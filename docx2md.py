@@ -45,7 +45,7 @@ class Block:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 后处理（postprocess）
+# 后处理
 # ══════════════════════════════════════════════════════════════════
 
 def remove_cjk_spaces(text: str) -> str:
@@ -56,11 +56,10 @@ def remove_cjk_spaces(text: str) -> str:
 
 
 def merge_broken_paragraphs(blocks) -> list:
-    """过滤无用内容 + 合并断裂短行 + 去除中文间多余空格
+    """过滤无用行 + 合并断裂短行 + 去除中文间多余空格
 
-    只合并「上一行以「1.」这类序号结尾 + 本行很短」的情况（Word 里用换行
-    拆开的序号与标题）。docx 的段落不会被分页截断，所以不按「跨页续行」
-    合并相邻段落。
+    只合并「上一行以「1.」这类序号结尾 + 本行很短」的情况，即 Word 里被换行
+    拆开的序号与标题；docx 段落不会被分页截断，不做跨页续行合并。
     """
     result = []
     for b in blocks:
@@ -121,9 +120,8 @@ def fix_headings(blocks) -> list:
         text = b.text.strip()
         if not text:
             continue
-        # Word 自动编号的列表项还原后也是「1. 标题」「1.1 标题」的样子，
-        # 与手写章节标题无法从文本区分；只提升无编号的普通段落，
-        # 真正的 Word 标题已带 # 前缀（两条正则都不匹配，无需再处理）
+        # 自动编号的列表项还原后也是「1. 标题」的样子，与手写章节标题无法区分；
+        # 真正的 Word 标题已带 # 前缀，两条正则都匹配不到，无需再处理
         if b.numbered or text.startswith('#'):
             continue
 
@@ -237,7 +235,7 @@ def merge_consecutive_tables(blocks) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 表格数据处理（table_utils）
+# 表格数据处理
 # ══════════════════════════════════════════════════════════════════
 
 _CODE_PATTERN = re.compile(r'[A-Za-z]{2}\d{3,}')
@@ -269,9 +267,8 @@ def _is_header_row(row) -> bool:
 def _first_row_is_header(data) -> bool:
     """整张表都没识别出表头时的兜底判定
 
-    表头行文字可以很长（如「计算平均日污水量(m³/d)」），靠长度猜会漏判，
-    这里换成结构特征：首行不含纯数字、而下面的数据行含纯数字；若下面全是
-    长文本，则用「首行明显比下面短」来判断。
+    表头文字可以很长（如「计算平均日污水量(m³/d)」），靠长度猜会漏判，
+    这里改看结构：首行不含纯数字而下面含；若下面全是长文本，则比较长度。
     """
     if len(data) < 2:
         return False
@@ -291,8 +288,7 @@ def _first_row_is_header(data) -> bool:
 def _detect_header_count(data, header_flags=None) -> int:
     """推断表头行数
 
-    优先采用 Word 自己记录的「重复标题行」（w:trPr/w:tblHeader）；没有标记
-    时才按内容猜测，都判不出来时用 _first_row_is_header 兜底。
+    优先用 Word 自己记录的「重复标题行」；没有标记才按内容猜，都判不出时兜底。
     """
     if header_flags and len(header_flags) == len(data):
         marked = 0
@@ -401,7 +397,7 @@ def process_table_data(data, header_flags=None):
 
 
 def _align_headers_to_data(headers, rows):
-    """修复 PDF 合并单元格导致的表头/数据列错位"""
+    """修正合并单元格造成的表头与数据列错位：有表头无数据的列并到相邻列"""
     if not headers or not rows:
         return headers
     n = len(headers)
@@ -430,7 +426,7 @@ def _align_headers_to_data(headers, rows):
 
 
 # ══════════════════════════════════════════════════════════════════
-# Markdown 渲染（markdown_writer）
+# Markdown 渲染
 # ══════════════════════════════════════════════════════════════════
 
 _BLANK_LINES_RE = re.compile(r"\n{3,}")
@@ -493,11 +489,10 @@ def _render_table(block: Block):
 
 
 # ══════════════════════════════════════════════════════════════════
-# 自动编号解析（numbering）
+# 自动编号
 #
-# Word 的自动编号（多级列表 / 章节编号）并不写在正文文本里，而是由
-# numbering.xml 定义、渲染时才显示。因此直接抽取 w:t 只能拿到 "概述"，
-# 序号 "1" 会丢失。这里重建这套编号计算逻辑，把序号补回文本。
+# Word 的自动编号不写在正文里，而是由 numbering.xml 定义、渲染时才显示，
+# 直接抽 w:t 只能拿到「概述」而丢掉序号「1」。这里重建编号的计算逻辑。
 # ══════════════════════════════════════════════════════════════════
 
 _ROMAN_UNITS = ((1000, 'm'), (900, 'cm'), (500, 'd'), (400, 'cd'), (100, 'c'),
@@ -522,7 +517,7 @@ def _to_roman(n: int) -> str:
 
 
 def _to_letter(n: int) -> str:
-    """1 -> A, 26 -> Z, 27 -> AA"""
+    """序号转字母：1→A，26→Z，27→AA"""
     if n <= 0:
         return str(n)
     out = []
@@ -1004,9 +999,8 @@ def _parse_lvl(lvl):
 # ══════════════════════════════════════════════════════════════════
 # 公式转换（OMML → LaTeX）
 #
-# Word 的公式不是文本，而是 OMML 标记（m:oMath）。直接抽 w:t 只会拿到
-# 零散的字符，公式结构（分式、上下标、根号、括号…）全部丢失，这里把
-# OMML 还原成 LaTeX：块级公式输出 $$…$$，行内公式输出 $…$。
+# Word 公式是 OMML 标记（m:oMath）而非文本，抽 w:t 只能拿到零散字符，
+# 这里还原成 LaTeX：块级输出 $$…$$，行内输出 $…$。
 # ══════════════════════════════════════════════════════════════════
 
 MATH_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
@@ -1099,7 +1093,6 @@ def _as_script(value: str) -> str:
 
 
 def _math_children(elem, skip=()) -> str:
-    """按顺序渲染 OMML 子元素"""
     parts = []
     for child in elem:
         if child.tag in skip:
@@ -1355,7 +1348,7 @@ def render_math(elem) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
-# Word 解析（word_engine）
+# Word 解析
 # ══════════════════════════════════════════════════════════════════
 
 HEADING_LEVEL_MAP = {
@@ -1406,11 +1399,10 @@ def _is_toc_control(elm) -> bool:
 
 
 def _iter_body_blocks(container, host):
-    """按文档顺序遍历正文块，穿透 w:sdt（内容控件）等块级容器
+    """按文档顺序遍历正文块，穿透 w:sdt 等块级容器
 
-    封面页、文档属性等内容常被包在 w:sdt 里，只遍历 w:body 的直接子元素
-    会把这些内容整块丢掉。目录控件是自动生成的索引（页码在 markdown 里
-    没有意义），直接跳过。
+    封面页、文档属性等内容常被包在 w:sdt 里，只遍历 w:body 的直接子元素会整块丢失。
+    目录控件跳过：它是自动生成的索引，页码在 markdown 里没有意义。
     """
     for child in container:
         tag = child.tag
@@ -1475,8 +1467,7 @@ def _render_paragraph(para, list_counter: int, doc=None, numbering=None) -> str:
     style_name = para.style.name if para.style else ""
 
     inline = _render_inline(para, doc)
-    # Word 的自动编号（含「表%1.%2-%3」这类自定义 lvlText）不在文本里，
-    # 需按 numbering.xml 还原后补在正文前，缺失会导致序号丢失
+    # 自动编号（含「表%1.%2-%3」这类自定义序号）不在文本里，需按 numbering.xml 补回
     prefix = numbering.prefix_for(para) if numbering else ""
 
     level = heading_level_of(style_name)
@@ -1508,13 +1499,12 @@ def _collapse_spaces(text: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
 
 
-# 行内内容控件：w:sdt 是 Word 的「文档属性」/封面域与修订插入所用的容器，
-# w:fldSimple 是 { TITLE } 之类的简单域，漏掉它们整段文字都会丢失
+# w:sdt 是文档属性/封面域与修订插入所用的容器，w:fldSimple 是 { TITLE } 这类简单域，
+# 漏掉它们整段文字都会丢失；w:del / w:moveFrom 故意排除，删掉的内容不该出现
 _INLINE_CONTAINER_TAGS = frozenset((
     qn('w:sdt'), qn('w:fldSimple'), qn('w:ins'), qn('w:moveTo'),
     qn('w:smartTag'), qn('w:bdo'), qn('w:dir'),
 ))
-# w:del / w:moveFrom（修订删除）故意不在其中：已删除的文字不该出现在结果里
 
 
 def _render_inline(para, doc=None) -> str:
@@ -1576,8 +1566,7 @@ def _render_run(r_element) -> str:
 def _render_break(elem) -> str:
     """换行符的文本表示
 
-    分页符（w:type="page"）与分栏符（w:type="column"）只是排版指令，
-    转成换行会把标题从中间截断（如 "## \\n标题"），因此直接丢弃。
+    分页符与分栏符只是排版指令，转成换行会把标题从中间截断，故丢弃。
     """
     if elem.tag == qn('w:br') and elem.get(qn('w:type')) in ('page', 'column'):
         return ""
@@ -1708,10 +1697,9 @@ def _table_grid_cols(tbl) -> int:
 
 
 def _table_header_flags(tbl) -> list:
-    """逐行读取 Word 的「重复标题行」标记（w:trPr/w:tblHeader）
+    """逐行读取 Word 的「重复标题行」标记
 
-    这是 Word 自己记录的表头信息，比按文字猜可靠；行序与
-    _extract_table_grid 一致，长度对不上时调用方会退回猜测。
+    比按文字猜可靠；行序与 _extract_table_grid 一致，长度对不上时调用方会退回猜测。
     """
     flags = []
     for tr in tbl._element.iter(qn('w:tr')):

@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""Convert Markdown files to Word (.docx) documents."""
+# -*- coding: utf-8 -*-
+"""md2docx — 将 Markdown 转换为 Word (.docx) 的单文件独立脚本
+
+用法:
+    python md2docx.py path/to/file.md           转换单个文件
+    python md2docx.py -d path/to/dir            转换目录下所有 .md
+
+结果写在与 md 同一目录、文件名相同的 .docx 文件。与 docx2md 配套使用：
+公式（$$…$$ / $…$）会写成可编辑的 Word 公式而非纯文本。
+
+依赖:
+    pip install python-docx
+
+"""
 
 import sys
 import re
@@ -13,10 +26,10 @@ from docx.oxml import OxmlElement
 
 
 def _split_table_row(line):
-    """Split a GFM table row on unescaped pipes, unescaping ``\\|``.
+    """按未转义的 | 切分表格行，并把 \\| 还原为 |
 
-    docx2md escapes a literal pipe inside a cell as ``\\|``; splitting on a
-    plain ``|`` would tear such a cell into two columns and drop the rest.
+    docx2md 会把单元格里的竖线转义成 \\|，直接 split('|') 会把这样的单元格
+    切成两列，并丢掉后面各列的内容。
     """
     line = line.strip()
     if line.startswith('|'):
@@ -54,11 +67,10 @@ def _looks_like_math(tex):
 
 
 def _add_formatted_text(para, text):
-    """Add text with inline markdown formatting to a paragraph."""
+    """写入段落文本，识别行内公式与 markdown 行内格式"""
     if not text:
         return
 
-    # 行内公式 $...$ 先摘出来，其余按普通 markdown 处理
     for segment in re.split(r'(\$[^$\n]+\$)', text):
         if not segment:
             continue
@@ -71,7 +83,7 @@ def _add_formatted_text(para, text):
 
 
 def _add_text_segment(para, text):
-    """Add a non-math segment, handling `code` spans."""
+    """写入非公式片段，处理 `代码` 段"""
     for segment in re.split(r'(`[^`]+`)', text):
         if segment.startswith('`') and segment.endswith('`'):
             para.add_run(segment[1:-1])
@@ -80,7 +92,7 @@ def _add_text_segment(para, text):
 
 
 def _add_formatted_runs(para, text):
-    """Add bold, italic, bold-italic, and link formatting to a paragraph."""
+    """写入加粗、斜体、粗斜体与超链接格式"""
     pattern = re.compile(
         r'(\*\*\*(.+?)\*\*\*)'
         r'|(\*\*(.+?)\*\*)'
@@ -115,7 +127,7 @@ def _add_formatted_runs(para, text):
 
 
 def _link_default_fonts_to_theme(doc):
-    """Link default fonts to the theme and match Word 2016's default document."""
+    """让默认字体跟随主题，参数与 Word 2016 新建文档保持一致"""
     styles_elem = doc.styles.element
     doc_defaults = styles_elem.find(qn('w:docDefaults'))
     if doc_defaults is None:
@@ -171,7 +183,7 @@ def _link_default_fonts_to_theme(doc):
 
 
 def _config_theme_cn(doc):
-    """Make the bundled theme a Simplified-Chinese one (等线 fonts)."""
+    """把内置主题改成简体中文主题（等线）"""
     _set_theme_font_lang(doc)
 
     theme_part = None
@@ -202,7 +214,7 @@ def _config_theme_cn(doc):
 
 
 def _set_theme_fonts(node, face):
-    """Set latin and the Chinese (Hans) script font in a fontScheme slot."""
+    """设置 fontScheme 中拉丁字体与中文（Hans）字体的字体名"""
     from lxml import etree
     latin = node.find(qn('a:latin'))
     if latin is None:
@@ -219,7 +231,7 @@ def _set_theme_fonts(node, face):
 
 
 def _set_theme_font_lang(doc):
-    """Set settings.xml themeFontLang eastAsia to zh-CN."""
+    """把 settings.xml 的 themeFontLang 东亚语言设为 zh-CN"""
     settings = doc.settings.element
     tfl = settings.find(qn('w:themeFontLang'))
     if tfl is None:
@@ -706,6 +718,7 @@ def add_display_math(para, latex):
 
 
 def _find_list_number_abstract_id(num_part):
+    """找到 List Number 样式所引用的 abstractNumId"""
     w = qn('w:abstractNum')
     for abstract in num_part.element.findall(w):
         for lvl in abstract.findall(qn('w:lvl')):
@@ -716,7 +729,7 @@ def _find_list_number_abstract_id(num_part):
 
 
 def _add_num_override(num_part, num_id):
-    """Add a new <w:num> entry with a lvlOverride that restarts numbering."""
+    """新建一个 w:num，用 lvlOverride 让有序列表从 1 重新编号"""
     from lxml import etree
     abstract_id = _find_list_number_abstract_id(num_part)
     if abstract_id is None:
@@ -733,7 +746,7 @@ def _add_num_override(num_part, num_id):
 
 
 def _cancel_style_color_overrides(doc):
-    """Remove explicit colour overrides from python-docx's built-in styles."""
+    """去掉 python-docx 内置样式里写死的颜色，让样式跟随主题"""
     for s in doc.styles:
         if s.type != 1:
             continue
@@ -746,7 +759,7 @@ def _cancel_style_color_overrides(doc):
 
 
 def convert(md_path):
-    """Convert a markdown file to docx."""
+    """将单个 markdown 文件转换为同目录同名的 docx"""
     with open(md_path, 'r', encoding='utf-8') as f:
         lines = f.readlines()
 
@@ -939,7 +952,7 @@ def convert(md_path):
 
 
 def convert_dir(directory):
-    """Convert all .md files under a directory to .docx files."""
+    """转换指定目录下的所有 .md 文件"""
     md_files = sorted(glob.glob(os.path.join(directory, '*.md')))
     if not md_files:
         print(f'No .md files found in: {directory}')

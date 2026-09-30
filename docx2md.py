@@ -91,6 +91,9 @@ def merge_broken_paragraphs(blocks) -> list:
 
 _HEADING_NUM_RE = re.compile(r'^(\d+(?:\.\d+)+)\s+(\S.*?)\s*$')
 _HEADING_SWAP_RE = re.compile(r'^(.+?)[ 　]*(\d+\.\d+(?:\.\d+)*)$')
+# 「标题 4.1.2」这种把序号写在后面的写法，标题部分只会是干净的短语；
+# 出现句子成分（标点、句末小数、等号）说明是正文，不该把末尾的数字搬到行首
+_HEADING_PROSE_RE = re.compile(r'[、，,；;：:。？！?!]|=＝|\d+\.\d+')
 _HEADING_BAD_TAIL_RE = re.compile(r'[。？！?!.;；]\s*$')
 _HEADING_BAD_INNER_RE = re.compile(r'。')
 _HEADING_MAX_TITLE_LEN = 60
@@ -126,7 +129,8 @@ def fix_headings(blocks) -> list:
             continue
 
         m = _HEADING_SWAP_RE.match(text)
-        if m:
+        # 「…计算得C值=0.885」这类正文以小数结尾，搬动后会被当成章节号，先排除
+        if m and not _HEADING_PROSE_RE.search(m.group(1)):
             title = m.group(1).strip()
             num = m.group(2).strip()
             text = f"{num} {title}"

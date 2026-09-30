@@ -948,14 +948,14 @@ def convert(md_path):
 
     out_path = os.path.splitext(md_path)[0] + '.docx'
     doc.save(out_path)
-    print(f'Converted: {md_path} -> {out_path}')
+    print(f'已转换: {md_path} -> {out_path}')
 
 
 def convert_dir(directory):
     """转换指定目录下的所有 .md 文件"""
     md_files = sorted(glob.glob(os.path.join(directory, '*.md')))
     if not md_files:
-        print(f'No .md files found in: {directory}')
+        print(f'目录中没有 .md 文件: {directory}')
         return
     for md_path in md_files:
         convert(md_path)
@@ -963,11 +963,12 @@ def convert_dir(directory):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Convert Markdown files to Word (.docx) documents.')
+        prog='md2docx',
+        description='将 Markdown 文件转换为 Word (.docx)，输出同目录同名 .docx 文件')
     parser.add_argument('path', nargs='?',
-                        help='Path to a .md file, or with -d/--dir a directory')
+                        help='.md 文件路径（与 -d 二选一）')
     parser.add_argument('-d', '--dir', action='store_true',
-                        help='Treat the path as a directory and convert all .md files in it')
+                        help='把 path 当作目录，转换其中所有 .md 文件')
     args = parser.parse_args()
 
     if not args.path:
@@ -976,11 +977,11 @@ if __name__ == '__main__':
 
     if args.dir:
         if not os.path.isdir(args.path):
-            print(f'Error: Directory not found: {args.path}')
+            print(f'错误: 目录不存在: {args.path}', file=sys.stderr)
             sys.exit(1)
         convert_dir(args.path)
     else:
         if not os.path.isfile(args.path):
-            print(f'Error: File not found: {args.path}')
+            print(f'错误: 文件不存在: {args.path}', file=sys.stderr)
             sys.exit(1)
         convert(args.path)

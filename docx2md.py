@@ -3,9 +3,13 @@
 """docx2md — 将 Word (.docx) 文件转换为 Markdown 的单文件独立脚本
 
 用法:
-    python docx2md path/to/file.docx
+    python docx2md.py path/to/file.docx        转换单个文件
+    python docx2md.py -d path/to/dir           转换目录下所有 .docx
 
-运行后自动在 docx 文件所在目录生成同名 .md 文件。
+转换结果写在与 docx 同一目录、文件名相同的 .md 文件。
+
+支持: 多级标题、Word 自动编号、列表、表格（含合并单元格与多级表头）、
+      超链接、加粗/斜体/删除线、文档属性与域、修订、OMML 公式（转 LaTeX）
 
 依赖:
     pip install python-docx
@@ -32,54 +36,12 @@ from docx.text.paragraph import Paragraph
 
 @dataclass
 class Block:
-    """内容块，按 y 坐标排列"""
-    type: str  # "paragraph" / "table" / "image"
-    y_top: float = 0.0
+    """内容块，按文档顺序排列"""
+    type: str  # "paragraph" / "table"
     text: str = ""
     headers: list = field(default_factory=list)
     rows: list = field(default_factory=list)
-    image_path: str = ""
     numbered: bool = False  # 段落本身带编号（标题/列表），合并时不可与邻段粘连
-
-
-# ══════════════════════════════════════════════════════════════════
-# ConvertOptions（docx 转换相关子集）
-# ══════════════════════════════════════════════════════════════════
-
-@dataclass
-class ConvertOptions:
-    """转换行为开关"""
-    remove_cjk_spaces: bool = True
-    merge_broken_paragraphs: bool = True
-    merge_cross_page_paragraphs: bool = False
-    fix_headings: bool = True
-    merge_blank_lines: bool = True
-    add_front_matter: bool = False
-    business_mode: bool = False
-    fix_list_number_positions: bool = False
-    infer_empty_headers: bool = False
-    merge_cross_page_tables: bool = True
-    filter_footer: bool = True
-    extract_images: bool = False
-    enable_ocr: bool = True
-    ocr_lang: str = "ch"
-    page_range: Optional[tuple] = None
-
-    @classmethod
-    def default(cls) -> "ConvertOptions":
-        return cls()
-
-    @classmethod
-    def business(cls) -> "ConvertOptions":
-        opts = cls()
-        opts.business_mode = True
-        opts.fix_list_number_positions = True
-        opts.infer_empty_headers = True
-        return opts
-
-
-def _opts(options: Optional[ConvertOptions]) -> ConvertOptions:
-    return options if options is not None else ConvertOptions.default()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -93,14 +55,13 @@ def remove_cjk_spaces(text: str) -> str:
     return text
 
 
-def merge_broken_paragraphs(blocks, options: Optional[ConvertOptions] = None):
-    """过滤无用内容 + 合并断裂短行 + 跨页续行合并 + 去除中文间多余空格
+def merge_broken_paragraphs(blocks) -> list:
+    """过滤无用内容 + 合并断裂短行 + 去除中文间多余空格
 
-    跨页续行合并默认关闭：它是为 PDF 抽文本准备的（一个段落被分页截断成
-    两块），而 docx 的段落本身就不会被分页截断，强行合并只会把相邻的
-    独立段落粘成一行。
+    只合并「上一行以「1.」这类序号结尾 + 本行很短」的情况（Word 里用换行
+    拆开的序号与标题）。docx 的段落不会被分页截断，所以不按「跨页续行」
+    合并相邻段落。
     """
-    opts = _opts(options)
     result = []
     for b in blocks:
         if b.type == "paragraph":
@@ -112,133 +73,21 @@ def merge_broken_paragraphs(blocks, options: Optional[ConvertOptions] = None):
             if re.match(r'^[\.\s]{3,}$', text):
                 continue
 
-            cleaned = remove_cjk_spaces(text) if opts.remove_cjk_spaces else text
-            b.text = cleaned
+            b.text = cleaned = remove_cjk_spaces(text)
 
             # 标题/列表项是独立的结构行，不能与相邻段落粘连
-            mergeable = not b.numbered and (not result or not getattr(result[-1], 'numbered', False))
-
-            if (opts.merge_broken_paragraphs
-                    and mergeable
-                    and result
-                    and result[-1].type == "paragraph"
+            prev = result[-1] if result else None
+            if (prev is not None and prev.type == "paragraph"
+                    and not b.numbered and not prev.numbered
                     and len(cleaned) <= 6
-                    and re.search(r'\d+\.\s*$', result[-1].text.strip())):
-                result[-1].text += cleaned
-                continue
-
-            if (opts.merge_cross_page_paragraphs
-                    and mergeable
-                    and result
-                    and result[-1].type == "paragraph"
-                    and _is_cross_page_continuation(result[-1].text, cleaned)):
-                result[-1].text += cleaned
+                    and re.search(r'\d+\.\s*$', prev.text.strip())):
+                prev.text += cleaned
                 continue
 
             result.append(b)
         else:
             result.append(b)
     return result
-
-
-_SENTENCE_END_RE = re.compile(r'[。！？；;…」』\)\)]$')
-_PARAGRAPH_START_RE = re.compile(
-    r'^（\d+[)）]|^\d+[.、]\s|^第\d+章|^【|^序号|^说明[:：]|^注[:：]|^#{1,6}\s|^\d+\.\d+'
-)
-_HEADING_NUM_PREFIX_RE = re.compile(r'^\d+(?:\.\d+)+\s')
-
-
-def _is_cross_page_continuation(prev_text: str, curr_text: str) -> bool:
-    prev = prev_text.strip()
-    curr = curr_text.strip()
-    if len(prev) < 10 or len(curr) < 10:
-        return False
-    if _SENTENCE_END_RE.search(prev):
-        return False
-    if _PARAGRAPH_START_RE.match(curr):
-        return False
-    if re.match(r'^#{1,6}\s', prev):
-        return False
-    if re.match(r'^第\d+章', prev):
-        return False
-    if _HEADING_NUM_PREFIX_RE.match(prev):
-        return False
-    return True
-
-
-def fix_list_number_positions(blocks, options: Optional[ConvertOptions] = None):
-    """修复列表序号位置（特定模式规则）"""
-    opts = _opts(options)
-    if not opts.fix_list_number_positions:
-        return blocks
-
-    for b in blocks:
-        if b.type != "paragraph":
-            continue
-
-        text = b.text
-
-        text = re.sub(r'(?<=[\u4e00-\u9fff])[ 　]*\d+\.\s*(?=[\u4e00-\u9fff])', '', text)
-        b.text = text
-
-        m = re.match(r'^([\u4e00-\u9fff]{2,4})(表[。，])\s*(\d+)\.\s+([A-Z]{2}\d+)$', text)
-        if m:
-            action = m.group(1)
-            punct_char = m.group(2)[1]
-            num = m.group(3)
-            code = m.group(4)
-            text = f"{num}. {action}{code}表{punct_char}"
-            b.text = text
-            continue
-
-        m = re.search(r'([。，])\s*(\d+)\.\s+([A-Z]{2}\d+)', text)
-        if m:
-            num = m.group(2)
-            code = m.group(3)
-            before = text[:m.start()].strip()
-            after = text[m.end():].strip()
-            if code in before:
-                text = f"{num}. {before}"
-            else:
-                text = f"{num}. {before}{code}"
-            if after and after.strip() != code:
-                text += " " + after.strip()
-            b.text = text
-            continue
-
-        m = re.search(r'([\u4e00-\u9fff])\s+(\d+)\.\s+([A-Z]{2}\d+)', text)
-        if m:
-            num = m.group(2)
-            code = m.group(3)
-            before = text[:m.start()].strip()
-            last_char = m.group(1)
-            after = text[m.end():].strip()
-            if code in before:
-                text = f"{num}. {before}{last_char}"
-            else:
-                text = f"{num}. {before}{last_char}{code}"
-            if after and after.strip() != code:
-                text += " " + after.strip()
-            b.text = text
-            continue
-
-        m = re.search(r'([。，])\s*(\d+)\.\s*$', text)
-        if m:
-            num = m.group(2)
-            before = text[:m.start()].strip()
-            text = f"{num}. {before}"
-            b.text = text
-            continue
-
-        m = re.search(r'([\u4e00-\u9fff])\s+(\d+)\.\s*$', text)
-        if m:
-            num = m.group(2)
-            last_char = m.group(1)
-            before = text[:m.start()].strip()
-            text = f"{num}. {before}{last_char}"
-            b.text = text
-
-    return blocks
 
 
 _HEADING_NUM_RE = re.compile(r'^(\d+(?:\.\d+)+)\s+(\S.*?)\s*$')
@@ -264,12 +113,8 @@ def _looks_like_heading_title(title: str) -> bool:
     return True
 
 
-def fix_headings(blocks, options: Optional[ConvertOptions] = None):
+def fix_headings(blocks) -> list:
     """修复章节标题格式并添加 Markdown 标题级别前缀"""
-    opts = _opts(options)
-    if not opts.fix_headings:
-        return blocks
-
     for b in blocks:
         if b.type != "paragraph":
             continue
@@ -323,9 +168,6 @@ def _header_similarity(a, b) -> float:
     return len(ca & cb) / len(ca | cb)
 
 
-_CODE_PATTERN_RE = re.compile(r'[A-Za-z]{2}\d{3,}')
-
-
 def _looks_like_data_row(block: Block) -> bool:
     if not block.rows:
         return False
@@ -334,17 +176,13 @@ def _looks_like_data_row(block: Block) -> bool:
     if not non_empty:
         return False
     for t in non_empty:
-        if _CODE_PATTERN_RE.match(t):
+        if _CODE_PATTERN.match(t):
             return True
     return False
 
 
-def merge_consecutive_tables(blocks, options: Optional[ConvertOptions] = None):
-    """合并连续出现的表格（跨页表格）"""
-    opts = _opts(options)
-    if not opts.merge_cross_page_tables:
-        return blocks
-
+def merge_consecutive_tables(blocks) -> list:
+    """合并紧挨着的两张表（Word 里被拆成两个 w:tbl 的同一张表）"""
     if len(blocks) < 2:
         return blocks
 
@@ -365,27 +203,30 @@ def merge_consecutive_tables(blocks, options: Optional[ConvertOptions] = None):
 
         should_merge = False
         merged_rows = nxt.rows
+        nxt_first_row = list(nxt.rows[0]) if nxt.rows else []
 
         if headers_match(current.headers, nxt.headers):
             should_merge = True
         elif _looks_like_data_row(nxt):
             should_merge = True
         elif _header_similarity(current.headers, nxt.headers) >= 0.8:
-            if _looks_like_data_row(nxt) or not headers_match(nxt.headers, nxt.rows[0] if nxt.rows else []):
+            if _looks_like_data_row(nxt) or not headers_match(nxt.headers,
+                                                             nxt_first_row):
                 should_merge = True
             if should_merge and nxt.rows and not _looks_like_data_row(nxt):
-                if _header_similarity(nxt.headers, list(nxt.rows[0])) >= 0.8:
+                if _header_similarity(nxt.headers, nxt_first_row) >= 0.8:
+                    # 后一张表的首行其实是表头，合并时丢掉
                     merged_rows = nxt.rows[1:]
 
         if should_merge:
             merged = Block(
                 type="table",
-                y_top=current.y_top,
                 headers=current.headers,
                 rows=current.rows + merged_rows,
             )
             i += 2
-            while i < len(blocks) and blocks[i].type == "table" and headers_match(current.headers, blocks[i].headers):
+            while (i < len(blocks) and blocks[i].type == "table"
+                   and headers_match(current.headers, blocks[i].headers)):
                 merged.rows += blocks[i].rows
                 i += 1
             result.append(merged)
@@ -472,10 +313,8 @@ def _detect_header_count(data, header_flags=None) -> int:
     return 1 if _first_row_is_header(data) else 0
 
 
-def process_table_data(data, options: Optional[ConvertOptions] = None,
-                       header_flags=None):
+def process_table_data(data, header_flags=None):
     """处理表格数据：扁平化多级表头、压缩空列、清理换行"""
-    opts = _opts(options)
     if not data:
         return [], []
 
@@ -543,16 +382,6 @@ def process_table_data(data, options: Optional[ConvertOptions] = None,
 
     flat_headers = _align_headers_to_data(flat_headers, rows)
 
-    if opts.infer_empty_headers:
-        for ci in range(len(flat_headers)):
-            if flat_headers[ci].strip():
-                continue
-            data_vals = [r[ci] for r in rows if ci < len(r) and r[ci].strip()]
-            if data_vals:
-                unique_vals = set(v.strip() for v in data_vals)
-                if len(unique_vals) == 1:
-                    flat_headers[ci] = list(unique_vals)[0]
-
     final_headers = []
     final_rows = [[] for _ in range(len(rows))]
     for ci in range(len(flat_headers)):
@@ -609,22 +438,9 @@ _DISPLAY_MATH_RE = re.compile(r"^\$\$[\s\S]+\$\$$")
 _HEADING_LINE_RE = re.compile(r"^#{1,6}\s")
 
 
-def render(blocks, title: str = "", options: Optional[ConvertOptions] = None,
-           metadata: Optional[dict] = None) -> str:
+def render(blocks) -> str:
     """将 Block 对象列表渲染为 Markdown 字符串"""
-    opts = options if options is not None else ConvertOptions()
     lines = []
-
-    if opts.add_front_matter and metadata:
-        lines.append("---")
-        for key, val in metadata.items():
-            lines.append(f"{key}: {val}")
-        lines.append("---")
-        lines.append("")
-
-    if title:
-        lines.append(f"# {title}")
-        lines.append("")
 
     prev_was_table = False
     for block in blocks:
@@ -642,24 +458,14 @@ def render(blocks, title: str = "", options: Optional[ConvertOptions] = None,
                 # 块级公式后留空行，连续 $$ 块不会被合并成一个
                 lines.append("")
             prev_was_table = False
-        elif block.type == "table":
+        else:
             if lines and lines[-1] != "":
                 lines.append("")
             lines.extend(_render_table(block))
             prev_was_table = True
-        elif block.type == "image":
-            if lines and lines[-1] != "":
-                lines.append("")
-            lines.append(f"![]({block.image_path})")
-            lines.append("")
-            prev_was_table = False
 
-    content = "\n".join(lines).strip()
-
-    if opts.merge_blank_lines:
-        content = _BLANK_LINES_RE.sub("\n\n", content)
-
-    return content
+    # 折叠多余的空行，保证段落之间最多一个空行
+    return _BLANK_LINES_RE.sub("\n\n", "\n".join(lines).strip())
 
 
 def _render_table(block: Block):
@@ -680,7 +486,7 @@ def _render_table(block: Block):
 
     for row in block.rows:
         padded = list(row) + [""] * (len(block.headers) - len(row))
-        data_line = "| " + " | ".join(escape(padded[i]) for i in range(len(block.headers))) + " |"
+        data_line = "| " + " | ".join(escape(c) for c in padded) + " |"
         result.append(data_line)
 
     return result
@@ -799,7 +605,9 @@ def _format_num_value(value: int, fmt: str) -> str:
     if fmt == 'ideographDigital':
         return _to_chinese(value)
     if fmt == 'decimalEnclosedCircle':
-        return _CIRCLED_DIGITS[value - 1] if 1 <= value <= len(_CIRCLED_DIGITS) else f"({value})"
+        if 1 <= value <= len(_CIRCLED_DIGITS):
+            return _CIRCLED_DIGITS[value - 1]
+        return f"({value})"
     if fmt == 'decimalEnclosedParen':
         return f"({value})"
     if fmt == 'decimalEnclosedFullstop':
@@ -850,7 +658,9 @@ class NumberingResolver:
                 self._parse_num(child)
 
         # 「将级别链接到样式」：编号级别上的 w:pStyle
-        for num_id in sorted(self._num_map, key=lambda v: (_to_int(v) is None, _to_int(v) or 0)):
+        num_ids = sorted(self._num_map,
+                         key=lambda v: (_to_int(v) is None, _to_int(v) or 0))
+        for num_id in num_ids:
             levels = self._levels(num_id)
             for ilvl in sorted(k for k in levels if isinstance(k, int)):
                 style_ref = (levels[ilvl] or {}).get('pStyle')
@@ -1117,10 +927,6 @@ class NumberingResolver:
         return _LVL_PLACEHOLDER_RE.sub(repl, text)
 
     # ── 对外接口 ────────────────────────────────────────────────────
-    def number_for(self, para) -> str:
-        """返回段落自动编号文本（无编号时返回空串，并已推进内部计数器）"""
-        return self._resolve(para)[0]
-
     def prefix_for(self, para) -> str:
         """返回可直接拼在段落文本前的编号前缀（含分隔符），无编号时为空串"""
         number, suff = self._resolve(para)
@@ -1617,11 +1423,10 @@ def _iter_body_blocks(container, host):
             yield from _iter_body_blocks(content if content is not None else child, host)
 
 
-def parse_docx(path: str, options: Optional[ConvertOptions] = None) -> list:
+def parse_docx(path: str) -> list:
     """解析 .docx 文件，返回按文档顺序排列的 Block 列表"""
     doc = Document(path)
     blocks = []
-    order = 0
 
     numbering = NumberingResolver(doc).load()
 
@@ -1633,40 +1438,35 @@ def parse_docx(path: str, options: Optional[ConvertOptions] = None) -> list:
         if isinstance(elm, Paragraph):
             para = elm
             text = _render_paragraph(para, list_counter, doc, numbering)
-            if text.strip():
-                style_name = para.style.name if para.style else ""
-                if heading_level_of(style_name):
-                    # 标题不参与正文列表计数
-                    list_counter = 0
-                elif _is_numbered_list(para):
-                    list_counter += 1
-                elif _is_bullet_list(para):
-                    pass
-                else:
-                    list_counter = 0
-                numbered = (heading_level_of(style_name) is not None
-                            or _is_numbered_list(para)
-                            or _is_bullet_list(para)
-                            or bool(numbering and numbering.has_number(para)))
-                blocks.append(Block(type="paragraph", y_top=order, text=text,
-                                    numbered=numbered))
-                order += 1
-        else:
-            tbl = elm
-            data = _extract_table_grid(tbl)
-            headers, rows = process_table_data(data, options,
-                                              _table_header_flags(tbl))
-            if headers and rows:
-                blocks.append(Block(
-                    type="table", y_top=order,
-                    headers=headers, rows=rows,
-                ))
-                order += 1
+            if not text.strip():
+                continue
+            style_name = para.style.name if para.style else ""
+            is_heading = heading_level_of(style_name) is not None
+            is_numbered = _is_numbered_list(para)
+            is_bullet = _is_bullet_list(para)
 
-    blocks = merge_consecutive_tables(blocks, options)
-    blocks = merge_broken_paragraphs(blocks, options)
-    blocks = fix_list_number_positions(blocks, options)
-    blocks = fix_headings(blocks, options)
+            if is_heading:
+                # 标题不参与正文列表计数
+                list_counter = 0
+            elif is_numbered:
+                list_counter += 1
+            elif not is_bullet:
+                list_counter = 0
+
+            blocks.append(Block(
+                type="paragraph", text=text,
+                numbered=(is_heading or is_numbered or is_bullet
+                          or bool(numbering and numbering.has_number(para))),
+            ))
+        else:
+            data = _extract_table_grid(elm)
+            headers, rows = process_table_data(data, _table_header_flags(elm))
+            if headers and rows:
+                blocks.append(Block(type="table", headers=headers, rows=rows))
+
+    blocks = merge_consecutive_tables(blocks)
+    blocks = merge_broken_paragraphs(blocks)
+    blocks = fix_headings(blocks)
     return blocks
 
 
@@ -1746,7 +1546,7 @@ def _render_run(r_element) -> str:
     for t in r_element.iter():
         if t.tag == qn('w:t'):
             texts.append(t.text or "")
-        elif t.tag == qn('w:br') or t.tag == qn('w:cr'):
+        elif t.tag in (qn('w:br'), qn('w:cr')):
             texts.append(_render_break(t))
         elif t.tag == qn('w:tab'):
             texts.append("\t")
@@ -1815,8 +1615,7 @@ def _is_bullet_list(para) -> bool:
         numpr = ppr.find(qn('w:numPr'))
         if numpr is not None:
             numfmt = numpr.find(qn('w:numFmt'))
-            if numfmt is not None and numfmt.get(qn('w:val')) == 'bullet':
-                return True
+            return numfmt is not None and numfmt.get(qn('w:val')) == 'bullet'
     return False
 
 
@@ -1830,8 +1629,9 @@ def _is_numbered_list(para) -> bool:
         numpr = ppr.find(qn('w:numPr'))
         if numpr is not None:
             numfmt = numpr.find(qn('w:numFmt'))
-            if numfmt is not None and numfmt.get(qn('w:val')) in ('decimal', 'chineseCounting'):
-                return True
+            if numfmt is None:
+                return False
+            return numfmt.get(qn('w:val')) in ('decimal', 'chineseCounting')
     return False
 
 
@@ -1935,16 +1735,15 @@ def _tc_text(tc_element) -> str:
 # 主入口
 # ══════════════════════════════════════════════════════════════════
 
-def convert(docx_path: str, options: Optional[ConvertOptions] = None) -> str:
+def convert(docx_path: str) -> str:
     """将 docx 转换为 markdown 文本"""
-    blocks = parse_docx(docx_path, options)
-    return render(blocks, options=options)
+    return render(parse_docx(docx_path))
 
 
-def _convert_one(src: Path, opts: ConvertOptions) -> bool:
+def _convert_one(src: Path) -> bool:
     """将单个 docx 文件转换为同目录同名的 md 文件，成功返回 True"""
     try:
-        content = convert(str(src), opts)
+        content = convert(str(src))
     except Exception as e:
         print(f"转换失败: {src}: {e}", file=sys.stderr)
         return False
@@ -1967,11 +1766,7 @@ def main(argv=None) -> int:
     )
     parser.add_argument("path", nargs="?", help="docx 文件路径（与 -d 二选一）")
     parser.add_argument("-d", "--dir", metavar="DIR", help="将目录下所有 docx 文件转换为 md 文件")
-    parser.add_argument("-b", "--business", action="store_true",
-                        help="启用业务文档规则（序号修复、空表头推断）")
     args = parser.parse_args(argv)
-
-    opts = ConvertOptions.business() if args.business else ConvertOptions.default()
 
     # 目录模式：转换目录下所有 docx
     if args.dir:
@@ -1981,11 +1776,11 @@ def main(argv=None) -> int:
             return 1
         docx_files = sorted(dir_path.glob("*.docx"))
         if not docx_files:
-            print(f"目录中没有 .docx 文件: {dir_path}", file=sys.stderr)
+            print(f"错误: 目录中没有 .docx 文件: {dir_path}", file=sys.stderr)
             return 1
         success = 0
         for f in docx_files:
-            if _convert_one(f, opts):
+            if _convert_one(f):
                 success += 1
         print(f"完成: 成功 {success} / 共 {len(docx_files)} 个文件")
         return 0 if success == len(docx_files) else 1
@@ -2001,7 +1796,7 @@ def main(argv=None) -> int:
         print(f"错误: 仅支持 .docx 文件: {src}", file=sys.stderr)
         return 1
 
-    return 0 if _convert_one(src, opts) else 1
+    return 0 if _convert_one(src) else 1
 
 
 if __name__ == "__main__":

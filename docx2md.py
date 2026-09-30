@@ -623,11 +623,11 @@ class NumberingResolver:
         self._start_override = {}  # (numId, ilvl) -> 起始值
         self._lvl_override = {}    # (numId, ilvl) -> lvl定义（lvlOverride 内联定义）
         self._pstyle_map = {}      # 样式名/styleId -> (numId, ilvl)
-        self._counters = {}        # numId -> {ilvl: 当前值}
-        self._depth = {}           # numId -> 当前展开的层级深度
-        self._last_level = {}      # numId -> 上一段落的 ilvl
+        self._counters = {}        # 编号定义 -> {ilvl: 当前值}
+        self._context = {}         # (编号定义, ilvl) -> 上级编号快照，用于判断重号
+        self._override_used = set()  # 已按 startOverride 重开过的 (numId, ilvl)
         self._style_cache = {}     # styleId -> (numId, ilvl)
-        self._levels_cache = {}    # numId -> 级别定义
+        self._def_cache = {}       # numId -> (编号定义, 级别定义)
         self._loaded = False
 
     # ── 加载 ────────────────────────────────────────────────────────
@@ -834,9 +834,16 @@ class NumberingResolver:
         return num_id, (_to_int(ilvl) or 0 if ilvl is not None else 0)
 
     # ── 编号计算 ────────────────────────────────────────────────────
-    def _levels(self, num_id, _seen=None):
-        if num_id in self._levels_cache:
-            return self._levels_cache[num_id]
+    def _resolve_def(self, num_id, _seen=None):
+        """解析 numId 实际生效的编号定义，返回 (归属标识, 级别定义表)
+
+        归属标识决定计数器是否共用：Word 的计数器挂在 abstractNum 上，两个
+        numId 指向同一个 abstractNum 时编号是连续的（要另起一段编号，Word 会
+        再建一个 abstractNum 出来），所以按 abstractNum 归组而不是按 numId。
+        经 w:numStyleLink 跳转时按最终生效的那个定义归组。
+        """
+        if num_id in self._def_cache:
+            return self._def_cache[num_id]
         _seen = _seen if _seen is not None else set()
         aid = self._num_map.get(num_id)
         levels = self._abstracts.get(aid) if aid is not None else None
@@ -849,11 +856,16 @@ class NumberingResolver:
             if st is not None:
                 link_num, _ = self._style_numpr(st.get(qn('w:styleId')))
                 if link_num:
-                    linked = self._levels(link_num, _seen)
-                    if linked:
-                        levels = linked
-        self._levels_cache[num_id] = levels
-        return levels
+                    linked = self._resolve_def(link_num, _seen)
+                    if linked[1]:
+                        self._def_cache[num_id] = linked
+                        return linked
+        resolved = (('abs', aid) if aid is not None else ('num', num_id), levels)
+        self._def_cache[num_id] = resolved
+        return resolved
+
+    def _levels(self, num_id, _seen=None):
+        return self._resolve_def(num_id, _seen)[1]
 
     def _lvl_def(self, num_id, levels, ilvl):
         override = self._lvl_override.get((num_id, ilvl))
@@ -873,36 +885,45 @@ class NumberingResolver:
             return lvl.get('start', 1) or 1
         return 1
 
+    def _restart_at(self, num_id, levels, ilvl):
+        """本级在第几级之上被用到时需要重新编号
+
+        w:lvlRestart 是 1 级的层号（如 ilvl=7 写 2 表示「用到第 1、2 级就重号」），
+        省略时就是「任意上级都用过就重号」；写 0 表示永不重号。
+        """
+        restart = (self._lvl_def(num_id, levels, ilvl) or {}).get('restart')
+        if restart is None:
+            return ilvl
+        return max(0, min(restart, ilvl))
+
     def _next_value(self, num_id, levels, ilvl):
         """推进计数器并返回该级别的当前值（同时保持各级别上下文）"""
-        counters = self._counters.setdefault(num_id, {})
-        depth = self._depth.get(num_id, 0)
+        key = self._resolve_def(num_id)[0]
+        counters = self._counters.setdefault(key, {})
+        # 跳级使用时父级按起始值占位，Word 同样把缺失的上级显示成起始值
+        for lv in range(ilvl):
+            if counters.get(lv) is None:
+                counters[lv] = self._start_value(num_id, levels, lv)
+
         start = self._start_value(num_id, levels, ilvl)
-
-        if ilvl > depth:
-            for lv in range(depth, ilvl):
-                if counters.get(lv) is None:
-                    counters[lv] = self._start_value(num_id, levels, lv)
-            depth = ilvl
-        elif ilvl < depth:
-            for lv in range(ilvl + 1, depth):
-                counters.pop(lv, None)
-            depth = ilvl
-
-        lvl = self._lvl_def(num_id, levels, ilvl)
-        restart = (lvl or {}).get('restart')
-        last = self._last_level.get(num_id)
-        if restart is not None and restart < ilvl and last is not None and last <= restart:
-            counters.pop(ilvl, None)
-
         current = counters.get(ilvl)
-        counters[ilvl] = start if current is None else current + 1
-        self._depth[num_id] = ilvl + 1
-        self._last_level[num_id] = ilvl
+        # 上级编号变了说明换了父级，本级要重新从起始值开始
+        depth = self._restart_at(num_id, levels, ilvl)
+        context = tuple(counters.get(lv) for lv in range(depth))
+        # startOverride 是 Word「设置起始值」的痕迹：带覆盖的 numId 首次用到本级时在此重开
+        override_key = (num_id, ilvl)
+        fresh_override = (override_key in self._start_override
+                          and override_key not in self._override_used)
+        if current is None or fresh_override or self._context.get((key, ilvl)) != context:
+            counters[ilvl] = start
+        else:
+            counters[ilvl] = current + 1
+        self._context[(key, ilvl)] = context
+        self._override_used.add(override_key)
         return counters[ilvl]
 
     def _render_lvl_text(self, text, num_id, levels, ilvl):
-        counters = self._counters.get(num_id, {})
+        counters = self._counters.get(self._resolve_def(num_id)[0], {})
 
         def repl(m):
             if m.group(0) == '%%':  # 转义后的字面量 %

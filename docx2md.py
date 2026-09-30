@@ -22,6 +22,8 @@ from typing import Optional
 from docx import Document
 from docx.oxml.ns import qn
 from docx.styles import BabelFish
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -37,6 +39,7 @@ class Block:
     headers: list = field(default_factory=list)
     rows: list = field(default_factory=list)
     image_path: str = ""
+    numbered: bool = False  # 段落本身带编号（标题/列表），合并时不可与邻段粘连
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -48,6 +51,7 @@ class ConvertOptions:
     """转换行为开关"""
     remove_cjk_spaces: bool = True
     merge_broken_paragraphs: bool = True
+    merge_cross_page_paragraphs: bool = False
     fix_headings: bool = True
     merge_blank_lines: bool = True
     add_front_matter: bool = False
@@ -90,7 +94,12 @@ def remove_cjk_spaces(text: str) -> str:
 
 
 def merge_broken_paragraphs(blocks, options: Optional[ConvertOptions] = None):
-    """过滤无用内容 + 合并断裂短行 + 跨页续行合并 + 去除中文间多余空格"""
+    """过滤无用内容 + 合并断裂短行 + 跨页续行合并 + 去除中文间多余空格
+
+    跨页续行合并默认关闭：它是为 PDF 抽文本准备的（一个段落被分页截断成
+    两块），而 docx 的段落本身就不会被分页截断，强行合并只会把相邻的
+    独立段落粘成一行。
+    """
     opts = _opts(options)
     result = []
     for b in blocks:
@@ -106,7 +115,11 @@ def merge_broken_paragraphs(blocks, options: Optional[ConvertOptions] = None):
             cleaned = remove_cjk_spaces(text) if opts.remove_cjk_spaces else text
             b.text = cleaned
 
+            # 标题/列表项是独立的结构行，不能与相邻段落粘连
+            mergeable = not b.numbered and (not result or not getattr(result[-1], 'numbered', False))
+
             if (opts.merge_broken_paragraphs
+                    and mergeable
                     and result
                     and result[-1].type == "paragraph"
                     and len(cleaned) <= 6
@@ -114,7 +127,8 @@ def merge_broken_paragraphs(blocks, options: Optional[ConvertOptions] = None):
                 result[-1].text += cleaned
                 continue
 
-            if (opts.merge_broken_paragraphs
+            if (opts.merge_cross_page_paragraphs
+                    and mergeable
                     and result
                     and result[-1].type == "paragraph"
                     and _is_cross_page_continuation(result[-1].text, cleaned)):
@@ -262,6 +276,11 @@ def fix_headings(blocks, options: Optional[ConvertOptions] = None):
         text = b.text.strip()
         if not text:
             continue
+        # Word 自动编号的列表项还原后也是「1. 标题」「1.1 标题」的样子，
+        # 与手写章节标题无法从文本区分；只提升无编号的普通段落，
+        # 真正的 Word 标题已带 # 前缀（两条正则都不匹配，无需再处理）
+        if b.numbered or text.startswith('#'):
+            continue
 
         m = _HEADING_SWAP_RE.match(text)
         if m:
@@ -381,35 +400,86 @@ def merge_consecutive_tables(blocks, options: Optional[ConvertOptions] = None):
 # ══════════════════════════════════════════════════════════════════
 
 _CODE_PATTERN = re.compile(r'[A-Za-z]{2}\d{3,}')
+# 单元格内容形如 11km、100%、≥80、2.5：出现这类值就说明该行是数据行而不是表头
+_VALUE_CELL_RE = re.compile(r'^[≈≥≤<>＜＞约近]?\s*\d[\d,. ]*\s*[^\d\s]{0,4}$')
 
 
-def process_table_data(data, options: Optional[ConvertOptions] = None):
+def _cell_texts(row) -> list:
+    """单元格文本规范化（换行折成空格、去空白）"""
+    return [str(c or "").replace("\n", " ").strip() for c in row]
+
+
+def _is_header_row(row) -> bool:
+    """按内容猜测某行是不是表头（短文本、无数值）"""
+    non_empty = [t for t in _cell_texts(row) if t]
+    if not non_empty:
+        return True
+    for t in non_empty:
+        if _CODE_PATTERN.match(t):
+            return False
+    if any(_VALUE_CELL_RE.match(t) for t in non_empty):
+        return False
+    if len(non_empty) >= 3:
+        avg = sum(len(t) for t in non_empty) / len(non_empty)
+        return avg <= 5
+    return True
+
+
+def _first_row_is_header(data) -> bool:
+    """整张表都没识别出表头时的兜底判定
+
+    表头行文字可以很长（如「计算平均日污水量(m³/d)」），靠长度猜会漏判，
+    这里换成结构特征：首行不含纯数字、而下面的数据行含纯数字；若下面全是
+    长文本，则用「首行明显比下面短」来判断。
+    """
+    if len(data) < 2:
+        return False
+    first = [t for t in _cell_texts(data[0]) if t]
+    if not first or any(t.isdigit() for t in first):
+        return False
+    rest = [t for row in data[1:] for t in _cell_texts(row) if t]
+    if any(t.isdigit() for t in rest):
+        return True
+    if not rest:
+        return False
+    avg_first = sum(len(t) for t in first) / len(first)
+    avg_rest = sum(len(t) for t in rest) / len(rest)
+    return avg_first * 1.5 < avg_rest
+
+
+def _detect_header_count(data, header_flags=None) -> int:
+    """推断表头行数
+
+    优先采用 Word 自己记录的「重复标题行」（w:trPr/w:tblHeader）；没有标记
+    时才按内容猜测，都判不出来时用 _first_row_is_header 兜底。
+    """
+    if header_flags and len(header_flags) == len(data):
+        marked = 0
+        for flag in header_flags:
+            if not flag:
+                break
+            marked += 1
+        if 0 < marked < len(data):
+            return marked
+
+    count = 0
+    for row in data:
+        if not _is_header_row(row):
+            break
+        count += 1
+    if count:
+        return count
+    return 1 if _first_row_is_header(data) else 0
+
+
+def process_table_data(data, options: Optional[ConvertOptions] = None,
+                       header_flags=None):
     """处理表格数据：扁平化多级表头、压缩空列、清理换行"""
     opts = _opts(options)
     if not data:
         return [], []
 
-    def is_header_row(row):
-        texts = [str(c or "").replace("\n", " ").strip() for c in row]
-        non_empty = [t for t in texts if t]
-        if not non_empty:
-            return True
-        for t in non_empty:
-            if _CODE_PATTERN.match(t):
-                return False
-        if any(t.isdigit() for t in non_empty):
-            return False
-        if len(non_empty) >= 3:
-            avg = sum(len(t) for t in non_empty) / len(non_empty)
-            return avg <= 5
-        return True
-
-    data_start = 0
-    for ri, row in enumerate(data):
-        if is_header_row(row):
-            data_start = ri + 1
-        else:
-            break
+    data_start = _detect_header_count(data, header_flags)
 
     header_rows = data[:data_start]
     data_rows = data[data_start:]
@@ -464,7 +534,8 @@ def process_table_data(data, options: Optional[ConvertOptions] = None):
         parts = []
         for ri in range(len(trimmed_headers)):
             val = clean_cell(trimmed_headers[ri][ci]).strip()
-            if val:
+            # 纵向合并的单元格会在多行表头里重复同一文字，拼接时只保留一次
+            if val and (not parts or parts[-1] != val):
                 parts.append(val)
         flat_headers.append(" ".join(parts))
 
@@ -534,6 +605,8 @@ def _align_headers_to_data(headers, rows):
 # ══════════════════════════════════════════════════════════════════
 
 _BLANK_LINES_RE = re.compile(r"\n{3,}")
+_DISPLAY_MATH_RE = re.compile(r"^\$\$[\s\S]+\$\$$")
+_HEADING_LINE_RE = re.compile(r"^#{1,6}\s")
 
 
 def render(blocks, title: str = "", options: Optional[ConvertOptions] = None,
@@ -561,7 +634,13 @@ def render(blocks, title: str = "", options: Optional[ConvertOptions] = None,
                 continue
             if prev_was_table:
                 lines.append("")
+            if lines and lines[-1] != "" and _HEADING_LINE_RE.match(text):
+                # 标题前留一个空行，正文段落不会被误读成标题的续行
+                lines.append("")
             lines.append(text)
+            if _DISPLAY_MATH_RE.match(text):
+                # 块级公式后留空行，连续 $$ 块不会被合并成一个
+                lines.append("")
             prev_was_table = False
         elif block.type == "table":
             if lines and lines[-1] != "":
@@ -1054,6 +1133,17 @@ class NumberingResolver:
             return number
         return f"{number} "
 
+    def has_number(self, para) -> bool:
+        """判断段落是否带可还原的自动编号（不推进计数器）"""
+        num_id, ilvl = self._paragraph_numpr(para)
+        if num_id is None:
+            return False
+        levels = self._levels(num_id)
+        lvl = self._lvl_def(num_id, levels, ilvl) if levels else None
+        if not lvl or not lvl.get('text'):
+            return False
+        return (lvl.get('fmt') or 'decimal') not in _BULLET_FORMATS
+
     def _resolve(self, para):
         """计算段落编号，返回 (编号文本, 分隔方式)"""
         num_id, ilvl = self._paragraph_numpr(para)
@@ -1106,6 +1196,359 @@ def _parse_lvl(lvl):
 
 
 # ══════════════════════════════════════════════════════════════════
+# 公式转换（OMML → LaTeX）
+#
+# Word 的公式不是文本，而是 OMML 标记（m:oMath）。直接抽 w:t 只会拿到
+# 零散的字符，公式结构（分式、上下标、根号、括号…）全部丢失，这里把
+# OMML 还原成 LaTeX：块级公式输出 $$…$$，行内公式输出 $…$。
+# ══════════════════════════════════════════════════════════════════
+
+MATH_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+
+
+def _m(tag: str) -> str:
+    """OMML 元素的 qname"""
+    return f'{{{MATH_NS}}}{tag}'
+
+
+_MATH_CHARS = {
+    '∑': r'\sum', '∏': r'\prod', '∐': r'\coprod', '∫': r'\int',
+    '∬': r'\iint', '∭': r'\iiint', '∮': r'\oint', '⋀': r'\bigwedge',
+    '⋁': r'\bigvee', '⋂': r'\bigcap', '⋃': r'\bigcup', '⋮': r'\vdots',
+    '⋱': r'\ddots', '⨀': r'\bigodot', '⨁': r'\bigoplus', '⨂': r'\bigotimes',
+}
+_MATH_ACCENTS = {
+    '\u0302': r'\hat', '\u02c6': r'\hat', '\u0303': r'\tilde',
+    '\u0304': r'\bar', '\u0305': r'\bar', '\u00af': r'\bar',
+    '\u0306': r'\breve', '\u0307': r'\dot', '\u0308': r'\ddot',
+    '\u030c': r'\check', '\u20d7': r'\vec', '\u2192': r'\vec',
+    '\u2194': r'\overleftrightarrow',
+}
+_MATH_ESCAPES = {
+    '\\': r'\backslash{}', '{': r'\{', '}': r'\}', '$': r'\$', '&': r'\&',
+    '#': r'\#', '%': r'\%', '_': r'\_', '^': r'\^{}', '~': r'\sim',
+}
+_MATH_FUNC_RE = re.compile(r'^[A-Za-z][A-Za-z0-9]*$')
+# 只认汉字/假名，全角标点（＝×≤…）另由 _MATH_SYMBOLS 处理
+_CJK_RE = re.compile(r'[\u3005-\u30ff\u4e00-\u9fff]')
+# 只承载内容的容器元素，渲染时直接递归子元素
+_MATH_CONTAINERS = frozenset(
+    _m(t) for t in ('e', 'num', 'den', 'sub', 'sup', 'lim', 'deg', 'fName', 'mr'))
+
+# Word 里常见的全角/符号/希腊字母写法，转成 LaTeX 宏
+_MATH_SYMBOLS = {
+    '＝': '=', '＋': '+', '－': '-', '×': r'\times ', '÷': r'\div ',
+    '＜': '<', '＞': '>', '≤': r'\leq ', '≥': r'\geq ',
+    '≠': r'\neq ', '≈': r'\approx ', '（': '(', '）': ')', '％': r'\%',
+    '√': r'\sqrt ', '∑': r'\sum ', '∫': r'\int ', 'π': r'\pi ',
+    'μ': r'\mu ', 'μ': r'\mu ', 'α': r'\alpha ', 'β': r'\beta ',
+    'γ': r'\gamma ', 'σ': r'\sigma ', 'θ': r'\theta ', 'λ': r'\lambda ',
+    'Δ': r'\Delta ', 'ψ': r'\psi ', 'φ': r'\phi ', 'Φ': r'\Phi ',
+    'ρ': r'\rho ', 'ε': r'\varepsilon ', 'ω': r'\omega ', 'η': r'\eta ',
+    'ξ': r'\xi ', 'τ': r'\tau ', 'ν': r'\nu ', 'ζ': r'\zeta ',
+    'κ': r'\kappa ', 'Ω': r'\Omega ', '°': r'^{\circ}',
+}
+# 全角 ASCII（！～）统一转半角
+_FULLWIDTH_ASCII = {c: chr(c - 0xFEE0) for c in range(0xFF01, 0xFF5F)}
+_PRIME_CHARS = ("'", '\u2032', '\u2019')
+
+
+def _escape_tex_text(text: str) -> str:
+    """文本模式（\\text{…}）下的转义：只处理 TeX 保留符号，不放宏"""
+    return ''.join(_MATH_ESCAPES.get(c, c) for c in text)
+
+
+def _escape_math(text: str) -> str:
+    """数学模式下的转义（全角写法、希腊字母等转成 LaTeX 宏）"""
+    text = text.translate(_FULLWIDTH_ASCII)
+    out = []
+    for c in text:
+        if c in _MATH_SYMBOLS:
+            out.append(_MATH_SYMBOLS[c])
+        else:
+            out.append(_MATH_ESCAPES.get(c, c))
+    return ''.join(out)
+
+
+def _math_text(text: str) -> str:
+    """公式里的普通文本：含中文时用 \\text 包裹，避免被当成变量"""
+    if not text:
+        return ''
+    text = text.translate(_FULLWIDTH_ASCII)
+    if _CJK_RE.search(text):
+        # \text 内只能放普通字符，放宏会让部分渲染器报错
+        return r'\text{' + _escape_tex_text(text) + '}'
+    return _escape_math(text)
+
+
+def _as_script(value: str) -> str:
+    """上下标内容：多字母英文（min/max 等）按正体，撇号用 \\prime"""
+    if not value:
+        return ''
+    if value in _PRIME_CHARS:
+        return r'\prime'
+    if len(value) > 1 and _MATH_FUNC_RE.match(value):
+        return r'\mathrm{' + value + '}'
+    return value
+
+
+def _math_children(elem, skip=()) -> str:
+    """按顺序渲染 OMML 子元素"""
+    parts = []
+    for child in elem:
+        if child.tag in skip:
+            continue
+        parts.append(_render_math(child))
+    return ''.join(parts)
+
+
+def _math_val(parent, tag, default=None):
+    """读取 m:xxxPr 里的属性值（OMML 的属性在 m 命名空间，不是 w）"""
+    pr = parent.find(_m(tag)) if parent is not None else None
+    if pr is None:
+        return default
+    val = pr.get(_m('val'))
+    if val is None:
+        val = pr.get(qn('w:val'))
+    return default if val is None else val
+
+
+def _math_flag(parent, tag) -> bool:
+    """读取 m:xxxHide 之类的开关（缺省即关闭）"""
+    pr = parent.find(_m(tag)) if parent is not None else None
+    if pr is None:
+        return False
+    val = pr.get(_m('val'))
+    if val is None:
+        val = pr.get(qn('w:val'))
+    return val is None or str(val).lower() in ('1', 'on', 'true')
+
+
+def _render_math_run(elem) -> str:
+    """m:r → 公式里的文字"""
+    texts = []
+    for child in elem:
+        if child.tag == _m('t'):
+            texts.append(child.text or '')
+        elif child.tag in (_m('br'), _m('tab'), qn('w:br'), qn('w:tab')):
+            texts.append(' ')
+    text = ''.join(texts)
+    if not text:
+        return ''
+
+    rpr = elem.find(_m('rPr'))
+    upright = False
+    if rpr is not None:
+        # sty="p"（普通体）/ scr="roman" 都是正体，nor 表示普通文本
+        upright = (_math_val(rpr, 'sty') == 'p'
+                   or _math_val(rpr, 'scr') == 'roman'
+                   or rpr.find(_m('nor')) is not None)
+    if upright and _MATH_FUNC_RE.match(text.strip()):
+        return r'\mathrm{' + _escape_math(text.strip()) + '}'
+    return _math_text(text)
+
+
+def _render_math_delimiter(elem) -> str:
+    """m:d → \\left( … \\right)"""
+    pr = elem.find(_m('dPr'))
+    beg, end, sep = '(', ')', '|'
+    if pr is not None:
+        beg = _math_val(pr, 'begChr', '(')
+        end = _math_val(pr, 'endChr', ')')
+        sep = _math_val(pr, 'sepChr', '|')
+    parts = []
+    for child in elem:
+        if child.tag != _m('e'):
+            continue
+        parts.append(_render_math(child))
+    inner = (f' \\mathrel{{{_escape_math(sep)}}} '.join(parts) if len(parts) > 1
+             else ''.join(parts))
+    left = r'\left' if beg else r'\left.'
+    right = r'\right' if end else r'\right.'
+    return f'{left}{_escape_math(beg)}{inner}{right}{_escape_math(end)}'
+
+
+def _render_math_nary(elem) -> str:
+    """m:nary → 求和/积分等 n 元运算符"""
+    pr = elem.find(_m('naryPr'))
+    chr_ = '∫'
+    und_limits = False
+    if pr is not None:
+        chr_ = _math_val(pr, 'chr', '∫')
+        und_limits = _math_val(pr, 'limLoc', 'subSup') == 'undOvr'
+    op = _MATH_CHARS.get(chr_) or _escape_math(chr_)
+
+    sub = sup = body = ''
+    for child in elem:
+        if child.tag == _m('sub'):
+            sub = _render_math(child)
+        elif child.tag == _m('sup'):
+            sup = _render_math(child)
+        elif child.tag == _m('e'):
+            body = _render_math(child)
+    if pr is not None:
+        if _math_flag(pr, 'subHide'):
+            sub = ''
+        if _math_flag(pr, 'supHide'):
+            sup = ''
+
+    scripts = ''
+    if sub:
+        scripts += f'_{{{sub}}}'
+    if sup:
+        scripts += f'^{{{sup}}}'
+    if und_limits:
+        scripts = r'\limits' + scripts
+    return f'{op}{scripts} {body}'
+
+
+def _render_math_matrix(elem) -> str:
+    """m:m（mr 里是 m:e 单元格）/ m:eqArr（每个 m:e 就是一行）"""
+    rows = []
+    aligned = False
+    for child in elem:
+        if child.tag == _m('mr'):
+            rows.append(' & '.join(_render_math(c) for c in child
+                                   if c.tag == _m('e')))
+        elif child.tag == _m('e'):
+            aligned = True
+            rows.append(' & '.join(_render_math(c) for c in child))
+    env = 'aligned' if aligned else 'matrix'
+    body = ' \\\\ '.join(rows)
+    return f'\\begin{{{env}}}{body}\\end{{{env}}}'
+
+
+def _render_math(elem) -> str:
+    """把一个 OMML 元素渲染为 LaTeX"""
+    tag = elem.tag
+    if tag == _m('t'):
+        return _math_text(elem.text or '')
+    if tag == _m('r'):
+        return _render_math_run(elem)
+    if tag == _m('f'):
+        num = den = ''
+        for child in elem:
+            if child.tag == _m('num'):
+                num = _render_math(child)
+            elif child.tag == _m('den'):
+                den = _render_math(child)
+        pr = elem.find(_m('fPr'))
+        if _math_val(pr, 'type') == 'noBar':
+            return f'{num or "1"}/{den or "1"}'
+        return f'\\frac{{{num or "1"}}}{{{den or "1"}}}'
+    if tag in (_m('sSub'), _m('sSup'), _m('sSubSup'), _m('limLow'), _m('limUpp')):
+        skip = {_m('sSubPr'), _m('sSupPr'), _m('sSubSupPr'),
+                _m('limLowPr'), _m('limUppPr')}
+        base = sub = sup = lim = ''
+        for child in elem:
+            if child.tag in skip:
+                continue
+            if child.tag == _m('e'):
+                base = _render_math(child)
+            elif child.tag == _m('sub'):
+                sub = _render_math(child)
+            elif child.tag == _m('sup'):
+                sup = _render_math(child)
+            elif child.tag == _m('lim'):
+                lim = _render_math(child)
+        low, high = _as_script(sub), _as_script(sup)
+        if tag == _m('limLow'):
+            low = _as_script(lim)
+        elif tag == _m('limUpp'):
+            high = _as_script(lim)
+        out = base
+        if low:
+            out += f'_{{{low}}}'
+        if high:
+            out += f'^{{{high}}}'
+        return out
+    if tag == _m('rad'):
+        pr = elem.find(_m('radPr'))
+        deg = ''
+        body = ''
+        for child in elem:
+            if child.tag == _m('deg'):
+                deg = _render_math(child)
+            elif child.tag == _m('e'):
+                body = _render_math(child)
+        if pr is not None and _math_flag(pr, 'degHide'):
+            deg = ''
+        return f'\\sqrt[{deg}]{{{body}}}' if deg else f'\\sqrt{{{body}}}'
+    if tag == _m('d'):
+        return _render_math_delimiter(elem)
+    if tag == _m('nary'):
+        return _render_math_nary(elem)
+    if tag in (_m('m'), _m('eqArr')):
+        return _render_math_matrix(elem)
+    if tag == _m('func'):
+        name = ''
+        for child in elem:
+            if child.tag == _m('fName'):
+                raw = ''.join(t.text or '' for t in child.iter(_m('t'))).strip()
+                name = (r'\mathrm{' + _escape_math(raw) + '}'
+                        if _MATH_FUNC_RE.match(raw) else _math_text(raw))
+        body = ''
+        for child in elem:
+            if child.tag == _m('e'):
+                body = _render_math(child)
+        return f'{name}{body}'
+    if tag == _m('acc') or tag == _m('groupChr'):
+        pr = elem.find(_m('accPr'))
+        if pr is None:
+            pr = elem.find(_m('groupChrPr'))
+        chr_ = _math_val(pr, 'chr', '\u0302')
+        if tag == _m('groupChr'):
+            macro = {chr(0x23DF): r'\underbrace', chr(0x23DE): r'\overbrace'}.get(
+                chr_, r'\underbrace')
+        else:
+            macro = _MATH_ACCENTS.get(chr_, r'\hat')
+        body = low = high = ''
+        for child in elem:
+            if child.tag == _m('e'):
+                body = _render_math(child)
+            elif child.tag == _m('sub'):
+                low = _render_math(child)
+            elif child.tag == _m('sup'):
+                high = _render_math(child)
+        if tag == _m('groupChr') and low:
+            return f'{macro}{{{body}}}_{{{low}}}'
+        if high:
+            return f'{macro}{{{body}}}^{{{high}}}'
+        return f'{macro}{{{body}}}'
+    if tag == _m('bar'):
+        pr = elem.find(_m('barPr'))
+        pos = _math_val(pr, 'pos', 'bot')
+        body = ''
+        for child in elem:
+            if child.tag == _m('e'):
+                body = _render_math(child)
+        macro = r'\overline' if pos == 'top' else r'\underline'
+        return f'{macro}{{{body}}}'
+    if tag in (_m('box'), _m('border'), _m('phant')):
+        # 边框/框注/幻影只起视觉作用，保留内容即可
+        return _math_children(elem, skip=(tag + 'Pr',))
+    if tag == _m('oMath'):
+        return _math_children(elem)
+    if tag == _m('oMathPara'):
+        return _math_children(elem, skip=(_m('oMathParaPr'),))
+    if tag in _MATH_CONTAINERS:
+        # m:e / m:num / m:den / m:sub / m:sup / m:lim / m:deg 等纯容器
+        return _math_children(elem)
+    # m:ctrlPr / m:argPr / m:aln 等无内容元素
+    return ''
+
+
+def render_math(elem) -> str:
+    """OMML 公式 → LaTeX 片段（$$…$$ 或 $…$）"""
+    body = _render_math(elem).strip()
+    if not body:
+        return ''
+    if elem.tag == _m('oMathPara'):
+        return f'$${body}$$'
+    return f'${body}$'
+
+
+# ══════════════════════════════════════════════════════════════════
 # Word 解析（word_engine）
 # ══════════════════════════════════════════════════════════════════
 
@@ -1116,6 +1559,63 @@ HEADING_LEVEL_MAP = {
     "标题 4": 4, "标题 5": 5, "标题 6": 6,
 }
 
+# Word 内置标题样式只到 9 级，Markdown 只支持 1-6 级，7 级以上统一压到 6 级
+_HEADING_STYLE_RE = re.compile(r'^(?:heading|标题)\s*(\d{1,2})$', re.IGNORECASE)
+_HEADING_MAX_LEVEL = 6
+
+
+def heading_level_of(style_name: str) -> Optional[int]:
+    """返回段落样式对应的 Markdown 标题级别（1-6），非标题返回 None"""
+    if not style_name:
+        return None
+    level = HEADING_LEVEL_MAP.get(style_name)
+    if level:
+        return level
+    m = _HEADING_STYLE_RE.match(style_name.strip())
+    if m:
+        return min(int(m.group(1)), _HEADING_MAX_LEVEL)
+    return None
+
+
+# 块级容器：Word 会把整段内容（封面、文档属性、目录等）包在 w:sdt 里
+_BODY_CONTAINER_TAGS = frozenset((
+    qn('w:sdt'), qn('w:customXml'), qn('w:ins'), qn('w:moveTo'),
+))
+_TOC_GALLERIES = ('table of contents', '目录')
+
+
+def _is_toc_control(elm) -> bool:
+    """内容控件是否为 Word 自动生成的目录（Table of Contents）"""
+    if elm.tag != qn('w:sdt'):
+        return False
+    pr = elm.find(qn('w:sdtPr'))
+    if pr is None:
+        return False
+    obj = pr.find(qn('w:docPartObj'))
+    if obj is None:
+        return False
+    gallery = obj.find(qn('w:docPartGallery'))
+    val = (gallery.get(qn('w:val')) or '') if gallery is not None else ''
+    return val.strip().lower() in _TOC_GALLERIES
+
+
+def _iter_body_blocks(container, host):
+    """按文档顺序遍历正文块，穿透 w:sdt（内容控件）等块级容器
+
+    封面页、文档属性等内容常被包在 w:sdt 里，只遍历 w:body 的直接子元素
+    会把这些内容整块丢掉。目录控件是自动生成的索引（页码在 markdown 里
+    没有意义），直接跳过。
+    """
+    for child in container:
+        tag = child.tag
+        if tag == qn('w:p'):
+            yield Paragraph(child, host)
+        elif tag == qn('w:tbl'):
+            yield Table(child, host)
+        elif tag in _BODY_CONTAINER_TAGS and not _is_toc_control(child):
+            content = child.find(qn('w:sdtContent'))
+            yield from _iter_body_blocks(content if content is not None else child, host)
+
 
 def parse_docx(path: str, options: Optional[ConvertOptions] = None) -> list:
     """解析 .docx 文件，返回按文档顺序排列的 Block 列表"""
@@ -1125,21 +1625,17 @@ def parse_docx(path: str, options: Optional[ConvertOptions] = None) -> list:
 
     numbering = NumberingResolver(doc).load()
 
-    body = doc.element.body
-    para_idx = 0
-    tbl_idx = 0
+    # Paragraph/Table 需要 body 容器对象来访问 part、样式等
+    host = getattr(doc, '_body', None) or doc
     list_counter = 0
 
-    for child in body.iterchildren():
-        if child.tag == qn('w:p'):
-            if para_idx >= len(doc.paragraphs):
-                break
-            para = doc.paragraphs[para_idx]
-            para_idx += 1
+    for elm in _iter_body_blocks(doc.element.body, host):
+        if isinstance(elm, Paragraph):
+            para = elm
             text = _render_paragraph(para, list_counter, doc, numbering)
             if text.strip():
                 style_name = para.style.name if para.style else ""
-                if HEADING_LEVEL_MAP.get(style_name):
+                if heading_level_of(style_name):
                     # 标题不参与正文列表计数
                     list_counter = 0
                 elif _is_numbered_list(para):
@@ -1148,15 +1644,18 @@ def parse_docx(path: str, options: Optional[ConvertOptions] = None) -> list:
                     pass
                 else:
                     list_counter = 0
-                blocks.append(Block(type="paragraph", y_top=order, text=text))
+                numbered = (heading_level_of(style_name) is not None
+                            or _is_numbered_list(para)
+                            or _is_bullet_list(para)
+                            or bool(numbering and numbering.has_number(para)))
+                blocks.append(Block(type="paragraph", y_top=order, text=text,
+                                    numbered=numbered))
                 order += 1
-        elif child.tag == qn('w:tbl'):
-            if tbl_idx >= len(doc.tables):
-                break
-            tbl = doc.tables[tbl_idx]
-            tbl_idx += 1
+        else:
+            tbl = elm
             data = _extract_table_grid(tbl)
-            headers, rows = process_table_data(data, options)
+            headers, rows = process_table_data(data, options,
+                                              _table_header_flags(tbl))
             if headers and rows:
                 blocks.append(Block(
                     type="table", y_top=order,
@@ -1176,34 +1675,68 @@ def _render_paragraph(para, list_counter: int, doc=None, numbering=None) -> str:
     style_name = para.style.name if para.style else ""
 
     inline = _render_inline(para, doc)
+    # Word 的自动编号（含「表%1.%2-%3」这类自定义 lvlText）不在文本里，
+    # 需按 numbering.xml 还原后补在正文前，缺失会导致序号丢失
+    prefix = numbering.prefix_for(para) if numbering else ""
 
-    level = HEADING_LEVEL_MAP.get(style_name)
+    level = heading_level_of(style_name)
     if level:
-        # Word 的自动编号不在文本里，需按 numbering.xml 还原后补在标题前
-        prefix = numbering.prefix_for(para) if numbering else ""
+        # 标题不能跨行：分页符/分栏符/换行符一律压成空格
+        title = _collapse_spaces(inline)
+        if not title:
+            return ""
         if prefix:
-            inline = prefix + inline.lstrip()
-        return f"{'#' * level} {inline}"
+            title = prefix + title
+        return f"{'#' * level} {title}"
 
     if _is_bullet_list(para):
+        if prefix:
+            return prefix + inline.lstrip()
         return f"- {inline}"
     if _is_numbered_list(para):
-        prefix = numbering.prefix_for(para) if numbering else ""
         if prefix:
             return prefix + inline.lstrip()
         return f"{list_counter + 1}. {inline}"
 
+    if prefix:
+        return prefix + inline.lstrip()
     return inline
 
 
+def _collapse_spaces(text: str) -> str:
+    """把换行、制表符与连续空白压成单个空格"""
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+# 行内内容控件：w:sdt 是 Word 的「文档属性」/封面域与修订插入所用的容器，
+# w:fldSimple 是 { TITLE } 之类的简单域，漏掉它们整段文字都会丢失
+_INLINE_CONTAINER_TAGS = frozenset((
+    qn('w:sdt'), qn('w:fldSimple'), qn('w:ins'), qn('w:moveTo'),
+    qn('w:smartTag'), qn('w:bdo'), qn('w:dir'),
+))
+# w:del / w:moveFrom（修订删除）故意不在其中：已删除的文字不该出现在结果里
+
+
 def _render_inline(para, doc=None) -> str:
-    """渲染段落的行内内容：run 的加粗/斜体/删除线 + 超链接"""
+    """渲染段落的行内内容：run 的加粗/斜体/删除线 + 超链接 + 内容控件/域"""
+    return _render_inline_children(para._element, doc)
+
+
+def _render_inline_children(parent, doc=None) -> str:
+    """递归渲染元素下的行内内容，容器元素（内容控件/域/修订插入）要展开"""
     parts = []
-    for child in para._element:
-        if child.tag == qn('w:r'):
+    for child in parent:
+        tag = child.tag
+        if tag == qn('w:r'):
             parts.append(_render_run(child))
-        elif child.tag == qn('w:hyperlink'):
+        elif tag == qn('w:hyperlink'):
             parts.append(_render_hyperlink(child, doc))
+        elif tag in _INLINE_CONTAINER_TAGS:
+            content = child.find(qn('w:sdtContent'))
+            parts.append(_render_inline_children(
+                content if content is not None else child, doc))
+        elif tag in (_m('oMath'), _m('oMathPara')):
+            parts.append(render_math(child))
     return "".join(parts)
 
 
@@ -1214,7 +1747,7 @@ def _render_run(r_element) -> str:
         if t.tag == qn('w:t'):
             texts.append(t.text or "")
         elif t.tag == qn('w:br') or t.tag == qn('w:cr'):
-            texts.append("\n")
+            texts.append(_render_break(t))
         elif t.tag == qn('w:tab'):
             texts.append("\t")
     text = "".join(texts)
@@ -1238,6 +1771,17 @@ def _render_run(r_element) -> str:
     if italic:
         text = f"*{text}*"
     return text
+
+
+def _render_break(elem) -> str:
+    """换行符的文本表示
+
+    分页符（w:type="page"）与分栏符（w:type="column"）只是排版指令，
+    转成换行会把标题从中间截断（如 "## \\n标题"），因此直接丢弃。
+    """
+    if elem.tag == qn('w:br') and elem.get(qn('w:type')) in ('page', 'column'):
+        return ""
+    return "\n"
 
 
 def _render_hyperlink(hl_element, doc=None) -> str:
@@ -1363,11 +1907,27 @@ def _table_grid_cols(tbl) -> int:
     return 0
 
 
+def _table_header_flags(tbl) -> list:
+    """逐行读取 Word 的「重复标题行」标记（w:trPr/w:tblHeader）
+
+    这是 Word 自己记录的表头信息，比按文字猜可靠；行序与
+    _extract_table_grid 一致，长度对不上时调用方会退回猜测。
+    """
+    flags = []
+    for tr in tbl._element.iter(qn('w:tr')):
+        trpr = tr.find(qn('w:trPr'))
+        flags.append(trpr is not None and trpr.find(qn('w:tblHeader')) is not None)
+    return flags
+
+
 def _tc_text(tc_element) -> str:
-    """提取 tc 元素的纯文本"""
+    """提取 tc 元素的纯文本（含公式的 LaTeX 形式）"""
     texts = []
-    for t in tc_element.iter(qn('w:t')):
-        texts.append(t.text or "")
+    for t in tc_element.iter():
+        if t.tag == qn('w:t'):
+            texts.append(t.text or "")
+        elif t.tag in (_m('oMath'), _m('oMathPara')):
+            texts.append(render_math(t))
     return "".join(texts)
 
 

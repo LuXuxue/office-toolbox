@@ -165,6 +165,7 @@ def main(argv=None):
 
     pythoncom.CoInitialize()
     word = None
+    word_dead = False   # Word 重启失败后，后续文件不再徒劳重试
     ok_list, skip_list, fail_list = [], [], []
 
     try:
@@ -186,6 +187,10 @@ def main(argv=None):
                 skip_list.append(name)
                 continue
 
+            if word_dead:
+                fail_list.append((name, "Word 重启失败，未处理"))
+                continue
+
             print("[%2d/%2d] 转换：%s" % (i, len(files), name))
             for attempt in (1, 2):
                 try:
@@ -200,15 +205,35 @@ def main(argv=None):
                     break
                 except Exception as e:
                     if attempt == 2:
+                        # Word 可能已写出 0 字节或不完整的 PDF，留着会让下次运行
+                        # 误判为「已存在」而跳过，所以失败后清理掉
+                        try:
+                            if os.path.exists(pdf):
+                                os.remove(pdf)
+                        except OSError:
+                            pass
                         print("        【失败】", describe_error(e))
                         fail_list.append((name, describe_error(e)))
                     else:
                         time.sleep(1.0)        # 文件被占用时重试一次
                         try:
                             word.Quit()
-                            word = start_word()
                         except Exception:
                             pass
+                        word = None
+                        try:
+                            word = start_word()
+                        except Exception as restart_err:
+                            why = describe_error(restart_err)
+                            print("        【失败】无法重新启动 Word：", why)
+                            try:
+                                if os.path.exists(pdf):
+                                    os.remove(pdf)
+                            except OSError:
+                                pass
+                            fail_list.append((name, why))
+                            word_dead = True
+                            break
     finally:
         if word is not None:
             try:

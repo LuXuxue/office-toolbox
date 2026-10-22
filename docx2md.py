@@ -42,6 +42,7 @@ class Block:
     headers: list = field(default_factory=list)
     rows: list = field(default_factory=list)
     numbered: bool = False  # 段落本身带编号（标题/列表），合并时不可与邻段粘连
+    explicit_body: bool = False  # 显式声明为「正文」（outlineLvl >= 9），不可再按文字猜成标题
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -78,6 +79,7 @@ def merge_broken_paragraphs(blocks) -> list:
             prev = result[-1] if result else None
             if (prev is not None and prev.type == "paragraph"
                     and not b.numbered and not prev.numbered
+                    and not b.explicit_body and not prev.explicit_body
                     and len(cleaned) <= 6
                     and re.search(r'\d+\.\s*$', prev.text.strip())):
                 prev.text += cleaned
@@ -125,7 +127,7 @@ def fix_headings(blocks) -> list:
             continue
         # 自动编号的列表项还原后也是「1. 标题」的样子，与手写章节标题无法区分；
         # 真正的 Word 标题已带 # 前缀，两条正则都匹配不到，无需再处理
-        if b.numbered or text.startswith('#'):
+        if b.numbered or b.explicit_body or text.startswith('#'):
             continue
 
         m = _HEADING_SWAP_RE.match(text)
@@ -309,6 +311,15 @@ def _detect_header_count(data, header_flags=None) -> int:
             break
         count += 1
     if count:
+        # 只有一行：按「无表头」处理（空表头 + 一行数据），
+        # 否则会在拍平成表头后因没有数据行而丢掉整张表
+        if len(data) == 1:
+            return 0
+        # 2 列及以下的「短文本」既可能是表头也可能是数据，靠长度分不开；
+        # 只认首行，多级表头请依赖 Word 的 w:tblHeader 标记。
+        # 所有行都被判成表头时同理：必须留下数据行，否则整表会被丢弃
+        if max(len(r) for r in data) < 3 or count >= len(data):
+            count = 1
         return count
     return 1 if _first_row_is_header(data) else 0
 
@@ -928,6 +939,9 @@ class NumberingResolver:
 
     def _render_lvl_text(self, text, num_id, levels, ilvl):
         counters = self._counters.get(self._resolve_def(num_id)[0], {})
+        # w:isLgl（Word 里的 legal 编号）：本级 lvlText 里的序号一律用阿拉伯数字，
+        # 不管各级原本的 numFmt 是什么（如一级用中文「二.」时二级仍显示「2.1.」）
+        legal = bool((self._lvl_def(num_id, levels, ilvl) or {}).get('isLgl'))
 
         def repl(m):
             if m.group(0) == '%%':  # 转义后的字面量 %
@@ -939,9 +953,10 @@ class NumberingResolver:
             if value is None:
                 value = self._start_value(num_id, levels, idx)
             fmt = 'decimal'
-            lvl = self._lvl_def(num_id, levels, idx)
-            if lvl:
-                fmt = lvl.get('fmt', 'decimal')
+            if not legal:
+                lvl = self._lvl_def(num_id, levels, idx)
+                if lvl:
+                    fmt = lvl.get('fmt', 'decimal')
             return _format_num_value(value, fmt)
 
         return _LVL_PLACEHOLDER_RE.sub(repl, text)
@@ -1001,6 +1016,16 @@ def _to_int(value):
         return None
 
 
+def _switch_on(elem) -> bool:
+    """开关类元素（w:b / w:i / w:isLgl 等）：元素存在即为开，显式写 0/false/off 才是关"""
+    if elem is None:
+        return False
+    val = elem.get(qn('w:val'))
+    if val is None:
+        return True
+    return str(val).strip().lower() not in ('0', 'false', 'off')
+
+
 def _parse_lvl(lvl):
     """解析单个 w:lvl 定义"""
 
@@ -1018,6 +1043,7 @@ def _parse_lvl(lvl):
         'restart': _to_int(attr('w:lvlRestart')),
         'pStyle': attr('w:pStyle'),
         'suff': attr('w:suff', 'tab') or 'tab',
+        'isLgl': _switch_on(lvl.find(qn('w:isLgl'))),
     }
 
 
@@ -1385,7 +1411,26 @@ HEADING_LEVEL_MAP = {
 
 # Word 内置标题样式只到 9 级，Markdown 只支持 1-6 级，7 级以上统一压到 6 级
 _HEADING_STYLE_RE = re.compile(r'^(?:heading|标题)\s*(\d{1,2})$', re.IGNORECASE)
+# 中文模板常把标题样式改名成「1级标题」「一级标题」这类，名字匹配不到就靠大纲级别
+_HEADING_CN_STYLE_RE = re.compile(r'^([0-9一二三四五六七八九十]{1,3})\s*级\s*标题$')
 _HEADING_MAX_LEVEL = 6
+
+_CN_DIGIT_VALUE = {'零': 0, '一': 1, '二': 2, '三': 3, '四': 4, '五': 5,
+                    '六': 6, '七': 7, '八': 8, '九': 9}
+
+
+def _cn_to_int(text: str) -> Optional[int]:
+    """中文数字转整数（一~九十九），认不出时返回 None"""
+    if '十' not in text:
+        return _CN_DIGIT_VALUE.get(text)
+    head, _, tail = text.partition('十')
+    tens = _CN_DIGIT_VALUE.get(head, 1) if head else 1
+    ones = _CN_DIGIT_VALUE.get(tail, 0) if tail else 0
+    if head and head not in _CN_DIGIT_VALUE:
+        return None
+    if tail and tail not in _CN_DIGIT_VALUE:
+        return None
+    return tens * 10 + ones
 
 
 def heading_level_of(style_name: str) -> Optional[int]:
@@ -1395,10 +1440,128 @@ def heading_level_of(style_name: str) -> Optional[int]:
     level = HEADING_LEVEL_MAP.get(style_name)
     if level:
         return level
-    m = _HEADING_STYLE_RE.match(style_name.strip())
+    name = style_name.strip()
+    m = _HEADING_STYLE_RE.match(name)
     if m:
         return min(int(m.group(1)), _HEADING_MAX_LEVEL)
+    m = _HEADING_CN_STYLE_RE.match(name)
+    if m:
+        raw = m.group(1)
+        value = int(raw) if raw.isdigit() else _cn_to_int(raw)
+        if value:
+            return min(value, _HEADING_MAX_LEVEL)
     return None
+
+
+class HeadingResolver:
+    """按段落样式判定 Markdown 标题级别
+
+    优先看 w:outlineLvl（大纲级别）：Word 的导航窗格与目录都按它认标题，
+    中文模板自定义的「1级标题」这类样式名虽然千奇百怪，却一定带大纲级别，
+    比按名字猜可靠。样式名匹配只作为没有大纲级别时的兜底。
+    """
+
+    def __init__(self, doc=None):
+        self._doc = doc
+        self._styles = {}   # styleId -> {'outline': int|None, 'basedOn': str|None}
+        self._cache = {}    # styleId -> 大纲级别
+
+    def load(self) -> "HeadingResolver":
+        root = None
+        try:
+            root = self._doc.styles.element
+        except Exception:
+            root = None
+        if root is None:
+            return self
+
+        for st in root.findall(qn('w:style')):
+            # 字符样式没有大纲级别，只有段落样式才可能是标题
+            if st.get(qn('w:type')) != 'paragraph':
+                continue
+            sid = st.get(qn('w:styleId'))
+            if not sid:
+                continue
+            ppr = st.find(qn('w:pPr'))
+            outline = None
+            if ppr is not None:
+                ol = ppr.find(qn('w:outlineLvl'))
+                if ol is not None:
+                    outline = _to_int(ol.get(qn('w:val')))
+            based = st.find(qn('w:basedOn'))
+            self._styles[sid] = {
+                'outline': outline,
+                'basedOn': based.get(qn('w:val')) if based is not None else None,
+            }
+        return self
+
+    def _style_outline(self, style_id, depth=0):
+        """样式的大纲级别，没写就沿 basedOn 继承"""
+        if not style_id or depth > 10:
+            return None
+        if style_id in self._cache:
+            return self._cache[style_id]
+        info = self._styles.get(style_id)
+        if info is None:
+            return None
+        value = info['outline']
+        if value is None:
+            value = self._style_outline(info['basedOn'], depth + 1)
+        self._cache[style_id] = value
+        return value
+
+    def level_of(self, para) -> Optional[int]:
+        """段落对应的 Markdown 标题级别（1-6），非标题返回 None"""
+        ppr = para._element.find(qn('w:pPr'))
+        if ppr is not None:
+            ol = ppr.find(qn('w:outlineLvl'))
+            if ol is not None:
+                value = _to_int(ol.get(qn('w:val')))
+                if value is not None:
+                    # 段落自己写了大纲级别就以它为准；9 表示「正文」，
+                    # 说明作者把标题降级了，不能再按样式当成标题
+                    if 0 <= value < 9:
+                        return min(value + 1, _HEADING_MAX_LEVEL)
+                    return None
+
+        try:
+            style = para.style
+        except Exception:
+            style = None
+        if style is None:
+            return None
+
+        outline = self._style_outline(getattr(style, 'style_id', None))
+        if outline is not None:
+            # 样式定下的大纲级别同样权威（9 = 正文，不再按样式名猜标题）
+            if 0 <= outline < 9:
+                return min(outline + 1, _HEADING_MAX_LEVEL)
+            return None
+        return heading_level_of(getattr(style, 'name', None))
+
+    def is_explicit_body(self, para) -> bool:
+        """段落是否显式声明为「正文」（outlineLvl >= 9）
+
+        这种段落即使文字形如「1.1 概述」也不能再由 fix_headings 猜成标题。
+        段落自己写的大纲级别优先于样式继承。
+        """
+        ppr = para._element.find(qn('w:pPr'))
+        if ppr is not None:
+            ol = ppr.find(qn('w:outlineLvl'))
+            if ol is not None:
+                value = _to_int(ol.get(qn('w:val')))
+                if value is not None:
+                    return value >= 9
+
+        try:
+            style = para.style
+        except Exception:
+            return False
+        if style is None:
+            return False
+        outline = self._style_outline(getattr(style, 'style_id', None))
+        return outline is not None and outline >= 9
+
 
 
 # 块级容器：Word 会把整段内容（封面、文档属性、目录等）包在 w:sdt 里
@@ -1446,6 +1609,7 @@ def parse_docx(path: str) -> list:
     blocks = []
 
     numbering = NumberingResolver(doc).load()
+    headings = HeadingResolver(doc).load()
 
     # Paragraph/Table 需要 body 容器对象来访问 part、样式等
     host = getattr(doc, '_body', None) or doc
@@ -1454,11 +1618,10 @@ def parse_docx(path: str) -> list:
     for elm in _iter_body_blocks(doc.element.body, host):
         if isinstance(elm, Paragraph):
             para = elm
-            text = _render_paragraph(para, list_counter, doc, numbering)
+            text = _render_paragraph(para, list_counter, doc, numbering, headings)
             if not text.strip():
                 continue
-            style_name = para.style.name if para.style else ""
-            is_heading = heading_level_of(style_name) is not None
+            is_heading = headings.level_of(para) is not None
             is_numbered = _is_numbered_list(para)
             is_bullet = _is_bullet_list(para)
 
@@ -1474,6 +1637,7 @@ def parse_docx(path: str) -> list:
                 type="paragraph", text=text,
                 numbered=(is_heading or is_numbered or is_bullet
                           or bool(numbering and numbering.has_number(para))),
+                explicit_body=headings.is_explicit_body(para),
             ))
         else:
             data = _extract_table_grid(elm)
@@ -1487,15 +1651,19 @@ def parse_docx(path: str) -> list:
     return blocks
 
 
-def _render_paragraph(para, list_counter: int, doc=None, numbering=None) -> str:
+def _render_paragraph(para, list_counter: int, doc=None, numbering=None,
+                      headings=None) -> str:
     """渲染段落为 Markdown 文本（含样式前缀、Word 自动编号与行内格式）"""
-    style_name = para.style.name if para.style else ""
+    if headings is not None:
+        level = headings.level_of(para)
+    else:
+        style_name = para.style.name if para.style else ""
+        level = heading_level_of(style_name)
 
     inline = _render_inline(para, doc)
     # 自动编号（含「表%1.%2-%3」这类自定义序号）不在文本里，需按 numbering.xml 补回
     prefix = numbering.prefix_for(para) if numbering else ""
 
-    level = heading_level_of(style_name)
     if level:
         # 标题不能跨行：分页符/分栏符/换行符一律压成空格
         title = _collapse_spaces(inline)
@@ -1538,25 +1706,45 @@ def _render_inline(para, doc=None) -> str:
 
 
 def _render_inline_children(parent, doc=None) -> str:
-    """递归渲染元素下的行内内容，容器元素（内容控件/域/修订插入）要展开"""
-    parts = []
+    """递归渲染元素下的行内内容，容器元素（内容控件/域/修订插入）要展开
+
+    先拆成「文本 + 加粗/斜体/删除线」片段，相邻且格式相同的片段合并后再加标记，
+    否则 Word 里被拆成多个 run 的同一句话会变成 **甲****乙** 这样的碎标记。
+    """
+    segs = []
+    _collect_segments(parent, doc, segs)
+    return _segments_to_markdown(segs)
+
+
+def _collect_segments(parent, doc, segs):
+    """把元素下的行内内容拆成 (文本, 加粗, 斜体, 删除线, 链接地址) 片段"""
     for child in parent:
         tag = child.tag
         if tag == qn('w:r'):
-            parts.append(_render_run(child))
+            seg = _run_segment(child)
+            if seg is not None:
+                segs.append(seg)
         elif tag == qn('w:hyperlink'):
-            parts.append(_render_hyperlink(child, doc))
+            # 一个超链接整体算一个片段：链接文字自己的加粗等标记留在括号里面，
+            # 写成 [**文字**](url) 而不是 **[文字](url)**，后者回转成 Word 时
+            # md2docx 认不出链接，会把 URL 当正文写出来
+            url = _hyperlink_url(child, doc)
+            inner = []
+            _collect_segments(child, doc, inner)
+            text = _segments_to_markdown(inner)
+            if text:
+                segs.append((text, False, False, False, url or None))
         elif tag in _INLINE_CONTAINER_TAGS:
             content = child.find(qn('w:sdtContent'))
-            parts.append(_render_inline_children(
-                content if content is not None else child, doc))
+            _collect_segments(content if content is not None else child, doc, segs)
         elif tag in (_m('oMath'), _m('oMathPara')):
-            parts.append(render_math(child))
-    return "".join(parts)
+            text = render_math(child)
+            if text:
+                segs.append((text, False, False, False, None))
 
 
-def _render_run(r_element) -> str:
-    """渲染单个 run 元素，应用加粗/斜体/删除线"""
+def _run_segment(r_element):
+    """把 run 拆成 (文本, 加粗, 斜体, 删除线, None) 片段"""
     texts = []
     for t in r_element.iter():
         if t.tag == qn('w:t'):
@@ -1567,25 +1755,46 @@ def _render_run(r_element) -> str:
             texts.append("\t")
     text = "".join(texts)
     if not text:
-        return ""
+        return None
 
     rpr = r_element.find(qn('w:rPr'))
     bold = italic = strike = False
     if rpr is not None:
-        if rpr.find(qn('w:b')) is not None:
-            bold = True
-        if rpr.find(qn('w:i')) is not None:
-            italic = True
-        if rpr.find(qn('w:strike')) is not None:
-            strike = True
+        bold = _switch_on(rpr.find(qn('w:b')))
+        italic = _switch_on(rpr.find(qn('w:i')))
+        strike = _switch_on(rpr.find(qn('w:strike')))
+    return (text, bold, italic, strike, None)
 
-    if strike:
-        text = f"~~{text}~~"
-    if bold:
-        text = f"**{text}**"
-    if italic:
-        text = f"*{text}*"
-    return text
+
+def _segments_to_markdown(segs) -> str:
+    """合并相邻同格式片段，再渲染成 Markdown 行内标记
+
+    链接片段（url 非空）不参与合并，也不再套加粗等标记——它的文字里已经带好了。
+    """
+    merged = []
+    for text, bold, italic, strike, url in segs:
+        if not text:
+            continue
+        if url is None and merged:
+            ptext, pbold, pitalic, pstrike, purl = merged[-1]
+            if purl is None and (pbold, pitalic, pstrike) == (bold, italic, strike):
+                merged[-1] = (ptext + text, bold, italic, strike, None)
+                continue
+        merged.append((text, bold, italic, strike, url))
+
+    parts = []
+    for text, bold, italic, strike, url in merged:
+        if url is not None:
+            parts.append(f"[{text}]({url})")
+            continue
+        if strike:
+            text = f"~~{text}~~"
+        if bold:
+            text = f"**{text}**"
+        if italic:
+            text = f"*{text}*"
+        parts.append(text)
+    return "".join(parts)
 
 
 def _render_break(elem) -> str:
@@ -1598,25 +1807,18 @@ def _render_break(elem) -> str:
     return "\n"
 
 
-def _render_hyperlink(hl_element, doc=None) -> str:
-    """渲染超链接元素为 [text](url)"""
-    texts = []
-    for r in hl_element.iter(qn('w:r')):
-        texts.append(_render_run(r))
-    text = "".join(texts)
-
+def _hyperlink_url(hl_element, doc=None) -> str:
+    """取超链接的目标地址，没有地址时返回空串"""
     rid = hl_element.get(qn('r:id'))
-    url = ""
-    if rid and doc is not None:
-        try:
-            rel = doc.part.rels.get(rid)
-            if rel is not None:
-                url = rel.target_ref or ""
-        except Exception:
-            url = ""
-    if url:
-        return f"[{text}]({url})"
-    return text
+    if not rid or doc is None:
+        return ""
+    try:
+        rel = doc.part.rels.get(rid)
+    except Exception:
+        return ""
+    if rel is None:
+        return ""
+    return rel.target_ref or ""
 
 
 def _is_bullet_list(para) -> bool:
@@ -1649,12 +1851,27 @@ def _is_numbered_list(para) -> bool:
     return False
 
 
+def _table_rows(tbl):
+    """遍历属于本表的行
+
+    .iter() 会把嵌套表格的行也遍历出来，而嵌套表格的文字已经通过 _tc_text()
+    记在父单元格里，会造成重复；但行也可能被包在 w:sdt 等容器里，不能简单用
+    findall 只取直接子元素。这里按「最近的 w:tbl 祖先是不是本表」判断。
+    """
+    for tr in tbl._element.iter(qn('w:tr')):
+        parent = tr.getparent()
+        while parent is not None and parent.tag != qn('w:tbl'):
+            parent = parent.getparent()
+        if parent is tbl._element:
+            yield tr
+
+
 def _extract_table_grid(tbl) -> list:
     """提取表格为二维网格，正确处理合并单元格"""
     grid = []
     vmerge_pending = {}
 
-    for tr in tbl._element.iter(qn('w:tr')):
+    for tr in _table_rows(tbl):
         row = []
         col_idx = 0
         tc_list = list(tr.findall(qn('w:tc')))
@@ -1715,7 +1932,7 @@ def _table_grid_cols(tbl) -> int:
     tbl_grid = tbl._element.find(qn('w:tblGrid'))
     if tbl_grid is not None:
         return len(list(tbl_grid.iter(qn('w:gridCol'))))
-    first_row = tbl._element.find(qn('w:tr'))
+    first_row = next(_table_rows(tbl), None)
     if first_row is not None:
         return len(list(first_row.iter(qn('w:tc'))))
     return 0
@@ -1727,7 +1944,8 @@ def _table_header_flags(tbl) -> list:
     比按文字猜可靠；行序与 _extract_table_grid 一致，长度对不上时调用方会退回猜测。
     """
     flags = []
-    for tr in tbl._element.iter(qn('w:tr')):
+    # 必须与 _extract_table_grid 用同一套行遍历，否则嵌套表格会让长度对不上
+    for tr in _table_rows(tbl):
         trpr = tr.find(qn('w:trPr'))
         flags.append(trpr is not None and trpr.find(qn('w:tblHeader')) is not None)
     return flags

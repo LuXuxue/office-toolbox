@@ -1,1 +1,3 @@
 python-docx
+# docx2pdf.py 需要（仅 Windows；其他平台安装时自动跳过）
+pywin32; sys_platform == "win32"

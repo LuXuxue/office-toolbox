@@ -21,7 +21,7 @@ import argparse
 import glob
 from docx import Document
 from docx.oxml.ns import qn
-from docx.shared import RGBColor
+from docx.shared import Inches, RGBColor
 from docx.oxml import OxmlElement
 
 
@@ -82,22 +82,56 @@ def _add_formatted_text(para, text):
         _add_text_segment(para, segment)
 
 
+def _add_mono_run(para, text):
+    """写入等宽字体 run（代码块与行内代码共用）"""
+    run = para.add_run(text)
+    # font.name 只设 ascii/hAnsi，中文字符还要显式指定 eastAsia
+    run.font.name = 'Consolas'
+    run._element.rPr.rFonts.set(qn('w:eastAsia'), 'Consolas')
+    return run
+
+
+# 行内链接：地址允许一层成对括号（如维基百科的 Foo_(bar)），
+# 否则 URL 会在第一个右括号处被截断，多出来的 ) 还会写进正文
+_LINK_PATTERN = (r'\[(?P<link_t>.+?)\]'
+                 r'\((?P<link_u>(?:[^()]|\([^()]*\))*)\)')
+
+# 代码段与链接按出现顺序匹配：`代码` 里的链接记号保持原样，
+# 链接文字里的 `代码` 则在递归处理链接文字时识别
+_INLINE_TOKEN_RE = re.compile(r'`[^`]+`|' + _LINK_PATTERN)
+
+
 def _add_text_segment(para, text):
-    """写入非公式片段，处理 `代码` 段"""
-    for segment in re.split(r'(`[^`]+`)', text):
-        if segment.startswith('`') and segment.endswith('`'):
-            para.add_run(segment[1:-1])
-        elif segment:
-            _add_formatted_runs(para, segment)
+    """写入非公式片段，处理行内代码、链接与其余行内格式"""
+    pos = 0
+    for m in _INLINE_TOKEN_RE.finditer(text):
+        if m.start() > pos:
+            _add_formatted_runs(para, text[pos:m.start()])
+
+        if m.group('link_t') is not None:
+            # 链接文字内部可能还有 **粗体** / *斜体* / `代码`
+            start = len(para.runs)
+            _add_text_segment(para, m.group('link_t'))
+            for run in para.runs[start:]:
+                run.font.color.rgb = RGBColor(0x05, 0x63, 0xC1)
+                run.font.underline = True
+        else:
+            _add_mono_run(para, m.group(0)[1:-1])
+
+        pos = m.end()
+
+    if pos < len(text):
+        _add_formatted_runs(para, text[pos:])
 
 
 def _add_formatted_runs(para, text):
-    """写入加粗、斜体、粗斜体与超链接格式"""
+    """写入加粗、斜体、粗斜体、删除线与超链接格式"""
     pattern = re.compile(
-        r'(\*\*\*(.+?)\*\*\*)'
-        r'|(\*\*(.+?)\*\*)'
-        r'|(\*(.+?)\*)'
-        r'|(\[(.+?)\]\((.+?)\))'
+        r'(?P<bi>\*\*\*(?P<bi_t>.+?)\*\*\*)'
+        r'|(?P<b>\*\*(?P<b_t>.+?)\*\*)'
+        r'|(?P<i>\*(?P<i_t>.+?)\*)'
+        r'|(?P<st>~~(?P<st_t>.+?)~~)'
+        r'|(?P<link>' + _LINK_PATTERN + r')'
     )
 
     pos = 0
@@ -105,20 +139,27 @@ def _add_formatted_runs(para, text):
         if m.start() > pos:
             para.add_run(text[pos:m.start()])
 
-        if m.group(2) is not None:
-            run = para.add_run(m.group(2))
+        if m.group('bi'):
+            run = para.add_run(m.group('bi_t'))
             run.bold = True
             run.italic = True
-        elif m.group(4) is not None:
-            run = para.add_run(m.group(4))
+        elif m.group('b'):
+            run = para.add_run(m.group('b_t'))
             run.bold = True
-        elif m.group(6) is not None:
-            run = para.add_run(m.group(6))
+        elif m.group('i'):
+            run = para.add_run(m.group('i_t'))
             run.italic = True
-        elif m.group(8) is not None:
-            run = para.add_run(m.group(8))
-            run.font.color.rgb = RGBColor(0x05, 0x63, 0xC1)
-            run.font.underline = True
+        elif m.group('st'):
+            run = para.add_run(m.group('st_t'))
+            run.font.strike = True
+        elif m.group('link'):
+            # 链接文字内部可能还有 **粗体** / *斜体*，先递归解析，
+            # 再把链接的颜色与下划线统一加到这些 run 上
+            start = len(para.runs)
+            _add_text_segment(para, m.group('link_t'))
+            for run in para.runs[start:]:
+                run.font.color.rgb = RGBColor(0x05, 0x63, 0xC1)
+                run.font.underline = True
 
         pos = m.end()
 
@@ -758,6 +799,17 @@ def _cancel_style_color_overrides(doc):
             rpr.remove(color)
 
 
+def _set_list_indent(para, level):
+    """按列表层级设置缩进（level 从 1 开始）
+
+    List Bullet / List Number 样式默认只给一级缩进，嵌套层级必须显式设置，
+    否则 1、2、3 级在 Word 里看起来完全一样。
+    """
+    fmt = para.paragraph_format
+    fmt.left_indent = Inches(0.25 * level)
+    fmt.first_line_indent = Inches(-0.25)
+
+
 def convert(md_path):
     """将单个 markdown 文件转换为同目录同名的 docx"""
     with open(md_path, 'r', encoding='utf-8') as f:
@@ -783,7 +835,7 @@ def convert(md_path):
         if in_code_block:
             if line.strip().startswith('```'):
                 para = doc.add_paragraph()
-                para.add_run('\n'.join(code_content))
+                _add_mono_run(para, '\n'.join(code_content))
                 in_code_block = False
                 code_content = []
                 ol_group_active = False
@@ -848,9 +900,10 @@ def convert(md_path):
 
         ul_match = re.match(r'^(\s*)([-*+])\s+(.+)$', line)
         if ul_match:
-            indent = len(ul_match.group(1))
+            # Tab 按 4 个空格算；Word 最多 9 级列表
+            indent = len(ul_match.group(1).expandtabs(4))
             content = ul_match.group(3)
-            new_level = indent // 2 + 1
+            new_level = min(indent // 2 + 1, 9)
 
             while list_level > new_level:
                 list_level -= 1
@@ -858,6 +911,7 @@ def convert(md_path):
                 list_level += 1
 
             para = doc.add_paragraph(style='List Bullet')
+            _set_list_indent(para, new_level)
             _add_formatted_text(para, content)
             ol_group_active = False
             i += 1
@@ -865,9 +919,10 @@ def convert(md_path):
 
         ol_match = re.match(r'^(\s*)\d+[.)]\s+(.+)$', line)
         if ol_match:
-            indent = len(ol_match.group(1))
+            # Tab 按 4 个空格算；Word 最多 9 级列表
+            indent = len(ol_match.group(1).expandtabs(4))
             content = ol_match.group(2)
-            new_level = indent // 2 + 1
+            new_level = min(indent // 2 + 1, 9)
 
             while list_level > new_level:
                 list_level -= 1
@@ -881,10 +936,12 @@ def convert(md_path):
                 ol_group_active = True
 
             para = doc.add_paragraph(style='List Number')
+            _set_list_indent(para, new_level)
             pPr = para._p.get_or_add_pPr()
             numPr = OxmlElement('w:numPr')
             ilvl = OxmlElement('w:ilvl')
-            ilvl.set(qn('w:val'), '0')
+            # 嵌套有序列表要用对应的编号级别，否则所有层级都会显示 1. 2. 3.
+            ilvl.set(qn('w:val'), str(new_level - 1))
             numId_elem = OxmlElement('w:numId')
             numId_elem.set(qn('w:val'), str(ol_current_num_id))
             numPr.append(ilvl)

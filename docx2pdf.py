@@ -192,13 +192,18 @@ def main(argv=None):
                 continue
 
             print("[%2d/%2d] 转换：%s" % (i, len(files), name))
+            # 先导出到临时文件，成功后再改名覆盖：导出失败时不会把原来那份
+            # PDF 弄丢（Word 可能写出 0 字节或不完整的文件，不能直接当结果）
+            tmp_pdf = os.path.join(os.path.dirname(pdf),
+                                   ".docx2pdf_tmp_" + os.path.basename(pdf))
             for attempt in (1, 2):
                 try:
-                    if os.path.exists(pdf):
-                        os.remove(pdf)          # 覆盖前先删，避免残留旧页
-                    export_pdf(word, src, pdf)
-                    if not (os.path.exists(pdf) and os.path.getsize(pdf) > 0):
+                    if os.path.exists(tmp_pdf):
+                        os.remove(tmp_pdf)
+                    export_pdf(word, src, tmp_pdf)
+                    if not (os.path.exists(tmp_pdf) and os.path.getsize(tmp_pdf) > 0):
                         raise IOError("Word 未生成有效的 PDF 文件")
+                    os.replace(tmp_pdf, pdf)   # 原子替换，旧的 PDF 到这一步才被覆盖
                     ok_list.append(name)
                     print("        -> %s（%.1f KB）"
                           % (os.path.basename(pdf), os.path.getsize(pdf) / 1024.0))
@@ -208,12 +213,13 @@ def main(argv=None):
                         # Word 可能已写出 0 字节或不完整的 PDF，留着会让下次运行
                         # 误判为「已存在」而跳过，所以失败后清理掉
                         try:
-                            if os.path.exists(pdf):
-                                os.remove(pdf)
+                            if os.path.exists(tmp_pdf):
+                                os.remove(tmp_pdf)
                         except OSError:
                             pass
-                        print("        【失败】", describe_error(e))
-                        fail_list.append((name, describe_error(e)))
+                        why = describe_error(e)
+                        print("        【失败】", why)
+                        fail_list.append((name, why))
                     else:
                         time.sleep(1.0)        # 文件被占用时重试一次
                         try:
@@ -227,8 +233,8 @@ def main(argv=None):
                             why = describe_error(restart_err)
                             print("        【失败】无法重新启动 Word：", why)
                             try:
-                                if os.path.exists(pdf):
-                                    os.remove(pdf)
+                                if os.path.exists(tmp_pdf):
+                                    os.remove(tmp_pdf)
                             except OSError:
                                 pass
                             fail_list.append((name, why))

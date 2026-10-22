@@ -68,7 +68,7 @@ def merge_broken_paragraphs(blocks) -> list:
             text = b.text.strip()
             if re.match(r'^\d+$', text):
                 continue
-            if re.match(r'^[IVXLCDM]{1,6}$', text):
+            if text in _ROMAN_PAGE_NUMERALS:
                 continue
             if re.match(r'^[\.\s]{3,}$', text):
                 continue
@@ -92,7 +92,9 @@ def merge_broken_paragraphs(blocks) -> list:
 
 
 _HEADING_NUM_RE = re.compile(r'^(\d+(?:\.\d+)+)\s+(\S.*?)\s*$')
-_HEADING_SWAP_RE = re.compile(r'^(.+?)[ 　]*(\d+\.\d+(?:\.\d+)*)$')
+# 把写在末尾的章节号搬到行首（「标题 4.1.2」→「4.1.2 标题」）。
+# 序号前面必须真的有空白，否则「1.2.3」这种纯数字会在数字中间被拆开，正文被改乱
+_HEADING_SWAP_RE = re.compile(r'^(.+?)\s+(\d+(?:\.\d+)+)$')
 # 「标题 4.1.2」这种把序号写在后面的写法，标题部分只会是干净的短语；
 # 出现句子成分（标点、句末小数、等号）说明是正文，不该把末尾的数字搬到行首
 _HEADING_PROSE_RE = re.compile(r'[、，,；;：:。？！?!]|=＝|\d+\.\d+')
@@ -334,27 +336,7 @@ def process_table_data(data, header_flags=None):
     header_rows = data[:data_start]
     data_rows = data[data_start:]
 
-    if not data_rows:
-        col_count = max(len(r) for r in header_rows) if header_rows else 0
-        col_has = [False] * col_count
-        for row in header_rows:
-            for ci in range(min(len(row), col_count)):
-                if row[ci] and str(row[ci]).strip():
-                    col_has[ci] = True
-        keep = [i for i, h in enumerate(col_has) if h]
-        trimmed = []
-        for row in header_rows:
-            trimmed.append([str(row[i] or "") if i < len(row) else "" for i in keep])
-
-        def clean(s: str) -> str:
-            return s.replace("\n", "")
-
-        flat = []
-        for ci in range(len(trimmed[0])):
-            parts = [clean(trimmed[ri][ci]).strip() for ri in range(len(trimmed))]
-            flat.append(" ".join(p for p in parts if p))
-        return flat, []
-
+    # _detect_header_count 永远不会返回 len(data)，data_rows 必定非空
     col_count = max(
         max((len(r) for r in data_rows), default=0),
         max((len(r) for r in header_rows), default=0),
@@ -529,6 +511,11 @@ def _to_roman(n: int) -> str:
             out.append(sym)
             n -= value
     return "".join(out)
+
+
+# 混在正文里的罗马数字页码。只收 1~50，避开 MIX、CIVIL 这类恰好由罗马数字
+# 字母拼成的英文单词（它们也是合法的罗马数字，但被当成页码丢掉就丢内容了）
+_ROMAN_PAGE_NUMERALS = frozenset(_to_roman(i).upper() for i in range(1, 51))
 
 
 def _to_letter(n: int) -> str:
@@ -1870,6 +1857,7 @@ def _extract_table_grid(tbl) -> list:
     """提取表格为二维网格，正确处理合并单元格"""
     grid = []
     vmerge_pending = {}
+    grid_cols = _table_grid_cols(tbl)
 
     for tr in _table_rows(tbl):
         row = []
@@ -1877,7 +1865,7 @@ def _extract_table_grid(tbl) -> list:
         tc_list = list(tr.findall(qn('w:tc')))
         tc_iter = iter(tc_list)
 
-        while col_idx < _table_grid_cols(tbl) or tc_iter:
+        while col_idx < grid_cols or tc_iter:
             try:
                 tc = next(tc_iter)
             except StopIteration:
@@ -1958,6 +1946,12 @@ def _tc_text(tc_element) -> str:
         if t.tag == qn('w:t'):
             texts.append(t.text or "")
         elif t.tag in (_m('oMath'), _m('oMathPara')):
+            # 块级公式是 m:oMathPara 里再套一个 m:oMath，迭代时两个都会遇到，
+            # 都渲染一遍公式就会重复出现，所以只认外层的 oMathPara
+            if t.tag == _m('oMath'):
+                parent = t.getparent()
+                if parent is not None and parent.tag == _m('oMathPara'):
+                    continue
             texts.append(render_math(t))
     return "".join(texts)
 

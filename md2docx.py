@@ -71,8 +71,13 @@ def _add_formatted_text(para, text):
     if not text:
         return
 
-    for segment in re.split(r'(\$[^$\n]+\$)', text):
+    # $$…$$ 是块级公式（docx2md 对 oMathPara 的输出），$…$ 是行内公式；
+    # 块级公式必须先匹配，否则 $$x$$ 会被拆成「$」+「$x$」+「$」
+    for segment in re.split(r'(\$\$.+?\$\$|\$[^$\n]+\$)', text):
         if not segment:
+            continue
+        if segment.startswith('$$') and segment.endswith('$$') and len(segment) > 4:
+            add_display_math(para, segment[2:-2])
             continue
         if len(segment) > 2 and segment[0] == '$' and segment[-1] == '$':
             body = segment[1:-1]
@@ -856,8 +861,7 @@ def convert(md_path):
                 _add_formatted_text(para, ' '.join(blockquote_lines))
                 in_blockquote = False
                 blockquote_lines = []
-            while list_level > 0:
-                list_level -= 1
+            list_level = 0
             ol_group_active = False
             i += 1
             continue
@@ -930,50 +934,61 @@ def convert(md_path):
                 list_level += 1
 
             if not ol_group_active:
-                _add_num_override(doc.part.numbering_part, ol_next_num_id)
-                ol_current_num_id = ol_next_num_id
+                # 模板里没有 List Number 的编号定义时会失败，这时只能退回样式自带的编号
+                ol_current_num_id = _add_num_override(doc.part.numbering_part,
+                                                      ol_next_num_id)
+                if ol_current_num_id is None:
+                    print("警告: 文档里没有 List Number 的编号定义，"
+                          "有序列表无法每组从 1 重新计数", file=sys.stderr)
                 ol_next_num_id += 1
                 ol_group_active = True
 
             para = doc.add_paragraph(style='List Number')
             _set_list_indent(para, new_level)
-            pPr = para._p.get_or_add_pPr()
-            numPr = OxmlElement('w:numPr')
-            ilvl = OxmlElement('w:ilvl')
-            # 嵌套有序列表要用对应的编号级别，否则所有层级都会显示 1. 2. 3.
-            ilvl.set(qn('w:val'), str(new_level - 1))
-            numId_elem = OxmlElement('w:numId')
-            numId_elem.set(qn('w:val'), str(ol_current_num_id))
-            numPr.append(ilvl)
-            numPr.append(numId_elem)
-            pPr.insert(0, numPr)
+            if ol_current_num_id is not None:
+                pPr = para._p.get_or_add_pPr()
+                # 用 get_or_add_numPr 而不是 insert(0, …)：w:pPr 里 w:pStyle 必须排在
+                # w:numPr 前面，直接插到最前面会写出不符合 OOXML 顺序的文档
+                numPr = pPr.get_or_add_numPr()
+                for child in list(numPr):
+                    numPr.remove(child)
+                ilvl = OxmlElement('w:ilvl')
+                # 嵌套有序列表要用对应的编号级别，否则所有层级都会显示 1. 2. 3.
+                ilvl.set(qn('w:val'), str(new_level - 1))
+                numId_elem = OxmlElement('w:numId')
+                numId_elem.set(qn('w:val'), str(ol_current_num_id))
+                numPr.append(ilvl)
+                numPr.append(numId_elem)
             _add_formatted_text(para, content)
             i += 1
             continue
 
         if '|' in line and i + 1 < len(lines) and re.match(r'^[\s|:\-]+$', lines[i + 1]):
-            table_lines = []
-            while i < len(lines) and '|' in lines[i]:
-                table_lines.append(lines[i].strip())
+            # 分隔行不一定带竖线（GFM 允许 `--- ---`），所以表头与分隔行单独吃掉；
+            # 数据行按「非空且含竖线」收集，与 GFM 一致：紧跟表格的含竖线文本也算表行
+            headers = _split_table_row(line.strip())
+            i += 2
+            rows = []
+            while i < len(lines) and lines[i].strip() and '|' in lines[i]:
+                rows.append(_split_table_row(lines[i].strip()))
                 i += 1
 
-            if len(table_lines) >= 2:
-                headers = _split_table_row(table_lines[0])
-                start_row = 2 if re.match(r'^[\s|:\-]+$', table_lines[1]) else 1
-                rows = []
-                for tl in table_lines[start_row:]:
-                    rows.append(_split_table_row(tl))
+            if headers:
+                # 数据行比表头宽时不丢内容：把表头补空到最宽的一行
+                num_cols = max([len(headers)] + [len(r) for r in rows])
+                if any(len(r) > len(headers) for r in rows):
+                    print("警告: 表格数据行的列数多于表头，已把表头补空以保留内容",
+                          file=sys.stderr)
+                headers = headers + [''] * (num_cols - len(headers))
 
-                num_cols = len(headers)
                 table = doc.add_table(rows=1 + len(rows), cols=num_cols)
                 table.style = 'Table Grid'
 
                 for j, h in enumerate(headers):
-                    if j < num_cols:
-                        cell = table.rows[0].cells[j]
-                        _add_formatted_text(cell.paragraphs[0], h)
-                        for run in cell.paragraphs[0].runs:
-                            run.bold = True
+                    cell = table.rows[0].cells[j]
+                    _add_formatted_text(cell.paragraphs[0], h)
+                    for run in cell.paragraphs[0].runs:
+                        run.bold = True
 
                 for r_idx, row in enumerate(rows):
                     for c_idx, cell_text in enumerate(row):
@@ -999,9 +1014,6 @@ def convert(md_path):
     if in_blockquote and blockquote_lines:
         para = doc.add_paragraph()
         _add_formatted_text(para, ' '.join(blockquote_lines))
-
-    while list_level > 0:
-        list_level -= 1
 
     out_path = os.path.splitext(md_path)[0] + '.docx'
     doc.save(out_path)

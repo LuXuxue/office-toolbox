@@ -427,6 +427,12 @@ class _LatexParser:
 
     def __init__(self, latex):
         self.tokens = [(m.lastgroup, m.group()) for m in _TOKEN_RE.finditer(latex)]
+        # \limits / \nolimits 只影响上下限排在下标位还是正下方，而 OMML 的
+        # naryPr/limLoc 一律写 undOvr（见 _to_omml 的 nary 分支），语义上等价。
+        # 直接丢掉这两个 token：否则 \sum 的上下限循环会在 \limits 处 break，
+        # 后面的 _{i=1} 找不到宿主基座，下标会被当成普通文字（\sum\limits i=1^{n}）。
+        self.tokens = [t for t in self.tokens
+                       if not (t[0] == 'cmd' and t[1] in (r'\limits', r'\nolimits'))]
         self.pos = 0
         self._drop_space = False
 
@@ -441,11 +447,16 @@ class _LatexParser:
     def parse(self):
         return self.parse_expr()
 
-    def parse_expr(self):
+    def parse_expr(self, stop_at_rbrack=False):
         nodes = []
         while True:
             kind, val = self.peek()
-            if kind is None or kind == 'close' or kind == 'rbrack':
+            if kind is None or kind == 'close':
+                break
+            # 右方括号默认不是终止符：它只是公式里的普通定界符（[σ]、[0,1]、[kN·m]）。
+            # 只有 \sqrt[3]{x} 这类「可选参数」场景才需要以 ] 收尾，由调用方传
+            # stop_at_rbrack=True 显式要求，否则 ] 之后的内容会被整段丢掉。
+            if stop_at_rbrack and kind == 'rbrack':
                 break
             if kind == 'cmd' and val in (r'\right', r'\end'):
                 break
@@ -517,6 +528,10 @@ class _LatexParser:
             return ('group', nodes)
         if kind == 'cmd':
             return self.parse_command(val)
+        if kind in ('lbrack', 'rbrack'):
+            # 方括号在 OMML 里没有独立节点，写成普通文字即可（与 (a+b) 一致）；
+            # 之前落到末尾的 return None，直接把 [ 和 ] 吃掉了
+            return ('text', '[' if kind == 'lbrack' else ']', None)
         if kind == 'esc':
             return ('text', _LATEX_SYMBOLS.get(val, val[1:]), None)
         if kind == 'amp':
@@ -534,7 +549,7 @@ class _LatexParser:
             deg = None
             if self.peek()[0] == 'lbrack':
                 self.take()
-                deg = self.parse_expr()
+                deg = self.parse_expr(stop_at_rbrack=True)
                 if self.peek()[0] == 'rbrack':
                     self.take()
             return ('rad', deg, self.parse_group())
@@ -577,8 +592,6 @@ class _LatexParser:
                 else:
                     break
             return ('nary', _LATEX_NARY[name], sub, sup)
-        if name == r'\limits':
-            return None
         if name in _LATEX_SYMBOLS:
             value = _LATEX_SYMBOLS[name]
             if value.strip():
@@ -608,7 +621,11 @@ class _LatexParser:
 
     def parse_env(self):
         env = self._read_env_name()
-        rows, cur = [], []
+        # rows: 行 → 单元格 → 节点。& 分列、\\ 换行，两者都必须真的切分：
+        # 之前 & 只是被 take() 丢掉，整行节点挤在一个列表里，_m_env 又把这个
+        # 列表当成「单元格列表」遍历，于是每个节点变成一个空 <m:e/>，
+        # 矩阵内容整块丢失（\begin{pmatrix}a&b\\c&d\end{pmatrix} 转出满天飞的空格子）
+        rows, cur, cell = [], [], []
         while True:
             kind, val = self.peek()
             if kind is None:
@@ -622,15 +639,26 @@ class _LatexParser:
                 continue
             if kind == 'amp':
                 self.take()
+                cur.append(cell)
+                cell = []
                 continue
             if kind == 'esc' and val == '\\\\':
                 self.take()
+                cur.append(cell)
+                cell = []
                 rows.append(cur)
                 cur = []
                 continue
             node = self.parse_scripted()
             if node is not None:
-                cur.append(node)
+                cell.append(node)
+        cur.append(cell)
+        # 末尾的 \\ 会多出一行只有一个空单元格，丢掉它，避免矩阵多出空行；
+        # 单元格可能是「纯空白节点」（\end 前的空格被词法成文字节点），
+        # 所以按纯空白判断，不能只看列表是否为空
+        if rows and len(cur) == 1 and all(
+                n[0] == 'text' and not n[1].strip() for n in cur[0]):
+            return ('env', env, rows)
         rows.append(cur)
         return ('env', env, rows)
 
@@ -778,9 +806,10 @@ def _m_env(env, rows):
     """matrix / bmatrix / aligned / array 等环境"""
     from lxml import etree
     if (env or '').lower().startswith(('align', 'array', 'cases')):
+        # eqArr 只有「行」没有「列」：把 & 分出来的单元格按顺序拼回一行
         arr = etree.Element(_mtag('eqArr'))
         for row in rows:
-            arr.append(_m_arg('e', row))
+            arr.append(_m_arg('e', [node for cell in row for node in cell]))
         return [arr]
     matrix = etree.Element(_mtag('m'))
     for row in rows:

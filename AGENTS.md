@@ -77,6 +77,32 @@ Word 会把连续文字拆成多个 run（拼写检查、格式切换、编辑�
 
 OOXML 规定 `w:pPr` 里 `w:pStyle` 必须排在 `w:numPr` 前面。`pPr.insert(0, numPr)` 会把 `w:numPr` 插到最前面，写出的文档虽然多数时候能打开，但顺序不合规，Word 重新保存时会重排。统一用 `pPr.get_or_add_numPr()`（python-docx 自己会插到正确的位置），不要手写 `insert`。
 
+### 11. 超链接有好几种写法，只认 `w:hyperlink` 会丢链接
+
+Word 里的链接地址不一定在 `w:t` 旁边。抽文字只能拿到链接文字，地址会整个丢掉：
+
+- `w:hyperlink` 带 `r:id` — 外部链接，地址在 `doc.part.rels` 的关系目标里；
+- `w:hyperlink` 只有 `w:anchor`（或 `w:docLocation`）— 文档内部的书签链接，没有 `r:id`，要转成 `#书签`；
+- `w:fldSimple` 与复杂域（`w:fldChar` + `w:instrText`）— `HYPERLINK "地址"` 域，地址只在域代码里；
+- 表格单元格里的链接 — 单元格走 `_tc_text()`，不共用段落的行内渲染，链接要在那里单独处理；
+- 文本框（`w:drawing` / `w:pict` 里的 `w:txbxContent`）— 里面的段落要单独渲染，否则里面的链接只是文字。
+
+`mc:AlternateContent` 里 `mc:Choice` 与 `mc:Fallback` 是同一份内容的两种写法，只取一个，否则同一段文字会被算两遍。
+
+### 12. 写超链接要用 `w:hyperlink` + 关系，不能只染颜色
+
+`md2docx.py` 里把 `[文字](地址)` 写成「蓝色带下划线的普通 run」看着像链接，其实不可点击，`docx2md` 再读回来时也拿不到地址。真正的超链接长这样：
+
+- 外部地址 — `<w:hyperlink r:id="rIdN">`，`rIdN` 来自 `para.part.relate_to(url, RT.HYPERLINK, is_external=True)`；
+- 文档内部的书签 — `<w:hyperlink w:anchor="书签名">`，**不建关系**（内部链接没有外部地址）。
+
+两条坑：
+
+- 链接文字的 run 在 `w:hyperlink` 元素里，**不是** `w:p` 的直属子元素。`para.runs` 只返回直属的 `w:r`，遍历它会漏掉链接文字——表格表头加粗那一步就曾因此漏加。统一走 `_iter_runs()`（用 `para._p.iter(qn('w:r'))`）。
+- `w:hyperlink` 必须插在链接文字原来的位置（`run._r.addprevious(hl)` 后再把 run 搬进去）。直接 `append` 到段尾会打乱顺序——链接后面跟着 `m:oMath` 时公式会跑到链接前面。
+
+链接文字套 `Hyperlink` 字符样式（Word 内置的蓝色带下划线样式，python-docx 的默认模板里没有，要自己建），同时保留直接格式兜底。
+
 ## 改完自检
 
 - [ ] 行尾仍是 CRLF

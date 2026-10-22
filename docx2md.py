@@ -1627,7 +1627,7 @@ def parse_docx(path: str) -> list:
                 explicit_body=headings.is_explicit_body(para),
             ))
         else:
-            data = _extract_table_grid(elm)
+            data = _extract_table_grid(elm, doc)
             headers, rows = process_table_data(data, _table_header_flags(elm))
             if headers and rows:
                 blocks.append(Block(type="table", headers=headers, rows=rows))
@@ -1679,12 +1679,22 @@ def _collapse_spaces(text: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
 
 
-# w:sdt 是文档属性/封面域与修订插入所用的容器，w:fldSimple 是 { TITLE } 这类简单域，
-# 漏掉它们整段文字都会丢失；w:del / w:moveFrom 故意排除，删掉的内容不该出现
+# w:sdt 是文档属性/封面域与修订插入所用的容器，漏掉它们整段文字都会丢失；
+# w:del / w:moveFrom 故意排除，删掉的内容不该出现。
+# w:fldSimple 不在这里：简单域要单独处理，HYPERLINK 域的地址只写在域代码里
 _INLINE_CONTAINER_TAGS = frozenset((
-    qn('w:sdt'), qn('w:fldSimple'), qn('w:ins'), qn('w:moveTo'),
+    qn('w:sdt'), qn('w:ins'), qn('w:moveTo'),
     qn('w:smartTag'), qn('w:bdo'), qn('w:dir'),
 ))
+
+# mc:AlternateContent 里 mc:Choice 是新版本、mc:Fallback 是旧版本兼容写法，
+# 两边内容一样，只取一个，否则同一段文字会被算两遍
+MC_NS = 'http://schemas.openxmlformats.org/markup-compatibility/2006'
+
+
+def _mc(tag: str) -> str:
+    """兼容性标记（mc:*）元素的 qname"""
+    return f'{{{MC_NS}}}{tag}'
 
 
 def _render_inline(para, doc=None) -> str:
@@ -1705,22 +1715,51 @@ def _render_inline_children(parent, doc=None) -> str:
 
 def _collect_segments(parent, doc, segs):
     """把元素下的行内内容拆成 (文本, 加粗, 斜体, 删除线, 链接地址) 片段"""
-    for child in parent:
+    _collect_segments_from(list(parent), doc, segs)
+
+
+def _collect_segments_from(children, doc, segs):
+    """按顺序处理一组行内子元素
+
+    复杂域在 Word 里是「域开始 + 域代码 + 域结果 + 域结束」好几个兄弟节点，
+    要整体识别，否则 HYPERLINK 域的地址（只写在域代码里）会整个丢掉。
+    """
+    i = 0
+    n = len(children)
+    while i < n:
+        child = children[i]
         tag = child.tag
         if tag == qn('w:r'):
-            seg = _run_segment(child)
-            if seg is not None:
-                segs.append(seg)
+            field = _field_hyperlink(children, i, doc)
+            if field is not None:
+                url, text, nxt = field
+                if text:
+                    segs.append((text, False, False, False, url or None))
+                i = nxt
+                continue
+            segs.extend(_run_segments(child, doc))
         elif tag == qn('w:hyperlink'):
             # 一个超链接整体算一个片段：链接文字自己的加粗等标记留在括号里面，
             # 写成 [**文字**](url) 而不是 **[文字](url)**，后者回转成 Word 时
             # md2docx 认不出链接，会把 URL 当正文写出来
-            url = _hyperlink_url(child, doc)
+            url = _hyperlink_target(child, doc)
             inner = []
             _collect_segments(child, doc, inner)
             text = _segments_to_markdown(inner)
             if text:
                 segs.append((text, False, False, False, url or None))
+        elif tag == qn('w:fldSimple'):
+            # 简单域：HYPERLINK 域的地址写在 w:instr 域代码里，不在文字里
+            url = _hyperlink_in_instr(child.get(qn('w:instr')) or '')
+            inner = []
+            _collect_segments(child, doc, inner)
+            if url:
+                text = _segments_to_markdown(inner)
+                if text:
+                    segs.append((text, False, False, False, url))
+            else:
+                # 不是链接域就按普通片段处理，免得加粗标记被拆成 **甲****乙**
+                segs.extend(inner)
         elif tag in _INLINE_CONTAINER_TAGS:
             content = child.find(qn('w:sdtContent'))
             _collect_segments(content if content is not None else child, doc, segs)
@@ -1728,29 +1767,92 @@ def _collect_segments(parent, doc, segs):
             text = render_math(child)
             if text:
                 segs.append((text, False, False, False, None))
+        elif tag == _mc('AlternateContent'):
+            branch = _mc_branch(child)
+            if branch is not None:
+                _collect_segments_from(list(branch), doc, segs)
+        i += 1
 
 
-def _run_segment(r_element):
-    """把 run 拆成 (文本, 加粗, 斜体, 删除线, None) 片段"""
-    texts = []
-    for t in r_element.iter():
-        if t.tag == qn('w:t'):
-            texts.append(t.text or "")
-        elif t.tag in (qn('w:br'), qn('w:cr')):
-            texts.append(_render_break(t))
-        elif t.tag == qn('w:tab'):
-            texts.append("\t")
-    text = "".join(texts)
-    if not text:
-        return None
+def _run_segments(r_element, doc=None) -> list:
+    """把 run 拆成若干 (文本, 加粗, 斜体, 删除线, None) 片段
 
+    文本框、图形里的内容单独渲染：里面的超链接才算得上链接，
+    直接抽 w:t 只能拿到文字，地址会丢。
+    """
     rpr = r_element.find(qn('w:rPr'))
     bold = italic = strike = False
     if rpr is not None:
         bold = _switch_on(rpr.find(qn('w:b')))
         italic = _switch_on(rpr.find(qn('w:i')))
         strike = _switch_on(rpr.find(qn('w:strike')))
-    return (text, bold, italic, strike, None)
+
+    segs = []
+    texts = []
+
+    def flush():
+        if texts:
+            segs.append(("".join(texts), bold, italic, strike, None))
+            del texts[:]
+
+    for node in r_element:
+        tag = node.tag
+        if tag == qn('w:t'):
+            texts.append(node.text or "")
+        elif tag in (qn('w:br'), qn('w:cr')):
+            texts.append(_render_break(node))
+        elif tag == qn('w:tab'):
+            texts.append("\t")
+        elif tag in (qn('w:drawing'), qn('w:pict'), qn('w:object')):
+            box = _textbox_segments(node, doc)
+            if box:
+                flush()
+                segs.extend(box)
+        elif tag == _mc('AlternateContent'):
+            branch = _mc_branch(node)
+            if branch is not None:
+                box = _textbox_segments(branch, doc)
+                if box:
+                    flush()
+                    segs.extend(box)
+        else:
+            # 其他子元素（如 w:ruby 的注音）继续往里找文字
+            for sub in node.iter(qn('w:t')):
+                texts.append(sub.text or "")
+    flush()
+    return segs
+
+
+def _mc_branch(node):
+    """mc:AlternateContent 里要采用的分支
+
+    优先用 mc:Choice（Word 2010 之后的写法），没有才退回 mc:Fallback。
+    """
+    choice = node.find(_mc('Choice'))
+    if choice is not None:
+        return choice
+    return node.find(_mc('Fallback'))
+
+
+def _textbox_segments(node, doc=None) -> list:
+    """文本框（w:drawing / w:pict）里的内容，转成行内片段
+
+    文本框里的内容按段落单独渲染，里面的超链接才不会丢。
+    """
+    segs = []
+    for txbx in node.iter(qn('w:txbxContent')):
+        for para in txbx.findall(qn('w:p')):
+            inner = []
+            _collect_segments(para, doc, inner)
+            text = _segments_to_markdown(inner)
+            if text:
+                segs.append((text, False, False, False, None))
+    return segs
+
+
+def _textbox_text(node, doc=None) -> str:
+    """文本框里的文字（表格单元格用）"""
+    return "".join(text for text, _, _, _, _ in _textbox_segments(node, doc))
 
 
 def _segments_to_markdown(segs) -> str:
@@ -1794,18 +1896,110 @@ def _render_break(elem) -> str:
     return "\n"
 
 
-def _hyperlink_url(hl_element, doc=None) -> str:
-    """取超链接的目标地址，没有地址时返回空串"""
+def _hyperlink_target(hl_element, doc=None) -> str:
+    """取超链接的目标地址，没有地址时返回空串
+
+    外部链接的地址写在 r:id 指向的关系里；文档内部的书签链接只有 w:anchor，
+    统一转成 Markdown 的「#锚点」形式，否则这个链接会被整个丢掉。
+    """
+    url = ""
     rid = hl_element.get(qn('r:id'))
-    if not rid or doc is None:
+    if rid and doc is not None:
+        try:
+            rel = doc.part.rels.get(rid)
+        except Exception:
+            rel = None
+        if rel is not None:
+            url = rel.target_ref or ""
+    if not url:
+        # 文档内部的书签链接：w:anchor 是书签名，w:docLocation 是完整位置
+        anchor = hl_element.get(qn('w:anchor')) or hl_element.get(qn('w:docLocation'))
+        if anchor:
+            url = "#" + anchor
+    return url if isinstance(url, str) else str(url)
+
+
+# HYPERLINK 域代码：HYPERLINK "地址" \l "书签" \o "提示文字"
+# \l 是文档内部的书签链接，\o 等开关只是提示信息，摘掉后剩下的才是地址
+_HYPERLINK_FIELD_RE = re.compile(r'\s*HYPERLINK\b', re.IGNORECASE)
+_FIELD_SWITCH_RE = re.compile(r'\\[a-zA-Z]\s*(?:"[^"]*"|\S+)')
+_QUOTED_RE = re.compile(r'"([^"]*)"')
+_ANCHOR_SWITCH_RE = re.compile(r'\\l\s+"([^"]*)"', re.IGNORECASE)
+_URL_RE = re.compile(r'(?:https?://|mailto:|file:|ftp:)\S+', re.IGNORECASE)
+
+
+def _hyperlink_in_instr(instr: str) -> str:
+    """从 HYPERLINK 域代码里取链接地址，取不到返回空串"""
+    if not instr or not _HYPERLINK_FIELD_RE.match(instr):
         return ""
-    try:
-        rel = doc.part.rels.get(rid)
-    except Exception:
-        return ""
-    if rel is None:
-        return ""
-    return rel.target_ref or ""
+    anchor = _ANCHOR_SWITCH_RE.search(instr)
+    if anchor:
+        return "#" + anchor.group(1)
+    rest = _FIELD_SWITCH_RE.sub(' ', instr)
+    m = _QUOTED_RE.search(rest)
+    if m:
+        return m.group(1)
+    m = _URL_RE.search(rest)
+    if m:
+        return m.group(0)
+    return ""
+
+
+def _is_field_begin(element) -> bool:
+    """元素是不是复杂域的「域开始」"""
+    for node in element.iter(qn('w:fldChar')):
+        if node.get(qn('w:fldCharType')) == 'begin':
+            return True
+    return False
+
+
+def _scan_field(children, index):
+    """扫描复杂域，返回 (域代码, 域结果起始下标, 域结束下标)
+
+    域结果起始下标为 None 表示这个域没有结果（还没更新过）。
+    """
+    if not _is_field_begin(children[index]):
+        return "", None, None
+    instr = []
+    sep = None
+    end = None
+    j = index
+    while j < len(children):
+        for node in children[j].iter():
+            if node.tag == qn('w:instrText'):
+                instr.append(node.text or "")
+            elif node.tag == qn('w:fldChar'):
+                kind = node.get(qn('w:fldCharType'))
+                if kind == 'separate' and sep is None:
+                    sep = j
+                elif kind == 'end':
+                    end = j
+                    break
+        if end is not None:
+            break
+        j += 1
+    return "".join(instr), sep, end
+
+
+def _field_hyperlink(children, index, doc=None):
+    """识别复杂域，若是 HYPERLINK 域就返回 (地址, 显示文字, 下一个待处理下标)
+
+    Word 里插入的超链接除了 w:hyperlink 元素，还可能写成复杂域：
+    「域开始 → 域代码 HYPERLINK "地址" → 域结果 → 域结束」。
+    这种域的地址不在 w:t 里，不单独识别就会整个丢掉。
+    """
+    instr, sep, end = _scan_field(children, index)
+    if end is None:
+        return None
+    url = _hyperlink_in_instr(instr)
+    if not url:
+        return None
+    text = ""
+    if sep is not None:
+        inner = []
+        _collect_segments_from(children[sep + 1:end], doc, inner)
+        text = _segments_to_markdown(inner)
+    return url, text, end + 1
 
 
 def _is_bullet_list(para) -> bool:
@@ -1853,7 +2047,7 @@ def _table_rows(tbl):
             yield tr
 
 
-def _extract_table_grid(tbl) -> list:
+def _extract_table_grid(tbl, doc=None) -> list:
     """提取表格为二维网格，正确处理合并单元格"""
     grid = []
     vmerge_pending = {}
@@ -1886,7 +2080,7 @@ def _extract_table_grid(tbl) -> list:
                     val = vm.get(qn('w:val'))
                     vmerge_state = "restart" if val == "restart" else "continue"
 
-            cell_text = _tc_text(tc)
+            cell_text = _tc_text(tc, doc)
 
             if vmerge_state == "restart":
                 for i in range(grid_span):
@@ -1939,21 +2133,86 @@ def _table_header_flags(tbl) -> list:
     return flags
 
 
-def _tc_text(tc_element) -> str:
-    """提取 tc 元素的纯文本（含公式的 LaTeX 形式）"""
-    texts = []
-    for t in tc_element.iter():
-        if t.tag == qn('w:t'):
-            texts.append(t.text or "")
-        elif t.tag in (_m('oMath'), _m('oMathPara')):
-            # 块级公式是 m:oMathPara 里再套一个 m:oMath，迭代时两个都会遇到，
-            # 都渲染一遍公式就会重复出现，所以只认外层的 oMathPara
-            if t.tag == _m('oMath'):
-                parent = t.getparent()
-                if parent is not None and parent.tag == _m('oMathPara'):
-                    continue
-            texts.append(render_math(t))
-    return "".join(texts)
+def _tc_text(tc_element, doc=None) -> str:
+    """提取 tc 元素的文本（含公式的 LaTeX 形式与超链接）"""
+    parts = []
+    _collect_cell_text(tc_element, doc, parts)
+    return "".join(parts)
+
+
+def _collect_cell_text(parent, doc, parts):
+    """递归收集单元格里的内容
+
+    单元格里的超链接要跟正文里一样转成 Markdown 链接：
+    只抽 w:t 能拿到文字，链接地址会丢（表格里的参考链接、文献列表很常见）。
+    """
+    for child in parent:
+        tag = child.tag
+        if tag == qn('w:t'):
+            parts.append(child.text or "")
+        elif tag == qn('w:r'):
+            _collect_cell_run_text(child, doc, parts)
+        elif tag == qn('w:hyperlink'):
+            url = _hyperlink_target(child, doc)
+            inner = []
+            _collect_cell_text(child, doc, inner)
+            text = "".join(inner)
+            if text:
+                parts.append(f"[{text}]({url})" if url else text)
+        elif tag == qn('w:fldSimple'):
+            url = _hyperlink_in_instr(child.get(qn('w:instr')) or '')
+            inner = []
+            _collect_cell_text(child, doc, inner)
+            text = "".join(inner)
+            if text:
+                parts.append(f"[{text}]({url})" if url else text)
+        elif tag in _INLINE_CONTAINER_TAGS:
+            content = child.find(qn('w:sdtContent'))
+            _collect_cell_text(content if content is not None else child, doc, parts)
+        elif tag in (_m('oMath'), _m('oMathPara')):
+            parts.append(_render_cell_math(child))
+        elif tag in (qn('w:drawing'), qn('w:pict'), qn('w:object')):
+            parts.append(_textbox_text(child, doc))
+        elif tag == _mc('AlternateContent'):
+            branch = _mc_branch(child)
+            if branch is not None:
+                parts.append(_textbox_text(branch, doc))
+        else:
+            # 段落、行、单元格、嵌套表格等容器继续往下找
+            _collect_cell_text(child, doc, parts)
+
+
+def _collect_cell_run_text(r_element, doc, parts):
+    """收集一个 run 里的内容（文字、公式、文本框）"""
+    for node in r_element:
+        tag = node.tag
+        if tag == qn('w:t'):
+            parts.append(node.text or "")
+        elif tag in (_m('oMath'), _m('oMathPara')):
+            parts.append(_render_cell_math(node))
+        elif tag in (qn('w:drawing'), qn('w:pict'), qn('w:object')):
+            parts.append(_textbox_text(node, doc))
+        elif tag == _mc('AlternateContent'):
+            branch = _mc_branch(node)
+            if branch is not None:
+                parts.append(_textbox_text(branch, doc))
+        else:
+            # 其他子元素（如 w:ruby 的注音）继续往里找文字
+            for sub in node.iter(qn('w:t')):
+                parts.append(sub.text or "")
+
+
+def _render_cell_math(node) -> str:
+    """单元格里的公式
+
+    块级公式是 m:oMathPara 里再套一个 m:oMath，两个都渲染一遍公式就会重复出现，
+    所以只认外层的 oMathPara。
+    """
+    if node.tag == _m('oMath'):
+        parent = node.getparent()
+        if parent is not None and parent.tag == _m('oMathPara'):
+            return ""
+    return render_math(node)
 
 
 # ══════════════════════════════════════════════════════════════════

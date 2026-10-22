@@ -20,6 +20,8 @@ import os
 import argparse
 import glob
 from docx import Document
+from docx.enum.style import WD_STYLE_TYPE
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.oxml.ns import qn
 from docx.shared import Inches, RGBColor
 from docx.oxml import OxmlElement
@@ -105,6 +107,74 @@ _LINK_PATTERN = (r'\[(?P<link_t>.+?)\]'
 # 链接文字里的 `代码` 则在递归处理链接文字时识别
 _INLINE_TOKEN_RE = re.compile(r'`[^`]+`|' + _LINK_PATTERN)
 
+# Word 内置的超链接字符样式名与链接文字颜色
+_HYPERLINK_STYLE_NAME = 'Hyperlink'
+_LINK_COLOR = RGBColor(0x05, 0x63, 0xC1)
+
+
+def _ensure_hyperlink_style(styles):
+    """确保文档里有「Hyperlink」字符样式
+
+    Word 自己插入的超链接用的就是这个字符样式（蓝色带下划线）。
+    没有它的话链接只能靠直接格式变蓝，用户在 Word 里改样式时链接就跟不上了。
+    """
+    try:
+        styles[_HYPERLINK_STYLE_NAME]
+        return
+    except KeyError:
+        pass
+    try:
+        style = styles.add_style(_HYPERLINK_STYLE_NAME,
+                                 WD_STYLE_TYPE.CHARACTER, builtin=True)
+        style.font.color.rgb = _LINK_COLOR
+        style.font.underline = True
+    except Exception:
+        # 样式建不出来也不影响链接本身，下面还有直接格式兜底
+        pass
+
+
+def _iter_runs(para):
+    """段落里的所有 run（包括 w:hyperlink 里的）
+
+    链接文字的 run 在 w:hyperlink 元素里，不是段落的直属子元素，
+    只遍历 para.runs 会漏掉它们。
+    """
+    from docx.text.run import Run
+    return [Run(r, para) for r in para._p.iter(qn('w:r'))]
+
+
+def _add_hyperlink(para, url, write_text):
+    """写入真正的超链接（w:hyperlink 元素 + 指向目标的关系）
+
+    write_text 负责把链接文字写进段落（可以带粗体、斜体等格式），
+    写完再把产生的 run 搬进 w:hyperlink，链接才是可点击的。
+    """
+    start = len(para.runs)
+    write_text()
+    link_runs = para.runs[start:]
+    if not link_runs:
+        return
+
+    # 第一次写链接时才建样式，没有链接的文档不受影响
+    _ensure_hyperlink_style(para.part.styles)
+
+    hl = OxmlElement('w:hyperlink')
+    hl.set(qn('w:history'), '1')
+    if url.startswith('#'):
+        # 文档内部的书签链接没有外部地址，只写锚点
+        hl.set(qn('w:anchor'), url[1:])
+    else:
+        r_id = para.part.relate_to(url, RT.HYPERLINK, is_external=True)
+        hl.set(qn('r:id'), r_id)
+
+    # 先在链接文字原来的位置插进去，再把 run 搬进去，顺序才不会乱
+    link_runs[0]._r.addprevious(hl)
+    for run in link_runs:
+        hl.append(run._r)
+        run.font.color.rgb = _LINK_COLOR
+        run.font.underline = True
+        run.style = _HYPERLINK_STYLE_NAME
+
 
 def _add_text_segment(para, text):
     """写入非公式片段，处理行内代码、链接与其余行内格式"""
@@ -115,11 +185,10 @@ def _add_text_segment(para, text):
 
         if m.group('link_t') is not None:
             # 链接文字内部可能还有 **粗体** / *斜体* / `代码`
-            start = len(para.runs)
-            _add_text_segment(para, m.group('link_t'))
-            for run in para.runs[start:]:
-                run.font.color.rgb = RGBColor(0x05, 0x63, 0xC1)
-                run.font.underline = True
+            link_t = m.group('link_t')
+            link_u = m.group('link_u')
+            _add_hyperlink(para, link_u,
+                           lambda: _add_text_segment(para, link_t))
         else:
             _add_mono_run(para, m.group(0)[1:-1])
 
@@ -159,12 +228,11 @@ def _add_formatted_runs(para, text):
             run.font.strike = True
         elif m.group('link'):
             # 链接文字内部可能还有 **粗体** / *斜体*，先递归解析，
-            # 再把链接的颜色与下划线统一加到这些 run 上
-            start = len(para.runs)
-            _add_text_segment(para, m.group('link_t'))
-            for run in para.runs[start:]:
-                run.font.color.rgb = RGBColor(0x05, 0x63, 0xC1)
-                run.font.underline = True
+            # 再把产生的 run 搬进 w:hyperlink
+            link_t = m.group('link_t')
+            link_u = m.group('link_u')
+            _add_hyperlink(para, link_u,
+                           lambda: _add_text_segment(para, link_t))
 
         pos = m.end()
 
@@ -987,7 +1055,8 @@ def convert(md_path):
                 for j, h in enumerate(headers):
                     cell = table.rows[0].cells[j]
                     _add_formatted_text(cell.paragraphs[0], h)
-                    for run in cell.paragraphs[0].runs:
+                    # 链接文字的 run 在 w:hyperlink 里，只遍历 para.runs 会漏掉
+                    for run in _iter_runs(cell.paragraphs[0]):
                         run.bold = True
 
                 for r_idx, row in enumerate(rows):

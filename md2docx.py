@@ -19,6 +19,7 @@ import re
 import os
 import argparse
 import glob
+import urllib.parse
 from docx import Document
 from docx.enum.style import WD_STYLE_TYPE
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
@@ -103,9 +104,18 @@ def _add_mono_run(para, text):
 _LINK_PATTERN = (r'\[(?P<link_t>.+?)\]'
                  r'\((?P<link_u>(?:[^()]|\([^()]*\))*)\)')
 
-# 代码段与链接按出现顺序匹配：`代码` 里的链接记号保持原样，
+# 图片必须在链接之前匹配：否则 ![说明](a.png) 会先被链接规则吃掉，
+# 只剩一个孤零零的 ! 写进正文
+_IMAGE_PATTERN = (r'!\[(?P<img_alt>[^\]]*)\]'
+                  r'\((?P<img_src>(?:[^()]|\([^()]*\))*)\)')
+
+# 代码段、图片与链接按出现顺序匹配：`代码` 里的记号保持原样，
 # 链接文字里的 `代码` 则在递归处理链接文字时识别
-_INLINE_TOKEN_RE = re.compile(r'`[^`]+`|' + _LINK_PATTERN)
+_INLINE_TOKEN_RE = re.compile(r'`[^`]+`|' + _IMAGE_PATTERN + r'|' + _LINK_PATTERN)
+
+# 转换过程中的上下文：md 所在目录（解析相对图片路径）与版心宽度（大图缩放）
+_BASE_DIR = None
+_CONTENT_WIDTH = None
 
 # Word 内置的超链接字符样式名与链接文字颜色
 _HYPERLINK_STYLE_NAME = 'Hyperlink'
@@ -176,14 +186,51 @@ def _add_hyperlink(para, url, write_text):
         run.style = _HYPERLINK_STYLE_NAME
 
 
+def _add_image_run(para, src, alt=''):
+    """插入图片；找不到文件时把原始 Markdown 写成文字，绝不静默吞掉
+
+    缩放策略：超过版心宽度就等比缩到版心宽，否则保持原始尺寸
+    （小图标不该被放大，大图不该把版式撑破）。
+    """
+    raw = f'![{alt}]({src})'
+    path = src
+    if not os.path.isabs(path) and _BASE_DIR:
+        path = os.path.join(_BASE_DIR, path)
+    try:
+        path = urllib.parse.unquote(path)
+    except Exception:
+        pass
+    if not os.path.isfile(path):
+        para.add_run(raw)
+        print(f'警告: 图片不存在，按原文保留: {src}', file=sys.stderr)
+        return
+    try:
+        shape = para.add_run().add_picture(path)
+    except Exception as e:
+        # EMF/WMF 等 python-docx 不支持的格式，退回原文，别丢内容
+        para.add_run(raw)
+        print(f'警告: 图片插入失败 {src}: {e}', file=sys.stderr)
+        return
+    try:
+        width, height = int(shape.width or 0), int(shape.height or 0)
+        if _CONTENT_WIDTH and width > _CONTENT_WIDTH > 0:
+            ratio = _CONTENT_WIDTH / width
+            shape.height = int(height * ratio)
+            shape.width = int(_CONTENT_WIDTH)
+    except Exception:
+        pass
+
+
 def _add_text_segment(para, text):
-    """写入非公式片段，处理行内代码、链接与其余行内格式"""
+    """写入非公式片段，处理行内代码、图片、链接与其余行内格式"""
     pos = 0
     for m in _INLINE_TOKEN_RE.finditer(text):
         if m.start() > pos:
             _add_formatted_runs(para, text[pos:m.start()])
 
-        if m.group('link_t') is not None:
+        if m.group('img_src') is not None:
+            _add_image_run(para, m.group('img_src'), m.group('img_alt'))
+        elif m.group('link_t') is not None:
             # 链接文字内部可能还有 **粗体** / *斜体* / `代码`
             link_t = m.group('link_t')
             link_u = m.group('link_u')
@@ -799,6 +846,18 @@ def _m_node(node):
     return []
 
 
+# 矩阵环境的定界符。Word 里矩阵本身不带括号，靠外层 m:d 画出来；
+# 不包这一层，pmatrix 转出来就是个没有括号的裸矩阵，数学含义会变。
+_MATRIX_DELIMS = {
+    'matrix': ('', ''),
+    'pmatrix': ('(', ')'),
+    'bmatrix': ('[', ']'),
+    'Bmatrix': ('{', '}'),
+    'vmatrix': ('|', '|'),
+    'Vmatrix': ('‖', '‖'),
+}
+
+
 def _m_env(env, rows):
     """matrix / bmatrix / aligned / array 等环境"""
     from lxml import etree
@@ -813,7 +872,17 @@ def _m_env(env, rows):
         mr = etree.SubElement(matrix, _mtag('mr'))
         for cell in row:
             mr.append(_m_arg('e', cell))
-    return [matrix]
+
+    beg, end = _MATRIX_DELIMS.get(env or '', ('', ''))
+    if not beg and not end:
+        return [matrix]
+    d = etree.Element(_mtag('d'))
+    dpr = etree.SubElement(d, _mtag('dPr'))
+    # dPr 子元素顺序：begChr → sepChr → endChr → grow → shp
+    etree.SubElement(dpr, _mtag('begChr')).set(_mtag('val'), beg)
+    etree.SubElement(dpr, _mtag('endChr')).set(_mtag('val'), end)
+    etree.SubElement(d, _mtag('e')).append(matrix)
+    return [d]
 
 
 def latex_to_omml(latex):
@@ -868,8 +937,15 @@ def _find_list_number_abstract_id(num_part):
     return None
 
 
-def _add_num_override(num_part, num_id):
-    """新建一个 w:num，用 lvlOverride 让有序列表从 1 重新编号"""
+def _add_num_override(num_part, num_id, start=1, ilvl=0, lvl_text=None):
+    """新建一个 w:num，用 lvlOverride 指定该组有序列表的起始号与编号格式
+
+    start 取该组第一项在 Markdown 里写的数字，这样 `2. 3. 4.` 这种
+    被段落打断的续编号列表能原样还原，而不是一律从 1 重排。
+
+    lvl_text 用于还原公文习惯的 `1)` 写法（List Number 样式默认是 `1.`），
+    传 `%1)` 这样的格式串，不传则沿用样式自带的 `%1.`。
+    """
     from lxml import etree
     abstract_id = _find_list_number_abstract_id(num_part)
     if abstract_id is None:
@@ -879,9 +955,17 @@ def _add_num_override(num_part, num_id):
     abstract_ref = etree.SubElement(num_elem, qn('w:abstractNumId'))
     abstract_ref.set(qn('w:val'), abstract_id)
     override = etree.SubElement(num_elem, qn('w:lvlOverride'))
-    override.set(qn('w:ilvl'), '0')
+    override.set(qn('w:ilvl'), str(ilvl))
     start_override = etree.SubElement(override, qn('w:startOverride'))
-    start_override.set(qn('w:val'), '1')
+    start_override.set(qn('w:val'), str(start))
+    if lvl_text:
+        # lvlOverride 里的 w:lvl 会整体覆盖该级定义，子元素顺序必须按 schema 排
+        lvl = etree.SubElement(override, qn('w:lvl'))
+        lvl.set(qn('w:ilvl'), str(ilvl))
+        etree.SubElement(lvl, qn('w:start')).set(qn('w:val'), str(start))
+        etree.SubElement(lvl, qn('w:numFmt')).set(qn('w:val'), 'decimal')
+        etree.SubElement(lvl, qn('w:lvlText')).set(qn('w:val'), lvl_text)
+        etree.SubElement(lvl, qn('w:lvlJc')).set(qn('w:val'), 'left')
     return num_id
 
 
@@ -898,6 +982,47 @@ def _cancel_style_color_overrides(doc):
             rpr.remove(color)
 
 
+def _set_bottom_border(para):
+    """分隔线（`---`）写成段落下边框，docx2md 回读时还原成 `---`
+
+    早先用 50 个下划线字符模拟，回程就变成一串下划线正文：既不可逆，
+    又会被读文档的 AI 当成真实内容。
+    """
+    pPr = para._p.get_or_add_pPr()
+    pbdr = OxmlElement('w:pBdr')
+    bottom = OxmlElement('w:bottom')
+    bottom.set(qn('w:val'), 'single')
+    bottom.set(qn('w:sz'), '6')
+    bottom.set(qn('w:space'), '1')
+    bottom.set(qn('w:color'), 'auto')
+    pbdr.append(bottom)
+    # pPr 子元素顺序由 schema 规定，w:pBdr 必须排在 shd / tabs / spacing 之前
+    pPr.insert_element_before(
+        pbdr,
+        'w:shd', 'w:tabs', 'w:suppressAutoHyphens', 'w:kinsoku', 'w:wordWrap',
+        'w:overflowPunct', 'w:topLinePunct', 'w:autoSpaceDE', 'w:autoSpaceDN',
+        'w:bidi', 'w:adjustRightInd', 'w:snapToGrid', 'w:spacing', 'w:ind',
+        'w:contextualSpacing', 'w:mirrorIndents', 'w:suppressOverlap', 'w:jc',
+        'w:textDirection', 'w:textAlignment', 'w:textboxTightWrap',
+        'w:outlineLvl', 'w:divId', 'w:cnfStyle', 'w:rPr', 'w:sectPr',
+        'w:pPrChange',
+    )
+
+
+def _quote_paragraph(doc):
+    """引用块用 Quote 样式，docx2md 才能还原成 `> `
+
+    早先版本直接用默认段落，样式信息在回程里彻底丢失，`>` 不可逆。
+    模板里没有 Quote 样式时退回普通段落（内容不丢，只是回程无 `>`）。
+    """
+    for name in ('Quote', 'Intense Quote'):
+        try:
+            return doc.add_paragraph(style=name)
+        except KeyError:
+            continue
+    return doc.add_paragraph()
+
+
 def _set_list_indent(para, level):
     """按列表层级设置缩进（level 从 1 开始）
 
@@ -911,17 +1036,22 @@ def _set_list_indent(para, level):
 
 def convert(md_path):
     """将单个 markdown 文件转换为同目录同名的 docx"""
+    global _BASE_DIR, _CONTENT_WIDTH
+    _BASE_DIR = os.path.dirname(os.path.abspath(md_path))
     with open(md_path, 'r', encoding='utf-8') as f:
         lines = f.readlines()
 
     doc = Document()
     _link_default_fonts_to_theme(doc)
     _cancel_style_color_overrides(doc)
+    try:
+        sec = doc.sections[0]
+        _CONTENT_WIDTH = int(sec.page_width - sec.left_margin - sec.right_margin)
+    except Exception:
+        _CONTENT_WIDTH = None
 
     in_code_block = False
     code_content = []
-    blockquote_lines = []
-    in_blockquote = False
     list_level = 0
     ol_next_num_id = 10
     ol_group_active = False
@@ -950,11 +1080,6 @@ def convert(md_path):
             continue
 
         if not line.strip():
-            if in_blockquote:
-                para = doc.add_paragraph()
-                _add_formatted_text(para, ' '.join(blockquote_lines))
-                in_blockquote = False
-                blockquote_lines = []
             list_level = 0
             ol_group_active = False
             i += 1
@@ -962,7 +1087,7 @@ def convert(md_path):
 
         if re.match(r'^[\-\*_]{3,}\s*$', line.strip()):
             para = doc.add_paragraph()
-            para.add_run('_' * 50)
+            _set_bottom_border(para)
             ol_group_active = False
             i += 1
             continue
@@ -990,8 +1115,11 @@ def convert(md_path):
 
         bq_match = re.match(r'^>\s?(.*)$', line)
         if bq_match:
-            in_blockquote = True
-            blockquote_lines.append(bq_match.group(1))
+            # 逐行成段：docx2md 里每条引用就是一个独立段落（图注、条文引用），
+            # 合并成一个段落会让往返不可逆（两条图注会粘成一段）
+            para = _quote_paragraph(doc)
+            _add_formatted_text(para, bq_match.group(1).strip())
+            list_level = 0
             ol_group_active = False
             i += 1
             continue
@@ -1015,11 +1143,12 @@ def convert(md_path):
             i += 1
             continue
 
-        ol_match = re.match(r'^(\s*)\d+[.)]\s+(.+)$', line)
+        ol_match = re.match(r'^(\s*)(\d+)([.)])\s+(.+)$', line)
         if ol_match:
             # Tab 按 4 个空格算；Word 最多 9 级列表
             indent = len(ol_match.group(1).expandtabs(4))
-            content = ol_match.group(2)
+            marker_num = int(ol_match.group(2))
+            content = ol_match.group(4)
             new_level = min(indent // 2 + 1, 9)
 
             while list_level > new_level:
@@ -1029,11 +1158,18 @@ def convert(md_path):
 
             if not ol_group_active:
                 # 模板里没有 List Number 的编号定义时会失败，这时只能退回样式自带的编号
+                # 起始号取本组第一项写的数字：被段落打断的续编号列表（2. 3. 4.）能原样还原
+                # 分隔符是 `)` 时改写该级编号格式，公文里的「1) 2) 3)」才不会退化成「1. 2. 3.」
+                sep = ol_match.group(3)
+                lvl_text = f'%{new_level})' if sep == ')' else None
                 ol_current_num_id = _add_num_override(doc.part.numbering_part,
-                                                      ol_next_num_id)
+                                                      ol_next_num_id,
+                                                      start=marker_num,
+                                                      ilvl=new_level - 1,
+                                                      lvl_text=lvl_text)
                 if ol_current_num_id is None:
                     print("警告: 文档里没有 List Number 的编号定义，"
-                          "有序列表无法每组从 1 重新计数", file=sys.stderr)
+                          "有序列表无法按原起始号编号", file=sys.stderr)
                 ol_next_num_id += 1
                 ol_group_active = True
 
@@ -1095,20 +1231,10 @@ def convert(md_path):
             ol_group_active = False
             continue
 
-        if in_blockquote:
-            para = doc.add_paragraph()
-            _add_formatted_text(para, ' '.join(blockquote_lines))
-            in_blockquote = False
-            blockquote_lines = []
-
         para = doc.add_paragraph()
         _add_formatted_text(para, line.strip())
         ol_group_active = False
         i += 1
-
-    if in_blockquote and blockquote_lines:
-        para = doc.add_paragraph()
-        _add_formatted_text(para, ' '.join(blockquote_lines))
 
     out_path = os.path.splitext(md_path)[0] + '.docx'
     doc.save(out_path)

@@ -383,6 +383,27 @@ def _first_row_is_header(data) -> bool:
     return avg_first * 1.5 < avg_rest
 
 
+def _header_covers_data(header_rows, data_rows) -> bool:
+    """判断表头块是否覆盖了数据行的全部列
+
+    表单类表格（「工程名称 | 值」逐行排列）首列才是标签，右侧的值常由
+    gridSpan 合并成多列，按文字猜表头时会把整段表单误并成一行表头。
+    真正的表头应当给每个有数据的列一个标题，否则宁可当作无表头。
+    """
+    if not data_rows:
+        return True
+
+    def used_columns(rows):
+        cols = set()
+        for row in rows:
+            for ci, cell in enumerate(row):
+                if str(cell or "").strip():
+                    cols.add(ci)
+        return cols
+
+    return used_columns(data_rows) <= used_columns(header_rows)
+
+
 def _detect_header_count(data, header_flags=None) -> int:
     """推断表头行数
 
@@ -403,6 +424,9 @@ def _detect_header_count(data, header_flags=None) -> int:
             break
         count += 1
     if count:
+        # 表头没覆盖到数据行的列，说明这是逐行排列的表单而不是表头
+        if not _header_covers_data(data[:count], data[count:]):
+            return 0
         # 只有一行：按「无表头」处理（空表头 + 一行数据），
         # 否则会在拍平成表头后因没有数据行而丢掉整张表
         if len(data) == 1:

@@ -289,38 +289,13 @@ def headers_match(a, b) -> bool:
     return a_clean == b_clean
 
 
-def _header_similarity(a, b) -> float:
-    def chars(headers):
-        s = set()
-        for h in headers:
-            for c in h.strip().lower():
-                if not c.isspace():
-                    s.add(c)
-        return s
-
-    ca, cb = chars(a), chars(b)
-    if not ca and not cb:
-        return 1.0
-    if not ca or not cb:
-        return 0.0
-    return len(ca & cb) / len(ca | cb)
-
-
-def _looks_like_data_row(block: Block) -> bool:
-    if not block.rows:
-        return False
-    first = block.rows[0]
-    non_empty = [c.strip() for c in first if c.strip()]
-    if not non_empty:
-        return False
-    for t in non_empty:
-        if _CODE_PATTERN.match(t):
-            return True
-    return False
-
-
 def merge_consecutive_tables(blocks) -> list:
-    """合并紧挨着的两张表（Word 里被拆成两个 w:tbl 的同一张表）"""
+    """合并跨页拆开的同一张表（后一段重复了与前一段相同的表头）
+
+    只认表头完全一致。表头不同的相邻表格是各自独立的表（例如一份报告里
+    连续排列的多张同版式表单），不能合并：合并会把后一张表的首行当成
+    重复表头丢掉，整行内容就没了。
+    """
     if len(blocks) < 2:
         return blocks
 
@@ -339,28 +314,11 @@ def merge_consecutive_tables(blocks) -> list:
             i += 1
             continue
 
-        should_merge = False
-        merged_rows = nxt.rows
-        nxt_first_row = list(nxt.rows[0]) if nxt.rows else []
-
         if headers_match(current.headers, nxt.headers):
-            should_merge = True
-        elif _looks_like_data_row(nxt):
-            should_merge = True
-        elif _header_similarity(current.headers, nxt.headers) >= 0.8:
-            if _looks_like_data_row(nxt) or not headers_match(nxt.headers,
-                                                             nxt_first_row):
-                should_merge = True
-            if should_merge and nxt.rows and not _looks_like_data_row(nxt):
-                if _header_similarity(nxt.headers, nxt_first_row) >= 0.8:
-                    # 后一张表的首行其实是表头，合并时丢掉
-                    merged_rows = nxt.rows[1:]
-
-        if should_merge:
             merged = Block(
                 type="table",
                 headers=current.headers,
-                rows=current.rows + merged_rows,
+                rows=current.rows + nxt.rows,
             )
             i += 2
             while (i < len(blocks) and blocks[i].type == "table"

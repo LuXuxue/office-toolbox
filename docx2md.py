@@ -46,14 +46,131 @@ class Block:
 
 
 # ══════════════════════════════════════════════════════════════════
+# 图片导出
+# ══════════════════════════════════════════════════════════════════
+#
+# docx 的图片存在包内 word/media/ 下，正文里只留一个 r:embed 关系 id。
+# 早先版本遇到 w:drawing 只取文本框文字，图片整体消失且 md 里毫无痕迹，
+# 读文档的 AI 会以为这一段本来就是空的。现在导出到 `<md名>_media/` 并
+# 在原位写 `![](…/image1.png)`；未配置输出目录（被当库调用）时退回
+# `<!-- image: image1.png -->` 注释，至少保留「此处有图」这个事实。
+_MEDIA = None
+_VML_NS = 'urn:schemas-microsoft-com:vml'
+
+
+class _MediaDir:
+    """图片落盘器：懒建目录，同一张图只写一次"""
+
+    def __init__(self, directory: Path, rel_prefix: str):
+        self.directory = directory
+        self.rel_prefix = rel_prefix
+        self.written = set()
+
+    def save(self, name: str, blob: bytes) -> str:
+        if name not in self.written:
+            try:
+                self.directory.mkdir(parents=True, exist_ok=True)
+                (self.directory / name).write_bytes(blob)
+                self.written.add(name)
+            except OSError as e:
+                print(f"警告: 图片写入失败 {name}: {e}", file=sys.stderr)
+                return ""
+        return f"{self.rel_prefix}/{name}"
+
+
+def _media_ref(doc, rid: str):
+    """把一个图片关系 id 落成磁盘文件，返回 Markdown 里用的相对路径
+
+    写盘失败或关系缺失时返回占位注释，调用方据此仍能在原文位置留下标记。
+    """
+    part = None
+    try:
+        part = doc.part.related_parts[rid]
+    except (KeyError, AttributeError, TypeError):
+        part = None
+    name = ""
+    blob = b""
+    if part is not None:
+        blob = getattr(part, "blob", b"") or b""
+        partname = str(getattr(part, "partname", "") or "")
+        name = partname.rsplit("/", 1)[-1]
+    if not name:
+        name = f"{rid}.png"
+    if not blob:
+        return f"<!-- image: {name} (missing) -->"
+    if _MEDIA is None:
+        return f"<!-- image: {name} -->"
+    rel = _MEDIA.save(name, blob)
+    if not rel:
+        return f"<!-- image: {name} (write failed) -->"
+    return f"![]({rel})"
+
+
+def _image_segments(node, doc=None) -> list:
+    """drawing/pict 里的图片，转成行内片段（DrawingML 与老式 VML 两种写法）"""
+    if doc is None:
+        return []
+    rids = []
+    for blip in node.iter(qn('a:blip')):
+        rid = blip.get(qn('r:embed')) or blip.get(qn('r:link'))
+        if rid:
+            rids.append(rid)
+    for imagedata in node.iter(f'{{{_VML_NS}}}imagedata'):
+        rid = imagedata.get(qn('r:id'))
+        if rid:
+            rids.append(rid)
+
+    segs = []
+    seen = set()
+    for rid in rids:
+        if rid in seen:
+            continue
+        seen.add(rid)
+        ref = _media_ref(doc, rid)
+        if ref:
+            segs.append((ref, False, False, False, None))
+    return segs
+
+
+def _drawing_segments(node, doc=None) -> list:
+    """一段 w:drawing / w:pict 的全部可读内容：图片 + 文本框文字"""
+    segs = _image_segments(node, doc)
+    segs.extend(_textbox_segments(node, doc))
+    return segs
+
+
+def _drawing_text(node, doc=None) -> str:
+    """表格单元格里用的扁平文本（图片会渲染成 Markdown 图片语法）"""
+    return "".join(text for text, _, _, _, _ in _drawing_segments(node, doc))
+
+
+# ══════════════════════════════════════════════════════════════════
 # 后处理
 # ══════════════════════════════════════════════════════════════════
 
-def remove_cjk_spaces(text: str) -> str:
-    """去除中文字符之间的空格（半角与全角）"""
+_BOOK_TITLE_RE = re.compile(r'《[^》]*》')
+
+
+def _strip_cjk_gaps(text: str) -> str:
     text = re.sub(r'(?<=[\u4e00-\u9fff]) +(?=[\u4e00-\u9fff])', '', text)
     text = re.sub(r'(?<=[\u4e00-\u9fff])\u3000+(?=[\u4e00-\u9fff])', '', text)
     return text
+
+
+def remove_cjk_spaces(text: str) -> str:
+    """去除中文字符之间的空格（半角与全角）
+
+    书名号里的空格是标题本身的一部分 ——「《交通工程土工合成材料 土工格栅》」
+    去掉空格就把规范名改错了，所以整段跳过不处理。
+    """
+    out = []
+    pos = 0
+    for m in _BOOK_TITLE_RE.finditer(text):
+        out.append(_strip_cjk_gaps(text[pos:m.start()]))
+        out.append(m.group(0))
+        pos = m.end()
+    out.append(_strip_cjk_gaps(text[pos:]))
+    return ''.join(out)
 
 
 def merge_broken_paragraphs(blocks) -> list:
@@ -389,6 +506,14 @@ def process_table_data(data, header_flags=None):
                 final_headers.append(h)
                 for ri in range(len(rows)):
                     final_rows[ri].append(rows[ri][ci])
+
+    # 判不出表头时（表单类表格：首行是「姓名/性别/…」这种标签行，
+    # 或整表都没有 w:tblHeader 标记），把首行数据提上来当表头。
+    # 早先直接留空表头会造出一行 `|  |  |  |` 的假表头，既是噪音又占一行。
+    if (final_headers and rows and len(final_rows) >= 2
+            and all(not h.strip() for h in final_headers)):
+        final_headers = list(final_rows[0])
+        final_rows = final_rows[1:]
 
     return final_headers, final_rows
 
@@ -1073,19 +1198,26 @@ _CJK_RE = re.compile(r'[\u3005-\u30ff\u4e00-\u9fff]')
 _MATH_CONTAINERS = frozenset(
     _m(t) for t in ('e', 'num', 'den', 'sub', 'sup', 'lim', 'deg', 'fName', 'mr'))
 
-# Word 里常见的全角/符号/希腊字母写法，转成 LaTeX 宏
+# Word 里常见的全角/符号/希腊字母写法，转成 LaTeX 宏。
+# 这里不带尾随空格：宏名后是否需要空格取决于后面接什么（`\sigma]` 不用空格，
+# `\sigma a` 才需要），统一在 render_math 里按 lookahead 补，否则
+# `[\sigma]=140MPa` 会被写成 `[\sigma ]=140MPa`，往返不幂等。
 _MATH_SYMBOLS = {
-    '＝': '=', '＋': '+', '－': '-', '×': r'\times ', '÷': r'\div ',
-    '＜': '<', '＞': '>', '≤': r'\leq ', '≥': r'\geq ',
-    '≠': r'\neq ', '≈': r'\approx ', '（': '(', '）': ')', '％': r'\%',
-    '√': r'\sqrt ', '∑': r'\sum ', '∫': r'\int ', 'π': r'\pi ',
-    'μ': r'\mu ', 'μ': r'\mu ', 'α': r'\alpha ', 'β': r'\beta ',
-    'γ': r'\gamma ', 'σ': r'\sigma ', 'θ': r'\theta ', 'λ': r'\lambda ',
-    'Δ': r'\Delta ', 'ψ': r'\psi ', 'φ': r'\phi ', 'Φ': r'\Phi ',
-    'ρ': r'\rho ', 'ε': r'\varepsilon ', 'ω': r'\omega ', 'η': r'\eta ',
-    'ξ': r'\xi ', 'τ': r'\tau ', 'ν': r'\nu ', 'ζ': r'\zeta ',
-    'κ': r'\kappa ', 'Ω': r'\Omega ', '°': r'^{\circ}',
+    '＝': '=', '＋': '+', '－': '-', '×': r'\times', '÷': r'\div',
+    '＜': '<', '＞': '>', '≤': r'\leq', '≥': r'\geq',
+    '≠': r'\neq', '≈': r'\approx', '（': '(', '）': ')', '％': r'\%',
+    '√': r'\sqrt', '∑': r'\sum', '∫': r'\int', 'π': r'\pi',
+    'μ': r'\mu', 'α': r'\alpha', 'β': r'\beta',
+    'γ': r'\gamma', 'σ': r'\sigma', 'θ': r'\theta', 'λ': r'\lambda',
+    'Δ': r'\Delta', 'ψ': r'\psi', 'φ': r'\phi', 'Φ': r'\Phi',
+    'ρ': r'\rho', 'ε': r'\varepsilon', 'ω': r'\omega', 'η': r'\eta',
+    'ξ': r'\xi', 'τ': r'\tau', 'ν': r'\nu', 'ζ': r'\zeta',
+    'κ': r'\kappa', 'Ω': r'\Omega', '°': r'^{\circ}',
 }
+
+# 宏名后面紧跟字母或数字时必须有一个空格（`\sqrtx` 会被当成未知宏），
+# 后面是 `\`、`{`、`}`、运算符、右括号时则不能加，否则多出可见空格
+_MACRO_JOIN_RE = re.compile(r'(\\[A-Za-z]+)(?=[A-Za-z0-9])')
 # 全角 ASCII（！～）统一转半角
 _FULLWIDTH_ASCII = {c: chr(c - 0xFEE0) for c in range(0xFF01, 0xFF5F)}
 _PRIME_CHARS = ("'", '\u2032', '\u2019')
@@ -1185,6 +1317,17 @@ def _render_math_run(elem) -> str:
     return _math_text(text)
 
 
+# m:d 里只包着一个 m:m 时，说明这是 pmatrix/bmatrix 这类带定界符的矩阵；
+# 定界符是环境名的一部分，丢了就不只是排版问题（圆括号矩阵和无括号矩阵含义不同）
+_MATRIX_ENV_BY_DELIM = {
+    ('(', ')'): 'pmatrix',
+    ('[', ']'): 'bmatrix',
+    ('{', '}'): 'Bmatrix',
+    ('|', '|'): 'vmatrix',
+    ('‖', '‖'): 'Vmatrix',
+}
+
+
 def _render_math_delimiter(elem) -> str:
     """m:d → \\left( … \\right)"""
     pr = elem.find(_m('dPr'))
@@ -1200,6 +1343,11 @@ def _render_math_delimiter(elem) -> str:
         parts.append(_render_math(child))
     inner = (f' \\mathrel{{{_escape_math(sep)}}} '.join(parts) if len(parts) > 1
              else ''.join(parts))
+    if len(parts) == 1 and inner.startswith(r'\begin{matrix}'):
+        env = _MATRIX_ENV_BY_DELIM.get((beg, end))
+        if env:
+            return (inner.replace(r'\begin{matrix}', rf'\begin{{{env}}}', 1)
+                         .replace(r'\end{matrix}', rf'\end{{{env}}}', 1))
     left = r'\left' if beg else r'\left.'
     right = r'\right' if end else r'\right.'
     return f'{left}{_escape_math(beg)}{inner}{right}{_escape_math(end)}'
@@ -1375,11 +1523,42 @@ def _render_math(elem) -> str:
     return ''
 
 
+def _sep_macro_names(body: str) -> str:
+    """宏名后面紧跟字母或数字时补一个分隔空格
+
+    `\\sigma]` 不用空格（右括号终止了宏名），`\\sigma a` 才需要 —— 否则会粘成
+    未知宏 `\\sigmaa`。用正则做不了：`\\\\[A-Za-z]+` 遇到 `\\sigma ` 会回溯到
+    `\\sigm` 以满足 lookahead，把 `\\sigma` 拆成 `\\sigm a`（实测踩过）。
+    """
+    out = []
+    i, n = 0, len(body)
+    while i < n:
+        ch = body[i]
+        if ch == '\\' and i + 1 < n and body[i + 1].isalpha():
+            j = i + 1
+            while j < n and body[j].isalpha():
+                j += 1
+            out.append(body[i:j])
+            if j < n and body[j].isalnum():
+                out.append(' ')
+            i = j
+        else:
+            out.append(ch)
+            i += 1
+    return ''.join(out)
+
+
 def render_math(elem) -> str:
     """OMML 公式 → LaTeX 片段（$$…$$ 或 $…$）"""
     body = _render_math(elem).strip()
     if not body:
         return ''
+    # 数学模式里连续空格没有语义（LaTeX 自己会忽略），但 md2docx 的 LaTeX→OMML
+    # 会把源码里的空白写成一个空 run，来回一趟就多出空格（`w_{i}` 前变两个空格）。
+    # 统一压成一个，往返才稳定。
+    body = re.sub(r'[ \t]{2,}', ' ', body)
+    # 宏名与后面的字母/数字之间补一个分隔空格，其余位置不留空格
+    body = _sep_macro_names(body)
     if elem.tag == _m('oMathPara'):
         return f'$${body}$$'
     return f'${body}$'
@@ -1669,6 +1848,13 @@ def _render_paragraph(para, list_counter: int, doc=None, numbering=None,
             return prefix + inline.lstrip()
         return f"{list_counter + 1}. {inline}"
 
+    if _is_quote(para):
+        # 引用块：与 md2docx 的 Quote 样式形成闭环，往返不掉 `>`
+        body = inline.strip()
+        if not body:
+            return ""
+        return f"> {prefix}{body}" if prefix else f"> {body}"
+
     if prefix:
         return prefix + inline.lstrip()
     return inline
@@ -1804,14 +1990,14 @@ def _run_segments(r_element, doc=None) -> list:
         elif tag == qn('w:tab'):
             texts.append("\t")
         elif tag in (qn('w:drawing'), qn('w:pict'), qn('w:object')):
-            box = _textbox_segments(node, doc)
+            box = _drawing_segments(node, doc)
             if box:
                 flush()
                 segs.extend(box)
         elif tag == _mc('AlternateContent'):
             branch = _mc_branch(node)
             if branch is not None:
-                box = _textbox_segments(branch, doc)
+                box = _drawing_segments(branch, doc)
                 if box:
                     flush()
                     segs.extend(box)
@@ -2032,6 +2218,27 @@ def _is_numbered_list(para) -> bool:
     return False
 
 
+_QUOTE_STYLE_NAMES = frozenset((
+    'Quote', 'Intense Quote', 'Block Text',
+    '引用', '明显引用', '引文', '块引用',
+))
+
+
+def _is_quote(para) -> bool:
+    """判断是否为引用块（Quote 样式），Markdown 里用 `> ` 前缀表达
+
+    只认样式，不认「手工缩进 + 左边框」—— 那类排版与普通段落无法可靠区分，
+    强行识别会把正文误判成引用。样式名按英文名与中文 Word 的本地化名一起匹配。
+    """
+    style_name = (para.style.name if para.style else "") or ""
+    name = style_name.strip()
+    if not name:
+        return False
+    if name in _QUOTE_STYLE_NAMES:
+        return True
+    return bool(re.search(r'(?i)quote|引用|引文', name))
+
+
 def _table_rows(tbl):
     """遍历属于本表的行
 
@@ -2172,11 +2379,11 @@ def _collect_cell_text(parent, doc, parts):
         elif tag in (_m('oMath'), _m('oMathPara')):
             parts.append(_render_cell_math(child))
         elif tag in (qn('w:drawing'), qn('w:pict'), qn('w:object')):
-            parts.append(_textbox_text(child, doc))
+            parts.append(_drawing_text(child, doc))
         elif tag == _mc('AlternateContent'):
             branch = _mc_branch(child)
             if branch is not None:
-                parts.append(_textbox_text(branch, doc))
+                parts.append(_drawing_text(branch, doc))
         else:
             # 段落、行、单元格、嵌套表格等容器继续往下找
             _collect_cell_text(child, doc, parts)
@@ -2226,11 +2433,17 @@ def convert(docx_path: str) -> str:
 
 def _convert_one(src: Path) -> bool:
     """将单个 docx 文件转换为同目录同名的 md 文件，成功返回 True"""
+    global _MEDIA
+    # 图片导出到 `<同名>_media/`，与 md 同目录，md 里写相对路径
+    media_dir = f"{src.stem}_media"
+    _MEDIA = _MediaDir(src.parent / media_dir, media_dir)
     try:
         content = convert(str(src))
     except Exception as e:
         print(f"转换失败: {src}: {e}", file=sys.stderr)
         return False
+    finally:
+        _MEDIA = None
 
     out_path = src.with_suffix(".md")
     try:

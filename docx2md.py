@@ -108,15 +108,29 @@ def _media_ref(doc, rid: str):
 
 
 def _image_segments(node, doc=None) -> list:
-    """drawing/pict 里的图片，转成行内片段（DrawingML 与老式 VML 两种写法）"""
+    """drawing/pict 里的图片，转成行内片段（DrawingML 与老式 VML 两种写法）
+
+    只收集当前 shape 自己的图片：文本框子树里的图片归 _textbox_segments 的
+    run 递归处理，这里整体 iter 再取一遍的话，同一张图在 md 里会输出两三遍。
+    """
     if doc is None:
         return []
+    # 先算出文本箱子树里的图片元素，收集时跳过它们
+    txbx_pics = set()
+    for txbx in node.iter(qn('w:txbxContent')):
+        txbx_pics.update(txbx.iter(qn('a:blip')))
+        txbx_pics.update(txbx.iter(f'{{{_VML_NS}}}imagedata'))
+
     rids = []
-    for blip in node.iter(qn('a:blip')):
-        rid = blip.get(qn('r:embed')) or blip.get(qn('r:link'))
+    for el in node.iter(qn('a:blip')):
+        if el in txbx_pics:
+            continue
+        rid = el.get(qn('r:embed')) or el.get(qn('r:link'))
         if rid:
             rids.append(rid)
     for imagedata in node.iter(f'{{{_VML_NS}}}imagedata'):
+        if imagedata in txbx_pics:
+            continue
         rid = imagedata.get(qn('r:id'))
         if rid:
             rids.append(rid)
@@ -511,6 +525,7 @@ def process_table_data(data, header_flags=None):
     # 判不出表头时（表单类表格：首行是「姓名/性别/…」这种标签行，
     # 或整表都没有 w:tblHeader 标记），把首行数据提上来当表头。
     # 早先直接留空表头会造出一行 `|  |  |  |` 的假表头，既是噪音又占一行。
+    # 只剩一行数据时不提升：提上去整表就没有数据行了，此时仍留空表头。
     if (final_headers and rows and len(final_rows) >= 2
             and all(not h.strip() for h in final_headers)):
         final_headers = list(final_rows[0])
@@ -562,13 +577,24 @@ def render(blocks) -> str:
     lines = []
 
     prev_was_table = False
+    prev_was_separator = False
     for block in blocks:
         if block.type == "paragraph":
             text = block.text.strip()
             if not text:
                 continue
-            if prev_was_table:
+            if prev_was_table or prev_was_separator:
                 lines.append("")
+            if text == "---":
+                # 分隔线前后都要空行：`上文` 紧跟 `---` 在 GFM 里是
+                # setext 二级标题（上文被标题化），不是分隔线
+                if lines and lines[-1] != "":
+                    lines.append("")
+                lines.append(text)
+                lines.append("")
+                prev_was_separator = True
+                prev_was_table = False
+                continue
             if lines and lines[-1] != "" and _HEADING_LINE_RE.match(text):
                 # 标题前留一个空行，正文段落不会被误读成标题的续行
                 lines.append("")
@@ -576,6 +602,7 @@ def render(blocks) -> str:
             if _DISPLAY_MATH_RE.match(text):
                 # 块级公式后留空行，连续 $$ 块不会被合并成一个
                 lines.append("")
+            prev_was_separator = False
             prev_was_table = False
         else:
             if lines and lines[-1] != "":
@@ -1200,25 +1227,23 @@ _MATH_CONTAINERS = frozenset(
     _m(t) for t in ('e', 'num', 'den', 'sub', 'sup', 'lim', 'deg', 'fName', 'mr'))
 
 # Word 里常见的全角/符号/希腊字母写法，转成 LaTeX 宏。
-# 这里不带尾随空格：宏名后是否需要空格取决于后面接什么（`\sigma]` 不用空格，
-# `\sigma a` 才需要），统一在 render_math 里按 lookahead 补，否则
-# `[\sigma]=140MPa` 会被写成 `[\sigma ]=140MPa`，往返不幂等。
+# 宏值统一带尾随空格：\sigma 后面接字母（\sigma a）必须有这个空格，否则粘成
+# 未知宏 \sigmaa（Word 里 σa 连排常在同一个 run 里，宏与字母之间没有结构边界，
+# 事后无法从字符串里再找回来）。\sigma ] 里的多余空格由 render_math 的
+# _trim_macro_space 按规则去掉，两边合起来两个方向都不丢信息。
 _MATH_SYMBOLS = {
-    '＝': '=', '＋': '+', '－': '-', '×': r'\times', '÷': r'\div',
-    '＜': '<', '＞': '>', '≤': r'\leq', '≥': r'\geq',
-    '≠': r'\neq', '≈': r'\approx', '（': '(', '）': ')', '％': r'\%',
-    '√': r'\sqrt', '∑': r'\sum', '∫': r'\int', 'π': r'\pi',
-    'μ': r'\mu', 'α': r'\alpha', 'β': r'\beta',
-    'γ': r'\gamma', 'σ': r'\sigma', 'θ': r'\theta', 'λ': r'\lambda',
-    'Δ': r'\Delta', 'ψ': r'\psi', 'φ': r'\phi', 'Φ': r'\Phi',
-    'ρ': r'\rho', 'ε': r'\varepsilon', 'ω': r'\omega', 'η': r'\eta',
-    'ξ': r'\xi', 'τ': r'\tau', 'ν': r'\nu', 'ζ': r'\zeta',
-    'κ': r'\kappa', 'Ω': r'\Omega', '°': r'^{\circ}',
+    '＝': '=', '＋': '+', '－': '-', '×': r'\times ', '÷': r'\div ',
+    '＜': '<', '＞': '>', '≤': r'\leq ', '≥': r'\geq ',
+    '≠': r'\neq ', '≈': r'\approx ', '（': '(', '）': ')', '％': r'\%',
+    '√': r'\sqrt ', '∑': r'\sum ', '∫': r'\int ', 'π': r'\pi ',
+    'μ': r'\mu ', 'α': r'\alpha ', 'β': r'\beta ',
+    'γ': r'\gamma ', 'σ': r'\sigma ', 'θ': r'\theta ', 'λ': r'\lambda ',
+    'Δ': r'\Delta ', 'ψ': r'\psi ', 'φ': r'\phi ', 'Φ': r'\Phi ',
+    'ρ': r'\rho ', 'ε': r'\varepsilon ', 'ω': r'\omega ', 'η': r'\eta ',
+    'ξ': r'\xi ', 'τ': r'\tau ', 'ν': r'\nu ', 'ζ': r'\zeta ',
+    'κ': r'\kappa ', 'Ω': r'\Omega ', '°': r'^{\circ}',
 }
 
-# 宏名后面紧跟字母或数字时必须有一个空格（`\sqrtx` 会被当成未知宏），
-# 后面是 `\`、`{`、`}`、运算符、右括号时则不能加，否则多出可见空格
-_MACRO_JOIN_RE = re.compile(r'(\\[A-Za-z]+)(?=[A-Za-z0-9])')
 # 全角 ASCII（！～）统一转半角
 _FULLWIDTH_ASCII = {c: chr(c - 0xFEE0) for c in range(0xFF01, 0xFF5F)}
 _PRIME_CHARS = ("'", '\u2032', '\u2019')
@@ -1524,12 +1549,16 @@ def _render_math(elem) -> str:
     return ''
 
 
-def _sep_macro_names(body: str) -> str:
-    """宏名后面紧跟字母或数字时补一个分隔空格
+def _trim_macro_space(body: str) -> str:
+    r"""宏名（最长字母串）后面跟着非字母时，把映射带出的分隔空格去掉
 
-    `\\sigma]` 不用空格（右括号终止了宏名），`\\sigma a` 才需要 —— 否则会粘成
-    未知宏 `\\sigmaa`。用正则做不了：`\\\\[A-Za-z]+` 遇到 `\\sigma ` 会回溯到
-    `\\sigm` 以满足 lookahead，把 `\\sigma` 拆成 `\\sigm a`（实测踩过）。
+    σ→`\\sigma ` 的映射带尾随空格：`\\sigma a` 必须有它，否则粘成未知宏
+    `\\sigmaa`（σa 连排常在同一 run 里，事后从字符串里找不回这个边界，
+    只能靠映射阶段把空格带上）。但空格是否多余只有后文能判断：
+    宏名一律按「最长字母串」解析（与 TeX 一致），后面跟着的不是字母时，
+    这个空格只是映射的副产品（`\\sigma ]`、`\\sigma=`），去掉才幂等；
+    后面是字母时保留一个分隔空格（`\sigma a`）；跟的是 `\` 时同样去掉
+    （反斜杠本身就终结了宏名）。
     """
     out = []
     i, n = 0, len(body)
@@ -1540,9 +1569,16 @@ def _sep_macro_names(body: str) -> str:
             while j < n and body[j].isalpha():
                 j += 1
             out.append(body[i:j])
-            if j < n and body[j].isalnum():
-                out.append(' ')
-            i = j
+            if j < n and body[j] in ' \t':
+                # 宏名后的空格：看空格之后再往后是什么，决定去留
+                k = j
+                while k < n and body[k] in ' \t':
+                    k += 1
+                if k < n and body[k].isalpha():
+                    out.append(' ')
+                i = k
+            else:
+                i = j
         else:
             out.append(ch)
             i += 1
@@ -1558,8 +1594,8 @@ def render_math(elem) -> str:
     # 会把源码里的空白写成一个空 run，来回一趟就多出空格（`w_{i}` 前变两个空格）。
     # 统一压成一个，往返才稳定。
     body = re.sub(r'[ \t]{2,}', ' ', body)
-    # 宏名与后面的字母/数字之间补一个分隔空格，其余位置不留空格
-    body = _sep_macro_names(body)
+    # 宏名的分隔空格：映射阶段统一带上，这里按后文裁剪（见 _trim_macro_space）
+    body = _trim_macro_space(body)
     if elem.tag == _m('oMathPara'):
         return f'$${body}$$'
     return f'${body}$'
@@ -2055,7 +2091,7 @@ def _textbox_segments(node, doc=None) -> list:
 
 
 def _textbox_text(node, doc=None) -> str:
-    """文本框里的文字（表格单元格用）"""
+    """文本框里的文字（扁平文本，图片不算 —— 含图片要用 _drawing_text）"""
     return "".join(text for text, _, _, _, _ in _textbox_segments(node, doc))
 
 
@@ -2408,7 +2444,12 @@ def _collect_cell_text(parent, doc, parts):
 
 
 def _collect_cell_run_text(r_element, doc, parts):
-    """收集一个 run 里的内容（文字、公式、文本框）"""
+    """收集一个 run 里的内容（文字、公式、图片、文本框）
+
+    图片要用 _drawing_text：w:drawing/w:pict 的内容不会靠 _textbox_segments
+    里 txbxContent 递归带出来，只抽文本框会把单元格里的图片整体丢掉
+    （连 `<!-- image: … -->` 占位注释都没有）。
+    """
     for node in r_element:
         tag = node.tag
         if tag == qn('w:t'):
@@ -2416,11 +2457,11 @@ def _collect_cell_run_text(r_element, doc, parts):
         elif tag in (_m('oMath'), _m('oMathPara')):
             parts.append(_render_cell_math(node))
         elif tag in (qn('w:drawing'), qn('w:pict'), qn('w:object')):
-            parts.append(_textbox_text(node, doc))
+            parts.append(_drawing_text(node, doc))
         elif tag == _mc('AlternateContent'):
             branch = _mc_branch(node)
             if branch is not None:
-                parts.append(_textbox_text(branch, doc))
+                parts.append(_drawing_text(branch, doc))
         else:
             # 其他子元素（如 w:ruby 的注音）继续往里找文字
             for sub in node.iter(qn('w:t')):

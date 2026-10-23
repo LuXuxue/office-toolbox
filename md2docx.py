@@ -1059,6 +1059,8 @@ def convert(md_path):
     ol_next_num_id = 10
     ol_group_active = False
     ol_current_num_id = None
+    # 各层最近一个编号（分隔符, 数字）：相隔的段落间没有空行也能看出「新组」
+    ol_last_marker = {}
 
     i = 0
     while i < len(lines):
@@ -1175,6 +1177,28 @@ def convert(md_path):
                           "有序列表无法按原起始号编号", file=sys.stderr)
                 ol_next_num_id += 1
                 ol_group_active = True
+            else:
+                # 组没有断开（中间没有空行/段落）时也不能闭着眼续下去：
+                # docx2md 在相邻段落之间不写空行，两个编号组背靠背时（2. 3. 接
+                # 1) 2)）只能靠标记本身分辨。按 CommonMark 规则处理：
+                # 同一列表里分隔符变化本来就会中断列表；同层序号回落也说明
+                # 新组开始（Word 的同一组序号只会递增）。该层标记在当前组里
+                # 首次出现（嵌套子列表开头）则仍属当前组，不另起。
+                sep = ol_match.group(3)
+                prev_marker = ol_last_marker.get(new_level)
+                if (prev_marker is not None
+                        and (prev_marker[0] != sep or marker_num <= prev_marker[1])):
+                    lvl_text = f'%{new_level})' if sep == ')' else None
+                    ol_current_num_id = _add_num_override(doc.part.numbering_part,
+                                                          ol_next_num_id,
+                                                          start=marker_num,
+                                                          ilvl=new_level - 1,
+                                                          lvl_text=lvl_text)
+                    if ol_current_num_id is None:
+                        print("警告: 文档里没有 List Number 的编号定义，"
+                              "有序列表无法按原起始号编号", file=sys.stderr)
+                    ol_next_num_id += 1
+            ol_last_marker[new_level] = (sep, marker_num)
 
             para = doc.add_paragraph(style='List Number')
             _set_list_indent(para, new_level)

@@ -1818,6 +1818,20 @@ def parse_docx(path: str) -> list:
     return blocks
 
 
+def _has_bottom_border(para) -> bool:
+    """段落有可见的下边框（md2docx 用它表示 `---` 分隔线）"""
+    ppr = para._element.find(qn('w:pPr'))
+    if ppr is None:
+        return False
+    pbdr = ppr.find(qn('w:pBdr'))
+    if pbdr is None:
+        return False
+    bottom = pbdr.find(qn('w:bottom'))
+    if bottom is None:
+        return False
+    return bottom.get(qn('w:val')) not in (None, 'nil', 'none')
+
+
 def _render_paragraph(para, list_counter: int, doc=None, numbering=None,
                       headings=None) -> str:
     """渲染段落为 Markdown 文本（含样式前缀、Word 自动编号与行内格式）"""
@@ -1828,6 +1842,9 @@ def _render_paragraph(para, list_counter: int, doc=None, numbering=None,
         level = heading_level_of(style_name)
 
     inline = _render_inline(para, doc)
+    # 只有一个下边框、没有文字的段落是分隔线（md2docx 写的就是这个）
+    if not inline.strip() and _has_bottom_border(para):
+        return "---"
     # 自动编号（含「表%1.%2-%3」这类自定义序号）不在文本里，需按 numbering.xml 补回
     prefix = numbering.prefix_for(para) if numbering else ""
 

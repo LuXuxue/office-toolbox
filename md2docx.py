@@ -985,6 +985,31 @@ def _cancel_style_color_overrides(doc):
             rpr.remove(color)
 
 
+def _set_bottom_border(para):
+    """分隔线（`---`）写成段落下边框，docx2md 回读时还原成 `---`
+
+    早先用 50 个下划线字符模拟，回程就变成一串下划线正文：既不可逆，
+    又会被读文档的 AI 当成真实内容。
+    """
+    pPr = para._p.get_or_add_pPr()
+    pbdr = OxmlElement('w:pBdr')
+    bottom = OxmlElement('w:bottom')
+    bottom.set(qn('w:val'), 'single')
+    bottom.set(qn('w:sz'), '6')
+    bottom.set(qn('w:space'), '1')
+    bottom.set(qn('w:color'), 'auto')
+    pbdr.append(bottom)
+    # pPr 子元素顺序由 schema 规定，w:pBdr 必须排在 shd / tabs / spacing 之前
+    pPr.insert_element_before(
+        pbdr,
+        'w:shd', 'w:tabs', 'w:suppressAutoHyphens', 'w:kinsoku', 'w:wordWrap',
+        'w:overflowPunct', 'w:topLinePunct', 'w:autoSpaceDE', 'w:autoSpaceDN',
+        'w:bidi', 'w:adjustRightInd', 'w:snapToGrid', 'w:spacing', 'w:ind',
+        'w:contextualSpacing', 'w:mirrorIndents', 'w:suppressOverlap', 'w:jc',
+        'w:textDirection', 'w:textAlignment', 'w:textboxTightWrap',
+        'w:outlineLvl', 'w:divId', 'w:cnfStyle', 'w:rPr', 'w:sectPr',
+        'w:pPrChange',
+    )
 
 
 def _quote_paragraph(doc):
@@ -1065,7 +1090,7 @@ def convert(md_path):
 
         if re.match(r'^[\-\*_]{3,}\s*$', line.strip()):
             para = doc.add_paragraph()
-            para.add_run('_' * 50)
+            _set_bottom_border(para)
             ol_group_active = False
             i += 1
             continue

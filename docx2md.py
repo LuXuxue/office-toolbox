@@ -52,8 +52,9 @@ class Block:
 # docx 的图片存在包内 word/media/ 下，正文里只留一个 r:embed 关系 id。
 # 早先版本遇到 w:drawing 只取文本框文字，图片整体消失且 md 里毫无痕迹，
 # 读文档的 AI 会以为这一段本来就是空的。现在导出到 `<md名>_media/` 并
-# 在原位写 `![](…/image1.png)`；未配置输出目录（被当库调用）时退回
-# `<!-- image: image1.png -->` 注释，至少保留「此处有图」这个事实。
+# 在原位写 `![](…/image1.png)`；convert() 无论 CLI 还是当库调用都会
+# 配置输出目录，`<!-- image: image1.png -->` 注释只在绕过 convert()
+# 直接调用 parse_docx/render 的场景出现，至少保留「此处有图」这个事实。
 _MEDIA = None
 _VML_NS = 'urn:schemas-microsoft-com:vml'
 
@@ -2428,22 +2429,26 @@ def _render_cell_math(node) -> str:
 
 def convert(docx_path: str) -> str:
     """将 docx 转换为 markdown 文本"""
-    return render(parse_docx(docx_path))
+    global _MEDIA
+    # 图片导出到 `<同名>_media/`：无论 CLI 还是当库调用都写盘，
+    # md 里写的相对路径按「md 与 docx 同目录同名」约定计算
+    src = Path(docx_path)
+    media_dir = f"{src.stem}_media"
+    _MEDIA = _MediaDir(src.parent / media_dir, media_dir)
+    try:
+        return render(parse_docx(docx_path))
+    finally:
+        _MEDIA = None
 
 
 def _convert_one(src: Path) -> bool:
     """将单个 docx 文件转换为同目录同名的 md 文件，成功返回 True"""
-    global _MEDIA
-    # 图片导出到 `<同名>_media/`，与 md 同目录，md 里写相对路径
-    media_dir = f"{src.stem}_media"
-    _MEDIA = _MediaDir(src.parent / media_dir, media_dir)
+    # _MEDIA 在 convert() 里设置与复位
     try:
         content = convert(str(src))
     except Exception as e:
         print(f"转换失败: {src}: {e}", file=sys.stderr)
         return False
-    finally:
-        _MEDIA = None
 
     out_path = src.with_suffix(".md")
     try:

@@ -1041,6 +1041,12 @@ class NumberingResolver:
         for lv in range(ilvl):
             if counters.get(lv) is None:
                 counters[lv] = self._start_value(num_id, levels, lv)
+                # 占位也算「这一级已经出现过一次」。不记上下文的话，之后真
+                # 用到这一级时会被当成换了父级、从起始值重来：标题从 2 级
+                # 开始时 Word 里下一个 1 级标题显示「2」，这里却显示「1」
+                depth = self._restart_at(num_id, levels, lv)
+                self._context[(key, lv)] = tuple(counters.get(x)
+                                                 for x in range(depth))
 
         start = self._start_value(num_id, levels, ilvl)
         current = counters.get(ilvl)

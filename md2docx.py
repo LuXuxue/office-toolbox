@@ -5,6 +5,7 @@
 用法:
     python md2docx.py path/to/file.md           转换单个文件
     python md2docx.py -d path/to/dir            转换目录下所有 .md
+    python md2docx.py -n path/to/file.md        1～5 级标题套用多级自动编号
 
 结果写在与 md 同一目录、文件名相同的 .docx 文件。与 docx2md 配套使用：
 公式（$$…$$ / $…$）会写成可编辑的 Word 公式而非纯文本。
@@ -972,6 +973,164 @@ def _add_num_override(num_part, num_id, start=1, ilvl=0, lvl_text=None):
     return num_id
 
 
+# 标题里常见的手写序号：1.1.1 / 1.1 / 1、/ 1) / 一、/ （一）/ 第一章
+# 只去掉行首那一段；「2024 年」这类多位数年份不会被误删
+_HEADING_NUMBER_RE = re.compile(
+    r'^\s*(?:'
+    # 第一章 / 第 3 节 / 第一部分：序号后面常跟冒号，一并吃掉
+    r'第\s*[0-9一二三四五六七八九十百]+\s*(?:部分|章|节|篇)\s*[:：、.．,，]?\s*'
+    # （一） / (2)：整段带括号的序号，括号里只能是数字或中文数字
+    r'|[（(]\s*[0-9一二三四五六七八九十]{1,3}\s*[）)]\s*'
+    # 1.1.1 / 1.1.1.1：三段以上，即使紧跟文字也按序号处理
+    r'|[0-9]{1,2}(?:[.．][0-9]{1,2}){2,}[.．、,，:：]?\s*'
+    # 1.1 / 3.2：两段，后面必须跟标点或空白，2.4GHz 这类小数不算序号
+    r'|[0-9]{1,2}[.．][0-9]{1,2}(?:[.．、,，:：]\s*|\s+)'
+    # 1. / 1、/ 1) / 1）：单级序号；点号后面不是数字才算序号，
+    # 否则 2.4GHz 会被截成 4GHz、1.1 会被截成 1
+    r'|[0-9]{1,2}[.．](?![0-9])\s*'
+    r'|[0-9]{1,2}[、)）]\s*'
+    # 一、 / 二) / 三.：顿号与右括号不会出现在数字里，中文数字也不会当小数
+    r'|[一二三四五六七八九十百]{1,3}[、)）.．]\s*'
+    # 1 概述：单级裸数字，后面必须有空白。docx2md 回读 Word 的单级自动
+    # 编号时写的就是「1 概述」，这条不能删
+    r'|[0-9]{1,2}\s+'
+    r')'
+)
+
+# docx2md 把 Word 的 6～9 级标题都压成 Markdown 的 ######，第 6 级标题
+# 到底对应 Word 的哪一级无法确定；自动编号只做到第 5 级，第 6 级保留原文序号
+_HEADING_NUMBER_MAX_LEVEL = 5
+
+
+def _strip_heading_number(text):
+    """去掉标题文字开头的手写序号（1.1.1、第一章 这类）
+
+    序号改由标题样式的多级列表自动生成；文字里再留一份就会出现
+    「1.1.1 1.1.1 概况」。只匹配行首，且带小数的序号要求点号后面不是
+    数字（多段还要求跟标点或空白），所以「2.4GHz」「3.5英寸」「2024 年」
+    这类标题原样保留。整个标题只有序号时保留原文，不产出空标题。
+    """
+    stripped = _HEADING_NUMBER_RE.sub('', text, count=1).strip()
+    return stripped or text.strip()
+
+
+def _heading_style(doc, level):
+    """取第 level 级标题样式：内置名优先，样式名被本地化时按 styleId 兜底"""
+    for name in (f'Heading {level}', f'标题 {level}', f'{level}级标题'):
+        try:
+            style = doc.styles[name]
+        except KeyError:
+            continue
+        if style.type == WD_STYLE_TYPE.PARAGRAPH:
+            return style
+    for style in doc.styles:
+        if style.type != WD_STYLE_TYPE.PARAGRAPH:
+            continue
+        if style.style_id == f'Heading{level}':
+            return style
+    return None
+
+
+def _apply_heading_numbering(doc):
+    """给 Heading 1～5 样式套用同一个多级列表，标题序号交给 Word 自动生成
+
+    与参考模板一致：各级 lvlText 为 %1 / %1.%2 / … / %1.%2.%3.%4.%5，并用
+    w:pStyle 把每个编号级别绑到对应的标题样式。编号写在样式上而不是
+    段落上，用户在 Word 里新加的同级标题也会自动接上序号。
+
+    第 6 级不参与：md 的 ###### 对应 Word 6～9 级，层级不确定，强行编号
+    会让本来没有序号的 7～9 级标题冒出「1.1.1.1.1.1」。
+    """
+    try:
+        numbering = doc.part.numbering_part.element
+    except Exception:
+        print('警告: 文档没有编号定义部件，无法给标题套用多级列表',
+              file=sys.stderr)
+        return False
+
+    # abstractNumId / numId 要避开正文有序列表已经占用的编号（它们从 10 起）
+    used_abstract = {e.get(qn('w:abstractNumId'))
+                     for e in numbering.findall(qn('w:abstractNum'))}
+    used_num = {e.get(qn('w:numId'))
+                for e in numbering.findall(qn('w:num'))}
+    abstract_id = next((str(i) for i in range(900, 1000)
+                        if str(i) not in used_abstract), None)
+    num_id = next((str(i) for i in range(900, 1000)
+                   if str(i) not in used_num), None)
+    if abstract_id is None or num_id is None:
+        print('警告: 编号定义已用满，无法给标题套用多级列表', file=sys.stderr)
+        return False
+
+    abstract = OxmlElement('w:abstractNum')
+    abstract.set(qn('w:abstractNumId'), abstract_id)
+
+    # 样式一次解析到底：缺某一级就停在那儿，不要让 lvlText 引用不存在的级别
+    # （比如缺 3 级时 4 级的 %1.%2.%3.%4 里 %3 没有定义，Word 会显示异常）
+    styles = {}
+    for level in range(1, _HEADING_NUMBER_MAX_LEVEL + 1):
+        style = _heading_style(doc, level)
+        if style is None:
+            break
+        styles[level] = style
+    if not styles:
+        print('警告: 文档里没有 1～5 级标题样式，无法套用多级列表',
+              file=sys.stderr)
+        return False
+
+    # w:lvl 必须排在 multiLevelType 之后，这里按 schema 顺序逐个 append
+    multi_type = OxmlElement('w:multiLevelType')
+    multi_type.set(qn('w:val'), 'multilevel')
+    abstract.append(multi_type)
+
+    for level, style in styles.items():
+        lvl = OxmlElement('w:lvl')
+        lvl.set(qn('w:ilvl'), str(level - 1))
+        start = OxmlElement('w:start')
+        start.set(qn('w:val'), '1')
+        lvl.append(start)
+        fmt = OxmlElement('w:numFmt')
+        fmt.set(qn('w:val'), 'decimal')
+        lvl.append(fmt)
+        pstyle = OxmlElement('w:pStyle')
+        pstyle.set(qn('w:val'), style.style_id)
+        lvl.append(pstyle)
+        # 用空格而不是默认的制表符分隔序号与标题，标题不会跳到制表位
+        suff = OxmlElement('w:suff')
+        suff.set(qn('w:val'), 'space')
+        lvl.append(suff)
+        lvl_text = OxmlElement('w:lvlText')
+        lvl_text.set(qn('w:val'),
+                     '.'.join(f'%{n}' for n in range(1, level + 1)))
+        lvl.append(lvl_text)
+        jc = OxmlElement('w:lvlJc')
+        jc.set(qn('w:val'), 'left')
+        lvl.append(jc)
+        # 不写 w:ind：标题本身通常不缩进，让标题样式自己的缩进生效
+        abstract.append(lvl)
+
+    # schema 要求所有 w:abstractNum 排在 w:num 之前
+    first_num = numbering.find(qn('w:num'))
+    if first_num is not None:
+        first_num.addprevious(abstract)
+    else:
+        numbering.append(abstract)
+
+    num = OxmlElement('w:num')
+    num.set(qn('w:numId'), num_id)
+    abstract_ref = OxmlElement('w:abstractNumId')
+    abstract_ref.set(qn('w:val'), abstract_id)
+    num.append(abstract_ref)
+    numbering.append(num)
+
+    for level, style in styles.items():
+        pPr = style.element.get_or_add_pPr()
+        # get_or_add_numPr 会按 schema 把 w:numPr 插到正确位置
+        numPr = pPr.get_or_add_numPr()
+        numPr.get_or_add_ilvl().val = level - 1
+        numPr.get_or_add_numId().val = int(num_id)
+    return True
+
+
 def _cancel_style_color_overrides(doc):
     """去掉 python-docx 内置样式里写死的颜色，让样式跟随主题"""
     for s in doc.styles:
@@ -1037,8 +1196,12 @@ def _set_list_indent(para, level):
     fmt.first_line_indent = Inches(-0.25)
 
 
-def convert(md_path):
-    """将单个 markdown 文件转换为同目录同名的 docx"""
+def convert(md_path, heading_numbering=False):
+    """将单个 markdown 文件转换为同目录同名的 docx
+
+    heading_numbering 为真时给标题样式套用多级自动编号，并去掉标题文字里
+    已有的手写序号（1.1.1 之类）。
+    """
     global _BASE_DIR, _CONTENT_WIDTH
     _BASE_DIR = os.path.dirname(os.path.abspath(md_path))
     with open(md_path, 'r', encoding='utf-8') as f:
@@ -1047,6 +1210,9 @@ def convert(md_path):
     doc = Document()
     _link_default_fonts_to_theme(doc)
     _cancel_style_color_overrides(doc)
+    # 编号没真正挂上时不要删标题里的序号，否则两边都没有序号
+    numbering_applied = (_apply_heading_numbering(doc)
+                         if heading_numbering else False)
     try:
         sec = doc.sections[0]
         _CONTENT_WIDTH = int(sec.page_width - sec.left_margin - sec.right_margin)
@@ -1101,6 +1267,8 @@ def convert(md_path):
         if heading_match:
             level = len(heading_match.group(1))
             text = heading_match.group(2).strip()
+            if numbering_applied and level <= _HEADING_NUMBER_MAX_LEVEL:
+                text = _strip_heading_number(text)
             para = doc.add_heading(level=level)
             _add_formatted_text(para, text)
             list_level = 0
@@ -1268,14 +1436,14 @@ def convert(md_path):
     print(f'已转换: {md_path} -> {out_path}')
 
 
-def convert_dir(directory):
+def convert_dir(directory, heading_numbering=False):
     """转换指定目录下的所有 .md 文件"""
     md_files = sorted(glob.glob(os.path.join(directory, '*.md')))
     if not md_files:
         print(f'目录中没有 .md 文件: {directory}')
         return
     for md_path in md_files:
-        convert(md_path)
+        convert(md_path, heading_numbering=heading_numbering)
 
 
 if __name__ == '__main__':
@@ -1286,6 +1454,10 @@ if __name__ == '__main__':
                         help='.md 文件路径（与 -d 二选一）')
     parser.add_argument('-d', '--dir', action='store_true',
                         help='把 path 当作目录，转换其中所有 .md 文件')
+    parser.add_argument('-n', '--heading-numbering', action='store_true',
+                        help='给 1～5 级标题样式套用多级自动编号（1 / 1.1 / '
+                             '1.1.1…），并去掉标题文字里已有的序号；'
+                             '6 级标题不编号、保留原文序号')
     args = parser.parse_args()
 
     if not args.path:
@@ -1296,9 +1468,9 @@ if __name__ == '__main__':
         if not os.path.isdir(args.path):
             print(f'错误: 目录不存在: {args.path}', file=sys.stderr)
             sys.exit(1)
-        convert_dir(args.path)
+        convert_dir(args.path, heading_numbering=args.heading_numbering)
     else:
         if not os.path.isfile(args.path):
             print(f'错误: 文件不存在: {args.path}', file=sys.stderr)
             sys.exit(1)
-        convert(args.path)
+        convert(args.path, heading_numbering=args.heading_numbering)

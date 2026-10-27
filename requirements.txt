@@ -1,3 +1,8 @@
+# docx2md.py 需要
 python-docx
+# pptx2md.py 需要
+python-pptx
+# pptx2md.py 用它把 EMF/WMF 图片（含 OLE 预览图）转成 PNG，缺失时这类图会跳过
+Pillow
 # docx2pdf.py 需要（仅 Windows；其他平台安装时自动跳过）
 pywin32; sys_platform == "win32"

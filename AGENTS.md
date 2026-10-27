@@ -5,13 +5,15 @@
 ## 仓库里有什么
 
 ```
-docx2md.py     .docx → .md，2034 行
-md2docx.py     .md → .docx，1044 行
-docx2pdf.py    .doc / .docx → .pdf，258 行（调用本机 Word）
-requirements.txt  python-docx；pywin32 仅 Windows（docx2pdf.py 用）
+docx2md.py     .docx → .md
+md2docx.py     .md → .docx
+docx2pdf.py    .doc / .docx → .pdf
+pptx2md.py     .pptx → .md
+fix_punct.py   .md 标点修正（英文标点 → 中文标点）
+requirements.txt
 ```
 
-`docx2md.py` 与 `md2docx.py` 是**单向转换器**，`md2docx.py` 的公式转换器专门服务于 `docx2md.py` 的 LaTeX 输出。改动一侧的输出格式，另一侧必须同步跟上，否则往返会静默损坏。`docx2pdf.py` 只负责调用本机 Microsoft Word 导出 PDF，不参与 Markdown 往返。
+`docx2md.py` 与 `md2docx.py` 是**单向转换器**，`md2docx.py` 的公式转换器专门服务于 `docx2md.py` 的 LaTeX 输出。改动一侧的输出格式，另一侧必须同步跟上，否则往返会静默损坏。`docx2pdf.py` 只负责调用本机 Microsoft Word 导出 PDF，不参与 Markdown 往返。`pptx2md.py` 只做 pptx → md，目前没有反向脚本，不改动上面这对往返。`fix_punct.py` 只做 md 的标点修正（中文文本里夹杂的英文标点替换为中文标点，公式、代码、URL、英文段落不动），是单向后处理，不参与 Markdown 往返。
 
 ## 硬性约束
 
@@ -23,7 +25,7 @@ requirements.txt  python-docx；pywin32 仅 Windows（docx2pdf.py 用）
 
 ### 1. 行尾必须是 CRLF
 
-仓库 `core.autocrlf=true`，三个 Python 源文件都是 CRLF。**任何用脚本重写源文件的操作都必须用 `newline=''`**，否则整个文件会被改成 LF，`git diff` 爆炸成上千行。
+仓库 `core.autocrlf=true`，四个 Python 源文件都是 CRLF。**任何用脚本重写源文件的操作都必须用 `newline=''`**，否则整个文件会被改成 LF，`git diff` 爆炸成上千行。
 
 改完检查：
 

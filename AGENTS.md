@@ -5,15 +5,16 @@
 ## 仓库里有什么
 
 ```
-docx2md.py     .docx → .md
-md2docx.py     .md → .docx
-docx2pdf.py    .doc / .docx → .pdf
-pptx2md.py     .pptx → .md
-fix_punct.py   .md 标点修正（英文标点 → 中文标点）
+docx2md.py         .docx → .md
+md2docx.py         .md → .docx
+docx2pdf.py        .doc / .docx → .pdf
+pptx2md.py         .pptx → .md
+fix_punct.py       .md 标点修正（英文标点 → 中文标点）
+normalize_docx.py  .docx 格式标准化（主题字体、字号行距、标题多级列表）
 requirements.txt
 ```
 
-`docx2md.py` 与 `md2docx.py` 是**单向转换器**，`md2docx.py` 的公式转换器专门服务于 `docx2md.py` 的 LaTeX 输出。改动一侧的输出格式，另一侧必须同步跟上，否则往返会静默损坏。`docx2pdf.py` 只负责调用本机 Microsoft Word 导出 PDF，不参与 Markdown 往返。`pptx2md.py` 只做 pptx → md，目前没有反向脚本，不改动上面这对往返。`fix_punct.py` 只做 md 的标点修正（中文文本里夹杂的英文标点替换为中文标点，公式、代码、URL、英文段落不动），是单向后处理，不参与 Markdown 往返。
+`docx2md.py` 与 `md2docx.py` 是**单向转换器**，`md2docx.py` 的公式转换器专门服务于 `docx2md.py` 的 LaTeX 输出。改动一侧的输出格式，另一侧必须同步跟上，否则往返会静默损坏。`docx2pdf.py` 只负责调用本机 Microsoft Word 导出 PDF，不参与 Markdown 往返。`pptx2md.py` 只做 pptx → md，目前没有反向脚本，不改动上面这对往返。`fix_punct.py` 只做 md 的标点修正（中文文本里夹杂的英文标点替换为中文标点，含英文括号 `()` → `（）`，公式、代码、URL、英文段落不动），是单向后处理，不参与 Markdown 往返。`normalize_docx.py` 只做 docx 的格式标准化（字体：标题黑体/正文宋体、英文 Times New Roman；正文小四 1.5 倍行距、标题 1 小三、标题 2~9 小四；标题 1~9 加粗、无倾斜、段前段后为 0、标题 8/9 居中；多级列表，其中 8/9 级为图表编号；无间隔样式五号 1 倍行距；自动替换，如 m3/h → m³/h），是单向后处理，不参与 Markdown 往返。
 
 ## 硬性约束
 

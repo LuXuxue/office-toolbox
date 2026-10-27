@@ -7,7 +7,7 @@
 规则:
 - 仅对“以中文为主”的行做替换(中文字数 >= 英文单词数),
   因此整段英文不受影响;
-- , ; : ? ! 在前一字符或后一字符为中文时替换,
+- , ; : ? ! ( ) 在前一字符或后一字符为中文时替换,
   数字(如 10,000)、时间(如 14:30)、版本号(如 1.0)里的标点保留;
 - . 在前一字符或后一字符为中文、或前一字符为收尾字符且处于行尾时替换;
 - 双引号按全文配对转换为 “ ”(嵌套时用 ‘ ’),
@@ -26,6 +26,8 @@ ZP_MAP = {
     ':': '：',
     '?': '？',
     '!': '！',
+    '(': '（',
+    ')': '）',
 }
 
 # 这些收尾字符后面允许接中文句号
@@ -34,6 +36,8 @@ ZH_BOUNDARY = '")]】》”’"”'
 
 def is_zh(ch):
     """判断是否为中文(含 CJK 统一表意文字与中文标点)。"""
+    if not ch:
+        return False
     cp = ord(ch)
     return (
         0x4E00 <= cp <= 0x9FFF     # CJK 统一表意文字
@@ -63,8 +67,8 @@ def protected_spans(line):
     spans += [m.span() for m in re.finditer(r'<https?://[^\s>]*>', line)]
     spans += [m.span() for m in re.finditer(r'https?://[^\s<>()]*', line)]
     spans += [m.span() for m in re.finditer(r'\]\([^)]*\)', line)]
-    # 有序列表标记的点(如 "1. ")
-    m = re.match(r'\s*\d+\.(?=\s|$)', line)
+    # 有序列表标记的点(如 "1. " 或 "1.本" 或 "a. " 或 "b.本")
+    m = re.match(r'\s*(?:\d+|[a-zA-Z])\.(?=\D|$)', line)
     if m:
         pos = m.end() - 1
         spans.append((pos, pos + 1))

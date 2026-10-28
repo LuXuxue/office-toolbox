@@ -9,16 +9,25 @@ docx2md.py         .docx → .md
 md2docx.py         .md → .docx
 docx2pdf.py        .doc / .docx → .pdf
 pptx2md.py         .pptx → .md
+pdf2md.py          .pdf → .md / .json（本地 OXR 推理，依赖 OXR/）
 fix_punct.py       .md 标点修正（英文标点 → 中文标点）
 normalize_docx.py  .docx 格式标准化（主题字体、字号行距、标题多级列表）
 requirements.txt
+OXR/
+  oxr/                        上游流水线最小子集（版面结果 → md/json）
+  services/layout_analyze/    D-FINE 版面分析推理代码
+  models/OXR-1.0/             模型权重（gitignore，自行下载）
 ```
 
 `docx2md.py` 与 `md2docx.py` 是**单向转换器**，`md2docx.py` 的公式转换器专门服务于 `docx2md.py` 的 LaTeX 输出。改动一侧的输出格式，另一侧必须同步跟上，否则往返会静默损坏。`docx2pdf.py` 只负责调用本机 Microsoft Word 导出 PDF，不参与 Markdown 往返。`pptx2md.py` 只做 pptx → md，目前没有反向脚本，不改动上面这对往返。`fix_punct.py` 只做 md 的标点修正（中文文本里夹杂的英文标点替换为中文标点，含英文括号 `()` → `（）`，公式、代码、URL、英文段落不动），是单向后处理，不参与 Markdown 往返。`normalize_docx.py` 只做 docx 的格式标准化（字体：标题黑体/正文宋体、英文 Times New Roman；正文小四 1.5 倍行距、标题 1 小三、标题 2~9 小四；标题 1~9 加粗、无倾斜、段前段后为 0、标题 8/9 居中；多级列表，其中 8/9 级为图表编号；无间隔样式五号 1 倍行距；自动替换，如 m3/h → m³/h），是单向后处理，不参与 Markdown 往返。
 
+`pdf2md.py` 是 pdf → md/json 的单向转换器（md 之后可以交给 `md2docx.py`）。它自己只负责 CLI、PDF 渲染、本地模型加载和文件输出，版面分析之后的流水线全部复用 `OXR/oxr/pipeline` 里的上游代码。`OXR/` 是从 [SoMarkAI/OXR](https://github.com/SoMarkAI/OXR) 复制的最小运行子集：`oxr/`（去掉 `cli/`、`server/`）加 `services/layout_analyze/dfine_la`，许可证见 `OXR/LICENSE`、`OXR/NOTICE`。模型权重 `OXR/models/OXR-1.0` 不在库里，用 modelscope 或 huggingface-cli 下载。
+
 ## 硬性约束
 
 1. 注释用中文。
+2. **`OXR/` 是上游代码子集，能不改就不改**。本地推理的接线（替换 `model_client` / `layout_client`、prompt、生成参数）都在 `pdf2md.py` 里；确实要改 `OXR/` 时在提交说明里写清改了什么、为什么，因为升级上游时会整块覆盖。
+3. 不要提交模型权重、`OXR/models/` 与转换产物（`*_media/`、`outputs/`）。
 
 ## 环境陷阱
 
@@ -26,7 +35,7 @@ requirements.txt
 
 ### 1. 行尾必须是 CRLF
 
-仓库 `core.autocrlf=true`，四个 Python 源文件都是 CRLF。**任何用脚本重写源文件的操作都必须用 `newline=''`**，否则整个文件会被改成 LF，`git diff` 爆炸成上千行。
+仓库 `core.autocrlf=true`，所有 Python 源文件（含 `pdf2md.py`）都是 CRLF。**任何用脚本重写源文件的操作都必须用 `newline=''`**，否则整个文件会被改成 LF，`git diff` 爆炸成上千行。
 
 改完检查：
 
@@ -110,8 +119,28 @@ Word 里的链接地址不一定在 `w:t` 旁边。抽文字只能拿到链接�
 
 `merge_consecutive_tables()` 只服务于「跨页被拆成两个 `w:tbl` 的同一张表」，判据必须是表头完全一致。报告里的表单表（如 3.3 管段检测成果表）每张都以「录像文件 / 起始井号 / 终止井号」开头，字符集几乎相同，若按字符相似度合并，就会把后一张表的首行当成重复表头丢掉。表头不同就各自成表，宁可多一张表也不能丢行。
 
+### 14. `pdf2md.py` 本地推理的三个坑
+
+这三处都是踩过的，改动 `pdf2md.py` 的模型加载/生成部分时别退回去：
+
+- **`eos_token_id` 必须显式传 `[151643, 151645]`**。模型内层 `llm.generation_config` 里只有 `151643`，而模型实际用 `<|im_end|>`（`151645`）结束；漏掉它就会一路生成到 `--max-tokens`（8192 起步），看起来像卡死。两个值都写在 `OXR/models/OXR-1.0/generation_config.json` 里，代码用 `GenerationConfig.from_pretrained()` 读出后作为 `eos_token_id` 传给 `generate`，别只取内层 `llm` 的那一个、也别硬编码。
+- **`indicator_token_indices` 要重建**。用 `from_pretrained` 低内存加载时它是非持久化 buffer，checkpoint 不覆盖，可能是未初始化内存（比如 `[2342367920352, 0, 0, 0]`），接着触发 CUDA `device-side assert`（`srcIndex < srcSelectDimSize`）。加载后按 `visual_vocab_size` 与 `INDICATOR_IDS` 长度重建。
+- **不要用 `trust_remote_code`**。transformers 5.x 会把 `modeling_oxr.py` / `configuration_oxr.py` 复制到不同缓存子目录，`Siglip2NavitConfig` 注册失效，报 `Unrecognized configuration class`。现在的做法是把模型目录挂成临时包 `_oxr_local_model` 再导入，保证所有类来自同一份源码。
+
+### 15. 模型权重不在仓库里
+
+`OXR/models/` 已写进 `.gitignore`（约 3 GB）。换机器时重新下载：
+
+```bash
+pip install modelscope
+modelscope download SoMark/OXR-1.0 --local_dir ./OXR/models/OXR-1.0
+```
+
+`pdf2md.py` 校验 `OXR/models/OXR-1.0/config.json` 与 `layout_analysis/last.pth`，缺了会直接退出并打印这条命令。
+
 ## 改完自检
 
 - [ ] 行尾仍是 CRLF
 - [ ] 一侧改了输出格式的话，另一侧同步跟上了
 - [ ] 注释是中文
+- [ ] `git status` 里没有模型权重、`OXR/models/`、`*_media/`、`outputs/`

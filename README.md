@@ -8,6 +8,7 @@
 | `pptx2md.py` | `.pptx` → `.md` | 按节分层标题，抽取正文列表、表格、图片、图表数据与演讲者备注 |
 | `fix_punct.py` | `.md` 标点修正 | 把中文文本里夹杂的英文标点（`,. :;?!` 与双引号、英文括号 `()`）替换为中文标点，英文段落、公式、代码、URL 不动 |
 | `normalize_docx.py` | `.docx` 格式标准化 | 把已有 docx 的字体（标题黑体/宋体正文、英文 Times New Roman）、字号行距、标题加粗与多级列表统一到一套标准（正文小四 1.5 倍行距、标题 1 小三、标题 2~9 小四、标题 1~9 加粗、无倾斜、段前段后为 0、标题 8/9 居中、标题 1~9 多级编号、标题 8/9 图表编号、无间隔样式五号 1 倍行距、自动替换如 m3/h→m³/h） |
+| `pdf2md.py` | `.pdf` → `.md` / `.json` | 使用 OXR-1.0 进行 OCR，还原正文、公式、表格、代码与图片 |
 
 
 ## 安装
@@ -16,7 +17,19 @@
 pip install -r requirements.txt
 ```
 
-要求 Python 3.8 及以上（开发与验证环境为 3.13）。六个脚本都是单文件、无内部包依赖，可以单独拷走使用。`docx2pdf.py` 额外需要本机安装 Microsoft Word；`pywin32` 已按平台条件写入 `requirements.txt`，非 Windows 平台安装时会自动跳过。`pptx2md.py` 依赖 `python-pptx`，并把 EMF/WMF 图片转成 PNG 需要 `Pillow`（缺了 Pillow 只会跳过这类图片，其它内容照常转换）。
+要求 Python 3.8 及以上（开发与验证环境为 3.13）。除 `pdf2md.py` 外的六个脚本都是单文件、无内部包依赖，可以单独拷走使用。`docx2pdf.py` 额外需要本机安装 Microsoft Word；`pywin32` 已按平台条件写入 `requirements.txt`，非 Windows 平台安装时会自动跳过。`pptx2md.py` 依赖 `python-pptx`，并把 EMF/WMF 图片转成 PNG 需要 `Pillow`（缺了 Pillow 只会跳过这类图片，其它内容照常转换）。
+
+`pdf2md.py` 需要额外的运行时：同目录的 `OXR/` 子目录（从 [SoMarkAI/OXR](https://github.com/SoMarkAI/OXR) 复制的最小代码子集）和约 3 GB 的模型权重。权重不入库，需自行下载：
+
+```bash
+pip install modelscope
+modelscope download SoMark/OXR-1.0 --local_dir ./OXR/models/OXR-1.0
+
+# 或者用 huggingface-cli
+huggingface-cli download SoMarkAI/OXR-1.0 --local-dir ./OXR/models/OXR-1.0
+```
+
+推理走本机 GPU（`torch` + `transformers`）；模型加载约 4 秒，之后每页视版面复杂度约 2～20 秒。没有 CUDA 时也能用 `--device cpu` 跑，但会慢一个数量级。`OXR/models/` 已写进 `.gitignore`。
 
 ## 用法
 
@@ -65,6 +78,35 @@ python pptx2md.py file.pptx --slide-markers  # 每页前加 <!-- slide N --> 便
 
 结果写在与 pptx 同一目录、文件名相同的 `.md` 文件，图片导出到同目录的 `<md名>_media/`。目录模式的输出与退出码约定和 `docx2md.py` 一致。
 
+### pdf → md（本地 OCR）
+
+```bash
+python pdf2md.py path/to/file.pdf             # 转换单个文件
+python pdf2md.py -d path/to/dir               # 转换目录下所有 .pdf
+python pdf2md.py -d path/to/dir --recursive   # 递归处理子目录
+python pdf2md.py -d path/to/dir -o path/to/out --formats md
+```
+
+结果默认写在与 PDF 同一目录、文件名相同的 `.md` / `.json`；用 `-o` 指定输出目录时会保留相对路径结构（`-d dir --recursive -o out` → `out\子目录\文件.md`）。PDF 里的插图导出到同目录的 `<文件名>_media/`，Markdown / JSON 里写相对路径，搬走 md 时连同这个目录一起搬。重新转换同一个 PDF 时，`_media/` 里上一次留下的旧插图会被清掉，不会越积越多。
+
+常用参数：
+
+| 参数 | 作用 |
+|---|---|
+| `-o`, `--out` | 输出目录（默认写在 PDF 旁边） |
+| `--recursive` | 配合 `-d` 递归子目录 |
+| `--formats md,json` | 只输出其中一种（默认两种都出） |
+| `--skip-existing` | 输出已存在就跳过；全部跳过时不加载模型，几秒内直接返回 |
+| `--dpi 150` | PDF 渲染 DPI，调高更清晰但更慢 |
+| `--keep-header-footer` | 保留页眉页脚（默认丢弃） |
+| `--device auto/cuda/cpu` | 推理设备，默认有 CUDA 就用 CUDA |
+| `--max-tokens 8192` | 单个版面块的最大生成 token 数 |
+| `--layout-batch-size 8` | 版面分析批大小 |
+| `--model <目录>` | 换一份模型权重 |
+| `--verbose` | 打印调试日志 |
+
+目录模式的输出与退出码约定和 `docx2md.py` 一致：单个文件失败不影响其它文件，最后汇总失败列表，退出码为 1。
+
 ### md 标点修正
 
 ```bash
@@ -89,6 +131,17 @@ python normalize_docx.py path/to/file.docx
 - **自动替换** — 按 `_REPLACEMENTS` 列表逐条替换（如 `m3/h` → `m³/h`、`m2` → `m²`），后续新增规则只需在列表中追加。
 
 字号、行距、加粗、段距与字体都写在样式层（Normal 与 Heading 1~9），不逐个改段落和 run，所以不破坏文档里已有的图片、表格与局部特殊格式。
+
+## pdf2md 的工作方式
+
+`pdf2md.py` 不抽取 PDF 文本层，而是把每页渲染成图片后交给本机 OXR-1.0 重新识别，所以扫描件和带文本层的 PDF 走同一条路径：
+
+- **版面分析** — D-FINE 检测标题、正文、表格、公式、图片、代码块、页眉页脚等区域；
+- **分类识别** — 按区域类型分别问模型：正文转 Markdown、公式转 LaTeX、表格转 Markdown 表格、代码保持原样、图片裁切后导出；
+- **阅读顺序** — 多栏与图文混排按版面位置加 XY-Cut 还原顺序，跨栏、跨页被拆开的段落会拼接；
+- **清理** — 去重、去重叠、合并碎片，丢弃页眉页脚，最后组装成 Markdown 与 JSON。
+
+JSON 与官方服务的返回一致：`{"pages": [{page_num, page_size, blocks: [{idx, type, bbox, content, format}]}]}`，`bbox` 是渲染图上的像素坐标。
 
 ## docx2md 的转换规则
 
@@ -162,3 +215,7 @@ PowerPoint 没有 Word 那样的段落样式和内置编号，脚本按版式与
 - **`pptx2md` 不保留版式**：只还原阅读顺序，不保留形状坐标、分栏、动画、母版背景与主题字体。
 - **`pptx2md` 只读 `.pptx` / `.pptm`**：不能在 `.ppt`（97-2003 二进制格式）上运行，需先在 PowerPoint 里另存为 `.pptx`；OLE 对象（Visio、MathType 等）只导出预览图，不解析原件。
 - **`pptx2md` 的阅读顺序是猜的**：页面上文字散落在很多小标签里时，按位置排序可能与视觉位置略有出入；页码、日期、页脚这类占位符不导出。
+- **`pdf2md` 会整页重新识别**：不读 PDF 文本层，纯文字 PDF 也走 OCR，速度与扫描件相同；输出是重建的 Markdown，不保留原字体、字号、分栏坐标与页面尺寸。
+- **`pdf2md` 需要 GPU 才实用**：首次运行加载约 3 GB 权重（4 秒左右），之后每页视版面复杂度约 2～20 秒；`--device cpu` 能跑但可能慢一个数量级。
+- **`pdf2md` 的插图是位图**：按版面分析检测到的图片区域裁切导出，不是从 PDF 里抽原始对象；图表里的数据不会变成表格。
+- **`pdf2md` 依赖 `OXR/` 子目录**：`oxr/` 流水线与 `services/layout_analyze` 是从上游 [SoMarkAI/OXR](https://github.com/SoMarkAI/OXR) 复制的最小运行子集（Apache-2.0，见 `OXR/LICENSE`、`OXR/NOTICE`），不是本仓库原创代码；模型权重另按上游条款分发，不在仓库里。

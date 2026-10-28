@@ -6,3 +6,13 @@ python-pptx
 Pillow
 # docx2pdf.py 需要（仅 Windows；其他平台安装时自动跳过）
 pywin32; sys_platform == "win32"
+# pdf2md.py 需要（本地 OXR 推理；GPU 版 torch 请按 https://pytorch.org 安装）
+torch
+torchvision
+transformers
+sopdf
+opencv-python
+pydantic-settings
+PyYAML
+openai
+httpx

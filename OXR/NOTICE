@@ -1,0 +1,44 @@
+OXR
+Official source: https://github.com/SoMarkAI/OXR
+
+Third-party source attributions
+
+1. XY-Cut++ (authors' implementation)
+   Paper authors: Shuai Liu, Youmeng Li, Jizeng Wei.
+   Paper: https://arxiv.org/abs/2504.10258
+   oxr/pipeline/_vendor/xycut_plus_plus.py contains a function closure adapted
+   from the authors' implementation at https://github.com/liushuai35/PaddleXrc,
+   commit
+   7873ab38662e3277091520f4259f090bc197fee4.
+   Copyright (c) 2024 PaddlePaddle Authors. All Rights Reserved.
+   Distributed under the Apache License, Version 2.0.
+   OXR adds an order-only mode with overlap removal disabled; the vendored
+   source retains its upstream copyright and license notices.
+
+2. D-FINE
+   services/layout_analyze contains an inference-only adaptation of
+   https://github.com/Peterande/D-FINE, distributed under the Apache License,
+   Version 2.0. See services/layout_analyze/THIRD_PARTY_NOTICES.md and
+   services/layout_analyze/third_party/D-FINE/LICENSE for attribution and
+   adaptation details.
+
+3. SoMarkDown Viewer
+   The OXR Online Demo adapts the Viewer interface and includes its packaged
+   SoMarkDown renderer (version recorded in demo/vendor/somarkdown/VERSION),
+   styles, and fonts under oxr/server/demo. The upstream license is retained
+   in oxr/server/demo/LICENSE-SoMarkDownViewer; vendor files retain their
+   embedded attribution notices.
+
+4. Demo rendering styles and fonts
+   KaTeX 0.16.9 styles: https://github.com/KaTeX/KaTeX/tree/v0.16.9
+   MIT license: oxr/server/demo/vendor/deps/LICENSE-KaTeX (upstream LICENSE).
+   KaTeX fonts retain their embedded copyright and reserved font names;
+   SIL Open Font License 1.1 and those notices are included in
+   oxr/server/demo/vendor/deps/katex_fonts/OFL.txt.
+   highlight.js 11.9.0 styles: https://github.com/highlightjs/highlight.js/tree/11.9.0
+   BSD 3-Clause license: oxr/server/demo/vendor/deps/LICENSE-highlight.js
+   (upstream LICENSE).
+
+Model weights are not included in this code distribution. Their distribution
+terms are provided separately by the model repositories; this code license
+does not assign a license to those weights.

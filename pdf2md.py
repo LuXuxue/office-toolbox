@@ -27,8 +27,21 @@ OXR/ 子目录（从 SoMarkAI/OXR 复制的最小运行子集）：
     # 递归处理 + 指定输出目录
     python pdf2md.py -d D:\\docs --recursive -o D:\\out
 
+    # 只跑第 1~5 页做效果/速度验证
+    python pdf2md.py D:\\docs\\a.pdf --pages 1-5
+
 结果默认写到源 PDF 所在目录，文件名与源文件相同，扩展名为 .md / .json；
 PDF 里的图片导出到同目录的 <文件名>_media/。
+
+速度相关的几个旋钮（默认值按“单卡、可中断”调过）：
+
+    --batch-size      文本模型的批大小。流水线原本面向 vLLM 的连续批处理，
+                      本地串行时把同一类型的多个识别请求拼成一批，能把
+                      每 token 都要重读一遍模型权重的开销摊薄，4~8 收益明显。
+    --chunk-pages     每批送进流水线的页数。越小越省显存、进度越细，
+                      但单批的固定开销占比越高。
+    --pages           页码范围（1 起），只在选中的页上工作。
+    --layout-concurrency  版面分析的在途批数（单卡串行，一般不用改）。
 
 依赖（GPU 版 torch 请按 https://pytorch.org 的说明安装）：
 
@@ -43,8 +56,10 @@ import importlib
 import json
 import logging
 import sys
+import threading
 import time
 import types
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -98,6 +113,55 @@ def _parse_formats(raw: str) -> List[str]:
     return formats
 
 
+def _parse_pages(raw: str) -> List[Tuple[int, Optional[int]]]:
+    """把 "1-5,8,12-" 解析成 [(1,5), (8,8), (12,None)]，页码从 1 开始。"""
+    ranges: List[Tuple[int, Optional[int]]] = []
+    for item in raw.replace("，", ",").replace("~", "-").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            left, _, right = item.partition("-")
+            left, right = left.strip(), right.strip()
+            try:
+                start = int(left) if left else 1
+                end = int(right) if right else None
+            except ValueError as error:
+                raise argparse.ArgumentTypeError(f"无法解析页码范围 {item!r}") from error
+            if start < 1:
+                raise argparse.ArgumentTypeError(f"页码从 1 开始：{item!r}")
+            if end is not None and end < start:
+                raise argparse.ArgumentTypeError(f"页码范围倒置：{item!r}")
+        else:
+            try:
+                start = int(item)
+            except ValueError as error:
+                raise argparse.ArgumentTypeError(f"无法解析页码 {item!r}") from error
+            if start < 1:
+                raise argparse.ArgumentTypeError(f"页码从 1 开始：{item!r}")
+            end = start
+        ranges.append((start, end))
+    if not ranges:
+        raise argparse.ArgumentTypeError("页码范围不能为空")
+    return ranges
+
+
+def select_page_indices(
+    total_pages: int, ranges: Sequence[Tuple[int, Optional[int]]]
+) -> List[int]:
+    """按用户给定顺序返回 0 起的页下标，越界页自动丢弃，重复页只保留一次。"""
+    indices: List[int] = []
+    seen = set()
+    for start, end in ranges:
+        stop = total_pages if end is None else min(end, total_pages)
+        for page in range(start, stop + 1):
+            index = page - 1
+            if index not in seen:
+                seen.add(index)
+                indices.append(index)
+    return indices
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="使用 OXR-1.0 把 PDF 转成 Markdown，输出同名 .md / .json 文件。",
@@ -105,6 +169,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "示例：\n"
             "  python pdf2md.py a.pdf\n"
+            "  python pdf2md.py a.pdf --pages 1-5\n"
             "  python pdf2md.py -d D:\\pdfs\n"
             "  python pdf2md.py -d D:\\pdfs --recursive -o D:\\out\n"
             "  python pdf2md.py -d D:\\pdfs --formats md\n"
@@ -125,6 +190,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="输出格式，逗号分隔，可选 md、json（默认：md,json）",
     )
     parser.add_argument(
+        "--pages", type=_parse_pages, default=None,
+        help="只处理指定页（1 起），如 1-5、1-3,8、12-（默认：全部）",
+    )
+    parser.add_argument(
+        "--chunk-pages", type=int, default=8,
+        help="每批送进流水线的页数（默认：8，越小越省内存、进度越细）",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=4,
+        help="文本模型的批大小，同类型请求合批推理（默认：4，1 表示不合批）",
+    )
+    parser.add_argument(
         "--model", default=str(DEFAULT_MODEL_DIR),
         help=f"OXR 模型目录（默认：{DEFAULT_MODEL_DIR}）",
     )
@@ -141,6 +218,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--layout-batch-size", type=int, default=8, help="版面分析批大小（默认：8）"
     )
     parser.add_argument(
+        "--layout-concurrency", type=int, default=2,
+        help="版面分析在途批数（默认：2）",
+    )
+    parser.add_argument(
+        "--torch-threads", type=int, default=0,
+        help="torch 的 CPU 线程数，0 表示保持默认（默认：0）",
+    )
+    parser.add_argument(
         "--keep-header-footer", action="store_true", help="保留页眉和页脚"
     )
     parser.add_argument(
@@ -150,6 +235,82 @@ def build_parser() -> argparse.ArgumentParser:
         "--verbose", action="store_true", help="输出调试日志"
     )
     return parser
+
+
+# --------------------------------------------------------------------------- #
+# 运行统计
+# --------------------------------------------------------------------------- #
+
+
+class RunStats:
+    """记录各阶段耗时与调用次数，跑完后一次性打印，方便定位瓶颈。
+
+    版面分析的推理在独立线程里跑，统计字段可能被多个线程同时累加，
+    所以统一加锁，避免累计值被写坏。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.layout_batches = 0
+        self.layout_pages = 0
+        self.layout_seconds = 0.0
+        self.generate_batches = 0
+        self.generate_samples = 0
+        self.prepare_seconds = 0.0
+        self.generate_seconds = 0.0
+        self.output_tokens = 0
+        self.length_hits = 0
+
+    def add_layout(self, pages: int, seconds: float) -> None:
+        with self._lock:
+            self.layout_batches += 1
+            self.layout_pages += pages
+            self.layout_seconds += seconds
+
+    def add_prepare(self, seconds: float) -> None:
+        with self._lock:
+            self.prepare_seconds += seconds
+
+    def add_generate(self, samples: int, tokens: int, seconds: float) -> None:
+        with self._lock:
+            self.generate_batches += 1
+            self.generate_samples += samples
+            self.generate_seconds += seconds
+            self.output_tokens += tokens
+
+    def add_length_hit(self) -> None:
+        with self._lock:
+            self.length_hits += 1
+
+    def summary(self) -> str:
+        if not self.generate_batches and not self.layout_batches:
+            return ""
+        lines = ["运行统计："]
+        if self.layout_batches:
+            lines.append(
+                f"  版面分析：{self.layout_batches} 批 / {self.layout_pages} 页，"
+                f"{self.layout_seconds:.1f}s"
+                f"（{self.layout_seconds / max(1, self.layout_pages) * 1000:.0f} ms/页）"
+            )
+        if self.generate_batches:
+            per_sample = self.generate_seconds / max(1, self.generate_samples)
+            per_token = (
+                self.generate_seconds / max(1, self.output_tokens) * 1000
+                if self.output_tokens else 0.0
+            )
+            lines.append(
+                f"  文本识别：{self.generate_batches} 批 / {self.generate_samples} 个请求，"
+                f"预处理 {self.prepare_seconds:.1f}s，生成 {self.generate_seconds:.1f}s"
+            )
+            lines.append(
+                f"    平均每请求 {per_sample * 1000:.0f} ms，"
+                f"每输出 token {per_token:.1f} ms，共 {self.output_tokens} token"
+            )
+            if self.length_hits:
+                lines.append(
+                    f"    达到 token 上限后重跑的块：{self.length_hits} 个"
+                )
+        return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -174,15 +335,21 @@ def _load_model_module(model_dir: Path):
 
 
 class OXRTextBackend:
-    """用 transformers 本地加载 OXR-1.0 并执行视觉问答。"""
+    """用 transformers 本地加载 OXR-1.0，按批执行视觉问答。
 
-    def __init__(self, model_dir: Path, device) -> None:
+    预处理（图像缩放、模板渲染、张量搬运）和生成（GPU）被拆成两步：
+    预处理在独立的单线程池里做，生成在另一个线程里做，两者可以重叠，
+    这样 CPU 侧的图像处理不会白等 GPU 解码。
+    """
+
+    def __init__(self, model_dir: Path, device, stats: Optional[RunStats] = None) -> None:
         import torch
         from transformers import GenerationConfig
 
         self.torch = torch
         self.device = device
         self.dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        self.stats = stats
 
         module = _load_model_module(model_dir)
         LOGGER.info("正在加载 OXR 模型：%s（%s，%s）", model_dir, device, self.dtype)
@@ -205,25 +372,43 @@ class OXRTextBackend:
             vocab_size - indicator_ids, vocab_size, dtype=torch.long, device=device
         )
         self.tokenizer = self.model.text_tokenizer
+
         # OXR.generate 内部委托给 llm.generate，而 llm 的 generation_config 只带
         # eos=151643；模型实际用 <|im_end|>(151645) 结束，必须显式传入。
         try:
             self.generation_config = GenerationConfig.from_pretrained(str(model_dir))
         except (OSError, ValueError):
             self.generation_config = None
+
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+        if pad_token_id is None:
+            raise SystemExit("分词器缺少 pad/eos token，无法批量生成。")
+        self.pad_token_id = int(pad_token_id)
+
+        eos_token_id = (
+            self.generation_config.eos_token_id
+            if self.generation_config is not None
+            else None
+        )
+        if eos_token_id is None:
+            eos_token_id = self.tokenizer.eos_token_id
+        if isinstance(eos_token_id, (list, tuple)):
+            self.eos_token_ids = [int(value) for value in eos_token_id]
+        elif eos_token_id is None:
+            self.eos_token_ids = []
+        else:
+            self.eos_token_ids = [int(eos_token_id)]
+        self._eos_lookup = set(self.eos_token_ids)
         LOGGER.info("模型加载完成，耗时 %.1fs", time.perf_counter() - started)
 
-    def generate(
-        self,
-        prompt: str,
-        image_bgr,
-        max_new_tokens: Optional[int],
-        model_options: Optional[Dict[str, Any]] = None,
-    ):
+    # -- 预处理（纯 CPU） -------------------------------------------------- #
+
+    def prepare(self, prompt: str, image_bgr):
+        """把一张裁剪图和提示词变成模型输入，全程不碰 GPU。"""
         import cv2
         from PIL import Image
-
-        from oxr.model.client import ModelOutput, resolve_model_options
 
         rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb)
@@ -236,32 +421,41 @@ class OXRTextBackend:
                 ],
             }
         ]
-
         input_ids, pixel_values, grid_thws = self.model.preprocess_inputs(
             messages, min_pixels=MIN_PIXELS, max_pixels=MAX_PIXELS
         )
-        input_ids = input_ids.to(self.device)
-        if pixel_values is not None:
-            pixel_values = pixel_values.to(self.device, dtype=self.dtype)
-        if grid_thws is not None:
-            grid_thws = grid_thws.to(self.device)
+        return input_ids[0], pixel_values, grid_thws
+
+    def prepare_batch(self, items: Sequence[Tuple[str, Any]]):
+        """逐张预处理；单张失败只影响它自己，不会毁掉整批。"""
+        started = time.perf_counter()
+        prepared = []
+        failures: List[Tuple[int, Exception]] = []
+        for position, (prompt, image) in enumerate(items):
+            try:
+                prepared.append(self.prepare(prompt, image))
+            except Exception as error:  # noqa: BLE001 - 交给调用方重试
+                failures.append((position, error))
+        if self.stats is not None:
+            self.stats.add_prepare(time.perf_counter() - started)
+        return prepared, failures
+
+    # -- 生成（GPU） ------------------------------------------------------- #
+
+    def _generation_kwargs(
+        self, max_new_tokens: int, model_options: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        from oxr.model.client import resolve_model_options
 
         options = resolve_model_options(model_options)
         limit = int(max_new_tokens or 8192)
         generation_kwargs: Dict[str, Any] = {
             "max_new_tokens": limit,
             "use_cache": True,
-            "pad_token_id": self.tokenizer.pad_token_id,
+            "pad_token_id": self.pad_token_id,
         }
-        eos_token_id = (
-            self.generation_config.eos_token_id
-            if self.generation_config is not None
-            else None
-        )
-        if eos_token_id is None:
-            eos_token_id = self.tokenizer.eos_token_id
-        if eos_token_id is not None:
-            generation_kwargs["eos_token_id"] = eos_token_id
+        if self.eos_token_ids:
+            generation_kwargs["eos_token_id"] = self.eos_token_ids
         if options["repetition_penalty"] != 1.0:
             generation_kwargs["repetition_penalty"] = options["repetition_penalty"]
         if options["temperature"] > 0:
@@ -272,34 +466,266 @@ class OXRTextBackend:
             )
         else:
             generation_kwargs["do_sample"] = False
+        return generation_kwargs
 
-        with self.torch.inference_mode():
-            generated = self.model.generate(
-                input_ids,
+    def generate_batch(
+        self,
+        prepared: Sequence[Any],
+        max_new_tokens: int,
+        model_options: Optional[Dict[str, Any]] = None,
+        limits: Optional[Sequence[int]] = None,
+    ):
+        """把若干条预处理结果拼成一个 batch 一次性生成。
+
+        左填充到等长，靠 attention_mask 屏蔽填充位；视觉 token 用负数的
+        指示 ID 占位，merge_multimodal 会按行序填回视觉特征，所以填充用的
+        pad_token_id（正数）不会和它们冲突。
+        """
+        from oxr.model.client import ModelOutput
+
+        torch = self.torch
+        if not prepared:
+            return []
+
+        started = time.perf_counter()
+        lengths = [int(input_ids.shape[0]) for input_ids, _, _ in prepared]
+        max_length = max(lengths)
+        rows = []
+        for input_ids, _, _ in prepared:
+            padding = max_length - int(input_ids.shape[0])
+            if padding > 0:
+                input_ids = torch.cat([
+                    torch.full((padding,), self.pad_token_id, dtype=torch.long),
+                    input_ids,
+                ])
+            rows.append(input_ids)
+        batch_input_ids = torch.stack(rows).to(self.device)
+
+        attention_mask = torch.zeros_like(batch_input_ids, dtype=torch.bool)
+        for row, length in enumerate(lengths):
+            attention_mask[row, max_length - length:] = True
+
+        pixel_values = None
+        if prepared[0][1] is not None:
+            pixel_values = torch.cat([item[1] for item in prepared], dim=0).to(
+                self.device, dtype=self.dtype
+            )
+        grid_thws = None
+        if prepared[0][2] is not None:
+            grid_thws = torch.cat([item[2] for item in prepared], dim=0).to(self.device)
+
+        generation_kwargs = self._generation_kwargs(max_new_tokens, model_options)
+
+        with torch.inference_mode():
+            inputs_embeds = self.model.merge_multimodal(
+                input_ids=batch_input_ids,
                 pixel_values=pixel_values,
                 grid_thws=grid_thws,
+            )
+            generated = self.model.llm.generate(
+                inputs=None,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
                 **generation_kwargs,
             )
-        generated_tokens = int(generated.shape[-1])
-        text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
-        finish_reason = "length" if generated_tokens >= limit else "stop"
-        return ModelOutput(text, finish_reason=finish_reason)
+
+        limit = int(generation_kwargs["max_new_tokens"])
+        results = []
+        produced_tokens = 0
+        for row, row_limit in enumerate(limits or [limit] * len(prepared)):
+            tokens = generated[row].tolist()
+            cut = len(tokens)
+            for position, token in enumerate(tokens):
+                if token in self._eos_lookup:
+                    cut = position
+                    break
+            text = self.tokenizer.decode(tokens[:cut], skip_special_tokens=True)
+            if cut >= row_limit:
+                finish_reason = "length"
+            else:
+                finish_reason = "stop"
+            if finish_reason == "length" and self.stats is not None:
+                self.stats.add_length_hit()
+            produced_tokens += cut
+            results.append(ModelOutput(text, finish_reason=finish_reason))
+
+        if self.stats is not None:
+            self.stats.add_generate(
+                len(prepared), produced_tokens, time.perf_counter() - started
+            )
+        return results
+
+
+class _PendingRequest:
+    """排队中的一次视觉问答请求。key 相同的请求才会被合进同一批。"""
+
+    __slots__ = ("prompt", "image", "limit", "options", "key", "future")
+
+    def __init__(
+        self, prompt: str, image, limit: int, options: Dict[str, float]
+    ) -> None:
+        self.prompt = prompt
+        self.image = image
+        self.limit = limit
+        self.options = options
+        # 提示词相同、token 上限相同、采样参数相同 -> 输出长度分布接近，适合合批
+        self.key = (prompt, limit, tuple(sorted(options.items())))
+        self.future: Optional[asyncio.Future] = None
 
 
 class LocalOXRClient:
-    """替换 OXRModelClient：用本地模型代替 OpenAI 兼容的 HTTP 服务。"""
+    """替换 OXRModelClient：把本机模型调用聚合成批，单卡串行执行。
 
-    def __init__(self, backend: OXRTextBackend, config) -> None:
+    流水线本身是按“HTTP 服务端有连续批处理”设计的，每个 block 发一次请求。
+    本地推理如果照单全收就退化成几千次 batch=1 的生成，而 batch=1 时每生成
+    一个 token 都要把整份权重读一遍显存。这里用两个常驻协程把请求攒起来：
+
+        _prepare_loop  : 按 key 取一组请求 -> 线程池里做 CPU 预处理
+        _generate_loop : 取预处理结果 -> 线程里做一次批量 GPU 生成
+
+    预处理队列深度为 2，所以第 N 批在 GPU 上跑的时候，第 N+1 批已经在
+    CPU 上准备好了。
+    """
+
+    def __init__(self, backend: OXRTextBackend, config, batch_size: int = 4) -> None:
         self.backend = backend
         self.config = config
-        self._lock = asyncio.Lock()
+        self.batch_size = max(1, int(batch_size))
+        self._pending: List[_PendingRequest] = []
+        self._condition = asyncio.Condition()
+        self._prepared: Optional[asyncio.Queue] = None
+        self._workers: List[asyncio.Task] = []
+        self._prepare_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="oxr-prepare"
+        )
+        self._semaphore: Optional[asyncio.Semaphore] = None
+        self._semaphore_loop: Optional[asyncio.AbstractEventLoop] = None
 
     def get_request_semaphore(self) -> asyncio.Semaphore:
-        # 本地单卡推理必须串行执行，见 _call_vision_model 中的锁。
-        return asyncio.Semaphore(1)
+        """流水线用它限制在途请求数。
+
+        本地实现里真正的串行点是对 GPU 的独占，用 1 会让请求永远无法攒成
+        一批；这里放宽到批大小的两倍，只作为内存/背压上限。
+        """
+        loop = asyncio.get_running_loop()
+        limit = max(self.batch_size * 2, 4)
+        if self._semaphore_loop is not loop or self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(limit)
+            self._semaphore_loop = loop
+        return self._semaphore
+
+    # -- 常驻协程 ---------------------------------------------------------- #
+
+    def _ensure_workers(self) -> None:
+        if self._workers:
+            return
+        self._prepared = asyncio.Queue(maxsize=2)
+        loop = asyncio.get_running_loop()
+        self._workers.append(loop.create_task(self._prepare_loop()))
+        self._workers.append(loop.create_task(self._generate_loop()))
+
+    async def _next_group(self) -> List[_PendingRequest]:
+        """取出队首请求所在的一批同类型请求。"""
+        async with self._condition:
+            while not self._pending:
+                await self._condition.wait()
+            first = self._pending[0]
+            group: List[_PendingRequest] = []
+            remaining: List[_PendingRequest] = []
+            for request in self._pending:
+                if request.key == first.key and len(group) < self.batch_size:
+                    group.append(request)
+                else:
+                    remaining.append(request)
+            self._pending = remaining
+            return group
+
+    async def _prepare_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                group = await self._next_group()
+                items = [(request.prompt, request.image) for request in group]
+                try:
+                    prepared, failures = await loop.run_in_executor(
+                        self._prepare_pool, self.backend.prepare_batch, items
+                    )
+                except Exception as error:  # noqa: BLE001 - 单批失败不影响后续
+                    LOGGER.error("请求预处理失败：%s", error)
+                    for request in group:
+                        self._reject(request, error)
+                    continue
+                failed_positions = set()
+                for position, error in failures:
+                    failed_positions.add(position)
+                    self._reject(group[position], error)
+                # prepared 与 succeeded 都按输入顺序排列，两者一一对应。
+                succeeded = [
+                    group[position]
+                    for position in range(len(group))
+                    if position not in failed_positions
+                ]
+                if not succeeded:
+                    continue
+                await self._prepared.put((succeeded, prepared))
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - 工作协程不能退出
+                LOGGER.exception("预处理协程异常：%s", error)
+
+    async def _generate_loop(self) -> None:
+        while True:
+            try:
+                group, prepared = await self._prepared.get()
+                limits = [request.limit for request in group]
+                options = group[0].options
+                try:
+                    outputs = await asyncio.to_thread(
+                        self.backend.generate_batch,
+                        prepared,
+                        max(limits),
+                        options,
+                        limits,
+                    )
+                except Exception as error:  # noqa: BLE001 - 单批失败不影响后续
+                    LOGGER.error("批量生成失败（%d 条）：%s", len(group), error)
+                    for request in group:
+                        self._reject(request, error)
+                    continue
+                for request, output in zip(group, outputs):
+                    self._resolve(request, output)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - 工作协程不能退出
+                LOGGER.exception("生成协程异常：%s", error)
+
+    @staticmethod
+    def _resolve(request: _PendingRequest, value) -> None:
+        future = request.future
+        if future is not None and not future.done():
+            future.set_result(value)
+
+    @staticmethod
+    def _reject(request: _PendingRequest, error: BaseException) -> None:
+        future = request.future
+        if future is not None and not future.done():
+            future.set_exception(error)
+
+    # -- 与流水线对接 ------------------------------------------------------ #
 
     async def aclose(self) -> None:
-        return None
+        for task in self._workers:
+            task.cancel()
+        for task in self._workers:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        self._workers.clear()
+        for request in self._pending:
+            self._reject(request, RuntimeError("客户端已关闭"))
+        self._pending.clear()
+        self._prepare_pool.shutdown(wait=False)
 
     async def _call_vision_model(
         self,
@@ -309,13 +735,22 @@ class LocalOXRClient:
         model_options: Optional[Dict[str, Any]] = None,
         max_tokens: Optional[int] = None,
     ):
+        from oxr.model.client import resolve_model_options
+
         del timeout  # 本地推理没有网络超时
         if image is None:
             raise ValueError("An image is required for vision model calls.")
-        async with self._lock:
-            return await asyncio.to_thread(
-                self.backend.generate, prompt, image, max_tokens, model_options
-            )
+
+        self._ensure_workers()
+        options = resolve_model_options(model_options)
+        limit = int(max_tokens or self.config.max_tokens or 8192)
+        request = _PendingRequest(prompt, image, limit, dict(options))
+        request.future = asyncio.get_running_loop().create_future()
+
+        async with self._condition:
+            self._pending.append(request)
+            self._condition.notify_all()
+        return await request.future
 
     # 以下方法复用 oxr.model.client.OXRModelClient 的实现（prompt 与参数一致），
     # 通过继承在 _install 中绑定即可。
@@ -365,7 +800,9 @@ class LocalOXRClient:
 class LocalLayoutRuntime:
     """用 services/layout_analyze 的 D-FINE 代码在本地推理。"""
 
-    def __init__(self, model_path: Path, device_name: str) -> None:
+    def __init__(
+        self, model_path: Path, device_name: str, stats: Optional[RunStats] = None
+    ) -> None:
         from dfine_la.config import Settings
         from dfine_la.runtime import ModelRuntime
 
@@ -377,13 +814,26 @@ class LocalLayoutRuntime:
         ).validate_checkpoint()
         LOGGER.info("正在加载版面分析模型：%s（%s）", model_path, device_name)
         self._runtime = ModelRuntime(settings)
+        self.stats = stats
 
-    def infer(self, payloads: Sequence[bytes]) -> Dict[str, Any]:
+    def infer(self, images: Sequence[Any]) -> Dict[str, Any]:
+        """直接吃 ndarray，省掉 PNG 编码再解码的往返。
+
+        原实现把页面编成 PNG 传给“服务端”，本地推理根本不需要这层序列化，
+        一张 1240x1754 的页面编解码各要几十毫秒。
+        """
+        import cv2
+
         from dfine_la.confidence import format_predictions
+        from dfine_la.preprocess import preprocess_images
 
-        ready, _decode_ms, _preprocess_ms = self._runtime.prepare(list(payloads))
+        started = time.perf_counter()
+        rgb = [cv2.cvtColor(image, cv2.COLOR_BGR2RGB) for image in images]
+        ready = preprocess_images(rgb, self._runtime.settings.image_size)
         outputs, _timings = self._runtime.infer(ready)
         # 阈值过滤和 NMS 由 oxr.pipeline.postprocess.layout_postprocess 统一完成。
+        if self.stats is not None:
+            self.stats.add_layout(len(images), time.perf_counter() - started)
         return format_predictions(outputs)
 
 
@@ -391,21 +841,13 @@ class LocalLayoutClient:
     """替换 LayoutAnalyzeClient：本地调用 D-FINE，而不是 HTTP 服务。"""
 
     def __init__(self, runtime: LocalLayoutRuntime, config) -> None:
-        import cv2
-
-        self._cv2 = cv2
         self.runtime = runtime
         self.config = config
         self._lock = asyncio.Lock()
 
-    def encode_images(self, images: Sequence[Any]) -> List[bytes]:
-        encoded_images: List[bytes] = []
-        for image in images:
-            success, encoded = self._cv2.imencode(".png", image)
-            if not success:
-                raise ValueError("Unable to encode image as PNG.")
-            encoded_images.append(encoded.tobytes())
-        return encoded_images
+    def encode_images(self, images: Sequence[Any]) -> List[Any]:
+        # 名字沿用上游接口，但本地实现不再做 PNG 编码：直接传 ndarray。
+        return list(images)
 
     async def request_batch(self, encoded_images: Sequence[bytes]):
         async with self._lock:
@@ -435,6 +877,7 @@ class LocalEngine:
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
+        self.stats = RunStats()
         self._loaded = False
 
     def load(self) -> None:
@@ -478,14 +921,27 @@ class LocalEngine:
         if device.type == "cpu":
             LOGGER.warning("正在使用 CPU 推理，速度会非常慢。")
 
+        if self.args.torch_threads > 0:
+            torch.set_num_threads(int(self.args.torch_threads))
+            cv2.setNumThreads(int(self.args.torch_threads))
+            LOGGER.info("torch/cv2 的 CPU 线程数已设为 %d", self.args.torch_threads)
+
         # 先调整流水线参数，再加载模型。
         settings.oxr_model.max_tokens = int(self.args.max_tokens)
         settings.layout_analyze_model.batch_size = int(self.args.layout_batch_size)
+        settings.layout_analyze_model.max_concurrency = max(
+            1, int(self.args.layout_concurrency)
+        )
+        # 打开后 orchestrator 会在 metadata 里带上各阶段耗时，用于进度输出。
+        settings.debug = True
 
-        text_backend = OXRTextBackend(model_dir, device)
-        oxr_client = LocalOXRClient(text_backend, settings.oxr_model)
+        text_backend = OXRTextBackend(model_dir, device, self.stats)
+        oxr_client = LocalOXRClient(
+            text_backend, settings.oxr_model, self.args.batch_size
+        )
         layout_client = LocalLayoutClient(
-            LocalLayoutRuntime(layout_model, device.type), settings.layout_analyze_model
+            LocalLayoutRuntime(layout_model, device.type, self.stats),
+            settings.layout_analyze_model,
         )
 
         # 各流水线模块在 import 时绑定了全局客户端，这里统一替换为本地实现。
@@ -573,38 +1029,119 @@ def write_outputs(base: Path, outputs: Dict[str, Any], formats: Iterable[str]) -
     return written
 
 
+def _debug_timing(result: Dict[str, Any]) -> Tuple[Dict[str, float], int]:
+    metadata = result.get("metadata") or {}
+    timing = metadata.get("debug_timing") or {}
+    stats = metadata.get("debug_stats") or {}
+    return timing, int(stats.get("total_blocks", 0))
+
+
 async def process_one(
     engine: LocalEngine,
     pdf_path: Path,
     base: Path,
     formats: Sequence[str],
     args: argparse.Namespace,
+    prefix: str = "",
 ) -> List[Path]:
+    started = time.perf_counter()
     pdf_bytes = pdf_path.read_bytes()
     images = await asyncio.to_thread(engine.pdf_to_images, pdf_bytes, args.dpi)
+    render_elapsed = time.perf_counter() - started
     if not images:
         raise ValueError("PDF 没有可渲染的页面")
+
+    total_pages = len(images)
+    selected = (
+        select_page_indices(total_pages, args.pages)
+        if args.pages
+        else list(range(total_pages))
+    )
+    if not selected:
+        raise ValueError(f"页码范围没有命中任何页（共 {total_pages} 页）")
 
     # PDF 里的图片按 pptx2md 的习惯导出到同级的 <文件名>_media/，
     # md/json 里写相对路径，搬走 md 时连同该目录一起搬。
     media_dir = base.parent / f"{base.name}_media"
-    # 插图用 uuid 命名，上一次转换留下的文件本次不会再被引用，成功后再清掉。
+    # 插图用 uuid 命名，上一次转换留下的文件本次不会再被引用，成功后清掉。
     stale_media = (
         {path.name for path in media_dir.glob("*.png")} if media_dir.is_dir() else set()
     )
-    result = await engine.process_decoded_document(
-        images,
-        pdf_path.name,
-        list(formats),
-        keep_header_footer=args.keep_header_footer,
-        asset_dir=media_dir,
-        asset_url_prefix=f"./{base.name}_media",
-    )
-    written = write_outputs(base, result["outputs"], formats)
+
+    # 按页分块送进流水线：显存/内存峰值只和块大小有关，而且每块都能落盘，
+    # 中断后已完成的页不会白跑。整篇一次性处理时，recognition 阶段会先把
+    # 几千张裁剪图全部 copy 进内存，很容易把机器压到换页。
+    chunk_size = max(1, int(args.chunk_pages))
+    chunk_count = (len(selected) + chunk_size - 1) // chunk_size
+    markdown_parts: List[str] = []
+    json_pages: List[Dict[str, Any]] = []
+    totals = {"layout": 0.0, "recognition": 0.0, "assembly": 0.0}
+    block_total = 0
+    written: List[Path] = []
+
+    for chunk_no, offset in enumerate(range(0, len(selected), chunk_size), start=1):
+        chunk = selected[offset:offset + chunk_size]
+        chunk_started = time.perf_counter()
+        result = await engine.process_decoded_document(
+            [images[index] for index in chunk],
+            pdf_path.name,
+            list(formats),
+            keep_header_footer=args.keep_header_footer,
+            asset_dir=media_dir,
+            asset_url_prefix=f"./{base.name}_media",
+        )
+        outputs = result.get("outputs") or {}
+
+        timing, blocks = _debug_timing(result)
+        block_total += blocks
+        chunk_timing = {
+            key: float(timing.get(f"{key}_time_ms", 0)) / 1000.0 for key in totals
+        }
+        for key, seconds in chunk_timing.items():
+            totals[key] += seconds
+
+        # 分块后 page_num 从 0 重来，这里换回原文档的页号。
+        if "json" in outputs:
+            pages = outputs["json"].get("pages") or []
+            for local_index, page in enumerate(pages):
+                page["page_num"] = chunk[local_index]
+            json_pages.extend(pages)
+            outputs["json"] = {"pages": json_pages}
+        if "markdown" in outputs:
+            markdown_parts.append(outputs["markdown"])
+            outputs["markdown"] = "\n\n".join(part for part in markdown_parts if part)
+
+        # 增量落盘：长文档跑到一半也能先看结果。
+        written = write_outputs(base, outputs, formats)
+
+        for index in chunk:
+            images[index] = None  # 尽早释放已处理页的位图
+
+        elapsed = time.perf_counter() - chunk_started
+        detail = "".join(
+            f"，{name} {chunk_timing[key]:.1f}s"
+            for name, key in (("版面", "layout"), ("识别", "recognition"), ("组装", "assembly"))
+            if timing
+        )
+        print(
+            f"{prefix} 页 {chunk[0] + 1}-{chunk[-1] + 1}/{total_pages}"
+            f"（第 {chunk_no}/{chunk_count} 批）{elapsed:.1f}s"
+            + (f"，块 {blocks}" if blocks else "")
+            + detail,
+            flush=True,
+        )
+
     for name in stale_media:
         (media_dir / name).unlink(missing_ok=True)
     if media_dir.is_dir() and not any(media_dir.iterdir()):
         media_dir.rmdir()
+
+    print(
+        f"{prefix} 完成：{len(selected)}/{total_pages} 页，"
+        f"渲染 {render_elapsed:.1f}s，块 {block_total}，"
+        f"合计 {time.perf_counter() - started:.1f}s",
+        flush=True,
+    )
     return written
 
 
@@ -644,10 +1181,12 @@ async def run(args: argparse.Namespace) -> int:
         print(f"{prefix} 正在处理：{pdf_path}", flush=True)
         started = time.perf_counter()
         try:
-            written = await process_one(engine, pdf_path, base, args.formats, args)
+            written = await process_one(
+                engine, pdf_path, base, args.formats, args, prefix
+            )
             elapsed = time.perf_counter() - started
             print(
-                f"{prefix} 完成（{elapsed:.1f}s）："
+                f"{prefix} 输出（{elapsed:.1f}s）："
                 + "，".join(str(path) for path in written),
                 flush=True,
             )
@@ -665,6 +1204,9 @@ async def run(args: argparse.Namespace) -> int:
         + f"，总耗时 {total_elapsed:.1f}s",
         flush=True,
     )
+    summary = engine.stats.summary()
+    if summary:
+        print("\n" + summary, flush=True)
     if failures:
         print("失败文件：", flush=True)
         for path, message in failures:

@@ -96,12 +96,17 @@ python pdf2md.py -d path/to/dir -o path/to/out --formats md
 | `-o`, `--out` | 输出目录（默认写在 PDF 旁边） |
 | `--recursive` | 配合 `-d` 递归子目录 |
 | `--formats md,json` | 只输出其中一种（默认两种都出） |
+| `--pages 1-5,8` | 只处理指定页（1 起），做小样本验证时用 |
 | `--skip-existing` | 输出已存在就跳过；全部跳过时不加载模型，几秒内直接返回 |
 | `--dpi 150` | PDF 渲染 DPI，调高更清晰但更慢 |
 | `--keep-header-footer` | 保留页眉页脚（默认丢弃） |
 | `--device auto/cuda/cpu` | 推理设备，默认有 CUDA 就用 CUDA |
 | `--max-tokens 8192` | 单个版面块的最大生成 token 数 |
+| `--batch-size 4` | 文本模型合批的批大小；1 表示不合批。同一页的多个文字块拼成一批推理，比逐块推理快 |
+| `--chunk-pages 8` | 每批送进流水线的页数；越小越省内存、进度越细，每批结束都会落盘 |
 | `--layout-batch-size 8` | 版面分析批大小 |
+| `--layout-concurrency 2` | 版面分析在途批数（单卡实际仍串行） |
+| `--torch-threads 0` | torch/OpenCV 的 CPU 线程数，0 表示保持默认；GPU 推理时调小有时反而更快 |
 | `--model <目录>` | 换一份模型权重 |
 | `--verbose` | 打印调试日志 |
 
@@ -141,7 +146,9 @@ python normalize_docx.py path/to/file.docx
 - **阅读顺序** — 多栏与图文混排按版面位置加 XY-Cut 还原顺序，跨栏、跨页被拆开的段落会拼接；
 - **清理** — 去重、去重叠、合并碎片，丢弃页眉页脚，最后组装成 Markdown 与 JSON。
 
-JSON 与官方服务的返回一致：`{"pages": [{page_num, page_size, blocks: [{idx, type, bbox, content, format}]}]}`，`bbox` 是渲染图上的像素坐标。
+本地推理分两步：CPU 侧预处理（缩放、拼模板、做张量）和 GPU 侧生成分别放在不同线程，前一页在 GPU 上跑的时候下一页已经在 CPU 上准备好；同一类型的多个文字块会拼成一批跑一次生成（`--batch-size`），比逐块推理快。整篇文档按 `--chunk-pages` 分块送进流水线，每块结束就落盘一次，长文档中断也不至于白跑，控制台会逐块打印页范围、耗时与块数，全部结束后再打一行调用次数与平均耗时。
+
+JSON 与官方服务的返回一致：`{"pages": [{page_num, page_size, blocks: [{idx, type, bbox, content, format}]}]}`，`bbox` 是渲染图上的像素坐标；分块处理时 `page_num` 仍是原文档的页号。
 
 ## docx2md 的转换规则
 

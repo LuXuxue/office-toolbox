@@ -42,6 +42,8 @@ PDF 里的图片导出到同目录的 <文件名>_media/。
                       但单批的固定开销占比越高。
     --pages           页码范围（1 起），只在选中的页上工作。
     --layout-concurrency  版面分析的在途批数（单卡串行，一般不用改）。
+    --graph-decode    解码段是否捕获成 CUDA Graph（auto/on/off，仅 NVIDIA）。
+    --graph-cache-len 图解码预留的缓存长度，超出的请求回退到普通生成。
 
 依赖（GPU 版 torch 请按 https://pytorch.org 的说明安装）：
 
@@ -52,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import importlib
 import json
 import logging
@@ -226,6 +229,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="torch 的 CPU 线程数，0 表示保持默认（默认：0）",
     )
     parser.add_argument(
+        "--graph-decode", choices=("auto", "on", "off"), default="auto",
+        help=(
+            "是否把逐 token 的解码捕获成 CUDA Graph（默认：auto，CUDA 上自动开启）。"
+            "auto/on 在 CPU、采样模式或 prompt 超出预留长度时自动回退"
+        ),
+    )
+    parser.add_argument(
+        "--graph-cache-len", type=int, default=2048,
+        help=(
+            "图解码预留的 KV 缓存长度（默认：2048）。"
+            "prompt 与生成长度之和超过它时回退到普通生成，"
+            "显存占用约 112 KB/行/千 token"
+        ),
+    )
+    parser.add_argument(
         "--keep-header-footer", action="store_true", help="保留页眉和页脚"
     )
     parser.add_argument(
@@ -260,6 +278,8 @@ class RunStats:
         self.generate_seconds = 0.0
         self.output_tokens = 0
         self.length_hits = 0
+        self.graph_batches = 0
+        self.graph_fallbacks = 0
 
     def add_layout(self, pages: int, seconds: float) -> None:
         with self._lock:
@@ -271,12 +291,20 @@ class RunStats:
         with self._lock:
             self.prepare_seconds += seconds
 
-    def add_generate(self, samples: int, tokens: int, seconds: float) -> None:
+    def add_generate(
+        self, samples: int, tokens: int, seconds: float, graph: bool = False
+    ) -> None:
         with self._lock:
             self.generate_batches += 1
             self.generate_samples += samples
             self.generate_seconds += seconds
             self.output_tokens += tokens
+            if graph:
+                self.graph_batches += 1
+
+    def add_graph_fallback(self) -> None:
+        with self._lock:
+            self.graph_fallbacks += 1
 
     def add_length_hit(self) -> None:
         with self._lock:
@@ -306,6 +334,15 @@ class RunStats:
                 f"    平均每请求 {per_sample * 1000:.0f} ms，"
                 f"每输出 token {per_token:.1f} ms，共 {self.output_tokens} token"
             )
+            if self.graph_batches:
+                lines.append(
+                    f"    CUDA Graph 解码 {self.graph_batches} 批"
+                    + (
+                        f"，超长回退 {self.graph_fallbacks} 批"
+                        if self.graph_fallbacks
+                        else ""
+                    )
+                )
             if self.length_hits:
                 lines.append(
                     f"    达到 token 上限后重跑的块：{self.length_hits} 个"
@@ -334,6 +371,268 @@ def _load_model_module(model_dir: Path):
     return importlib.import_module(f"{package_name}.modeling_oxr")
 
 
+# CUDA Graph 解码的分块大小：每跑这么多步同步一次，看是否已经有结论。
+GRAPH_CHUNK_STEPS = 16
+
+# 攒批时最多等这么久；本地生成是瓶颈，等一小会儿换更高的一批利用率更划算。
+GROUP_WAIT_SECONDS = 0.05
+
+
+def _cuda_graph_supported(torch, device) -> bool:
+    """CUDA Graph 只在 NVIDIA 的 CUDA 上启用。
+
+    ROCm 版的 torch 也把设备类型报成 "cuda"，`torch.cuda.is_available()` 同样
+    是 True，但图捕获依赖的若干行为在 HIP 上并不保证（StaticCache 的原地写入、
+    内核句柄复用等）。两者的区分点是版本号：CUDA 版有 `torch.version.cuda`、
+    没有 `hip`，ROCm 版反过来。非 NVIDIA 环境直接保留原来的 `generate`，
+    只是慢一些，转换结果不受影响。
+    """
+    if device.type != "cuda":
+        return False
+    if getattr(torch.version, "hip", None) is not None:
+        return False
+    return getattr(torch.version, "cuda", None) is not None
+
+
+@contextlib.contextmanager
+def _sdpa_gqa_enabled():
+    """临时让 SDPA 在带 mask 时也走 `enable_gqa`。
+
+    transformers 的 sdpa 实现在 `attention_mask` 非空时会用 `repeat_kv` 把
+    K/V 整段复制成和 Q 一样多的 head，每层两次 contiguous 拷贝，耗时随缓存
+    长度线性增长（实测占单步 GPU 时间的 42%）。torch 的融合内核本身支持
+    GQA + mask，只是 transformers 出于保守把它关掉了；这里临时打开，退出时
+    复原，避免影响走 `generate` 的代码路径。
+    """
+    from transformers.integrations import sdpa_attention
+
+    original = sdpa_attention.use_gqa_in_sdpa
+    sdpa_attention.use_gqa_in_sdpa = lambda *args, **kwargs: True
+    try:
+        yield
+    finally:
+        sdpa_attention.use_gqa_in_sdpa = original
+
+
+def _probe_sdpa_gqa(torch, config, device, dtype) -> bool:
+    """先用模型真实的 head 数试一次“带 mask 的 GQA”，失败就不开这个优化。
+
+    个别 torch / 显卡组合在这种组合下会直接触发 device-side assert，整张卡
+    作废且无法恢复，所以先在几个小张量上试一遍，再决定要不要真的用。
+    """
+    try:
+        heads = int(getattr(config, "num_attention_heads", 0))
+        kv_heads = int(getattr(config, "num_key_value_heads", heads))
+        head_dim = int(getattr(config, "head_dim", 128))
+        if heads <= 0 or kv_heads >= heads:
+            return False
+        q = torch.randn((1, heads, 1, head_dim), device=device, dtype=dtype)
+        k = torch.randn((1, kv_heads, 512, head_dim), device=device, dtype=dtype)
+        v = torch.randn((1, kv_heads, 512, head_dim), device=device, dtype=dtype)
+        mask = torch.ones((1, 1, 1, 512), dtype=torch.bool, device=device)
+        with torch.inference_mode():
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, enable_gqa=True
+            )
+        return bool(torch.isfinite(out).all().item())
+    except Exception:  # noqa: BLE001 - 不支持就退回 repeat_kv 的写法
+        return False
+
+
+class GreedyGraphDecoder:
+    """把逐 token 的贪心解码捕获成一张 CUDA Graph。
+
+    本地推理的瓶颈不在算力。实测单步 decode 的 GPU 时间只有约 11 ms，其余
+    50 ms 全花在 Windows 上几百次 kernel 提交的 CPU 开销（也能解释“CPU 高、
+    GPU 空转”）。解码段的形状本来是固定的（每步 1 个 token），只要把 KV
+    缓存按固定长度预分配（StaticCache），整段就能捕获成一张图，之后每步只剩
+    一次 graph.replay()。
+
+    为了让“缓存位置”和 mask 都能在图内推进，这两者用固定缓冲区保存：图里
+    每步把新 token 写回输入、把缓存位置 +1、把 mask 的下一位打开，因此一个
+    图可以被任意多个请求复用，只要 prompt 与生成长度不超出预留长度。
+    """
+
+    def __init__(
+        self,
+        llm,
+        batch: int,
+        cache_len: int,
+        device,
+    ) -> None:
+        import torch
+        from transformers import StaticCache
+
+        self.torch = torch
+        self.llm = llm
+        self.batch = int(batch)
+        self.cache_len = int(cache_len)
+        self.device = device
+
+        self.cache = StaticCache(config=llm.config, max_cache_len=self.cache_len)
+        # 带 mask 的 GQA 能省掉每层两次 K/V 拷贝，单步快约 40%；
+        # 能不能用取决于 torch 与显卡，先探测再决定。
+        dtype = next(llm.parameters()).dtype
+        self.use_gqa = _probe_sdpa_gqa(torch, llm.config, device, dtype)
+        self.input_ids = torch.zeros((self.batch, 1), dtype=torch.long, device=device)
+        self.mask = torch.zeros(
+            (self.batch, 1, 1, self.cache_len), dtype=torch.bool, device=device
+        )
+        # 能生成多少 token 只受缓存长度约束，history 直接按缓存长度开
+        self.history = torch.zeros(
+            (self.batch, self.cache_len), dtype=torch.long, device=device
+        )
+        self.step = torch.zeros((1,), dtype=torch.long, device=device)
+        self.mask_pos = torch.zeros((1,), dtype=torch.long, device=device)
+        # prompt 长度每个请求都不同，但图里不能出现 Python 常量，统一走张量
+        self.pos_base = torch.zeros((1,), dtype=torch.long, device=device)
+
+        self.graph = None
+        self.first = None
+        self.mask2d = None
+        self.prompt_length = 0
+
+    # -- 状态复位（每次请求开始前） ---------------------------------------- #
+
+    def _set_cumulative(self, value: int) -> None:
+        """把 KV 缓存的写入位置拨到 value（StaticCache 内部是张量，图里也用它）。"""
+        with self.torch.inference_mode():
+            for layer in self.cache.layers:
+                if getattr(layer, "is_initialized", False):
+                    layer.cumulative_length.zero_().add_(value)
+
+    def _reset(self) -> None:
+        """回到“预填充刚结束”的状态，供下一次 replay 从第一个新 token 开始。"""
+        with self.torch.inference_mode():
+            self._set_cumulative(self.prompt_length)
+            self.step.zero_()
+            self.pos_base.fill_(self.prompt_length)
+            self.mask_pos.fill_(self.prompt_length)
+            self.mask.zero_()
+            self.mask[..., : self.prompt_length] = self.mask2d[:, None, None, :]
+            # 第一个新 token 自己的位置也要放行（它的 key 在这一步刚写进缓存）
+            self.mask[..., self.prompt_length] = True
+            self.input_ids.copy_(self.first)
+            self.history.zero_()
+            self.history[:, 0:1].copy_(self.first)
+
+    # -- 一步解码（会被捕获进图） ------------------------------------------ #
+
+    def _step(self) -> None:
+        out = self.llm(
+            input_ids=self.input_ids,
+            attention_mask=self.mask,
+            past_key_values=self.cache,
+            use_cache=True,
+            logits_to_keep=1,
+        )
+        nxt = out.logits[:, -1].argmax(-1, keepdim=True)
+        # history[0] 是预填充给出的第一个 token，本例输出写在下一位
+        self.history.scatter_(
+            1, (self.step + 1).view(1, 1).expand(self.batch, 1), nxt
+        )
+        self.input_ids.copy_(nxt)
+        self.step.add_(1)
+        self.mask_pos.copy_(self.pos_base + self.step)
+        self.mask.index_fill_(3, self.mask_pos, True)
+
+    # -- 对外接口 ---------------------------------------------------------- #
+
+    def supports(self, prompt_length: int) -> bool:
+        # 至少留出 1 个 token 的生成空间，并且 mask 的“下一位”不能越界
+        return prompt_length + 2 <= self.cache_len
+
+    def capacity(self, prompt_length: int) -> int:
+        """这批请求最多能生成多少个 token（受预分配的缓存长度限制）。"""
+        return max(0, self.cache_len - prompt_length - 1)
+
+    def _fit_batch(self, tensor, expand_dims):
+        """把不足一批的行用最后一行的副本补齐，避免整行被 mask 掉产生 NaN。"""
+        rows = int(tensor.shape[0])
+        if rows == self.batch:
+            return tensor
+        tail = tensor[-1:].expand(self.batch - rows, *expand_dims)
+        return self.torch.cat([tensor, tail], dim=0)
+
+    def decode(
+        self,
+        inputs_embeds,
+        attention_mask,
+        max_new_tokens: int,
+        eos_lookup: set,
+    ):
+        """返回 (每行的 token 列表, 是否全部正常结束)。
+
+        第二个返回值为 False 表示这批 token 超出了预留的生成长度，调用方应当
+        回退到 transformers.generate 重跑，避免把结果截断。
+        """
+        torch = self.torch
+        rows = int(inputs_embeds.shape[0])
+        if rows > self.batch:
+            raise ValueError(f"图解码的批大小是 {self.batch}，收到 {rows} 行")
+        budget = min(int(max_new_tokens), self.capacity(int(attention_mask.shape[1])))
+        embeds = self._fit_batch(inputs_embeds, (inputs_embeds.shape[1], inputs_embeds.shape[2]))
+        mask2d = self._fit_batch(attention_mask, (attention_mask.shape[1],))
+
+        gqa = _sdpa_gqa_enabled() if self.use_gqa else contextlib.nullcontext()
+        with gqa, torch.inference_mode():
+            self._set_cumulative(0)
+            out = self.llm(
+                inputs_embeds=embeds,
+                attention_mask=mask2d,
+                past_key_values=self.cache,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+            self.first = out.logits[:, -1].argmax(-1, keepdim=True).clone()
+            self.mask2d = mask2d
+            self.prompt_length = int(mask2d.shape[1])
+            self._reset()
+            if self.graph is None:
+                self._capture()
+
+        produced = 1
+        finished = [token in eos_lookup for token in self.first[:rows, 0].tolist()]
+        while produced < budget and not all(finished):
+            steps = min(GRAPH_CHUNK_STEPS, budget - produced)
+            with torch.inference_mode():
+                for _ in range(steps):
+                    self.graph.replay()
+                torch.cuda.synchronize(self.device)
+            produced += steps
+            fresh = self.history[:rows, produced - steps : produced].tolist()
+            for row in range(rows):
+                if not finished[row]:
+                    finished[row] = any(token in eos_lookup for token in fresh[row])
+
+        tokens = self.history[:rows, :produced].tolist()
+        complete = all(finished) or produced >= int(max_new_tokens)
+        return tokens, complete
+
+    def _capture(self) -> None:
+        torch = self.torch
+        started = time.perf_counter()
+        stream = torch.cuda.Stream(device=self.device)
+        stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.inference_mode(), torch.cuda.stream(stream):
+            for _ in range(2):  # 预热：把 cuBLAS/算子句柄都建好再捕获
+                self._step()
+        torch.cuda.current_stream(self.device).wait_stream(stream)
+        torch.cuda.synchronize(self.device)
+        self._reset()
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.inference_mode(), torch.cuda.graph(self.graph):
+            self._step()
+        torch.cuda.synchronize(self.device)
+        self._reset()
+        LOGGER.info(
+            "CUDA Graph 解码已捕获：批 %d，缓存 %d token，耗时 %.1fs",
+            self.batch,
+            self.cache_len,
+            time.perf_counter() - started,
+        )
+
+
 class OXRTextBackend:
     """用 transformers 本地加载 OXR-1.0，按批执行视觉问答。
 
@@ -342,7 +641,15 @@ class OXRTextBackend:
     这样 CPU 侧的图像处理不会白等 GPU 解码。
     """
 
-    def __init__(self, model_dir: Path, device, stats: Optional[RunStats] = None) -> None:
+    def __init__(
+        self,
+        model_dir: Path,
+        device,
+        stats: Optional[RunStats] = None,
+        graph_decode: bool = False,
+        graph_batch: int = 4,
+        graph_cache_len: int = 2048,
+    ) -> None:
         import torch
         from transformers import GenerationConfig
 
@@ -402,6 +709,34 @@ class OXRTextBackend:
             self.eos_token_ids = [int(eos_token_id)]
         self._eos_lookup = set(self.eos_token_ids)
         LOGGER.info("模型加载完成，耗时 %.1fs", time.perf_counter() - started)
+
+        # 图解码只在 NVIDIA 的 CUDA 上、且是贪心生成时可用；创建实例不占多少
+        # 显存，StaticCache 由第一次使用时的一次真实预填充惰性分配。
+        self.graph_decoder: Optional[GreedyGraphDecoder] = None
+        if graph_decode and _cuda_graph_supported(torch, device):
+            try:
+                self.graph_decoder = GreedyGraphDecoder(
+                    self.model.llm,
+                    batch=max(1, int(graph_batch)),
+                    cache_len=int(graph_cache_len),
+                    device=device,
+                )
+                LOGGER.info(
+                    "CUDA Graph 解码可用（批 %d，缓存 %d token，SDPA %s）",
+                    self.graph_decoder.batch,
+                    self.graph_decoder.cache_len,
+                    "GQA" if self.graph_decoder.use_gqa else "repeat_kv",
+                )
+            except Exception as error:  # noqa: BLE001 - 退化为普通 generate
+                LOGGER.warning("CUDA Graph 解码不可用，回退到 generate：%s", error)
+                self.graph_decoder = None
+        elif graph_decode:
+            LOGGER.info(
+                "当前设备不是 NVIDIA CUDA（%s，torch %s），保留 transformers.generate；"
+                "CUDA Graph 仅在 NVIDIA 显卡上启用",
+                device.type,
+                getattr(torch.version, "cuda", None) or "ROCm/CPU",
+            )
 
     # -- 预处理（纯 CPU） -------------------------------------------------- #
 
@@ -515,6 +850,15 @@ class OXRTextBackend:
             grid_thws = torch.cat([item[2] for item in prepared], dim=0).to(self.device)
 
         generation_kwargs = self._generation_kwargs(max_new_tokens, model_options)
+        limit = int(generation_kwargs["max_new_tokens"])
+        row_limits = list(limits or [limit] * len(prepared))
+        greedy = (
+            generation_kwargs.get("do_sample") is False
+            and "repetition_penalty" not in generation_kwargs
+        )
+        decoder = self.graph_decoder
+        graph_used = False
+        tokens_by_row = None
 
         with torch.inference_mode():
             inputs_embeds = self.model.merge_multimodal(
@@ -522,18 +866,39 @@ class OXRTextBackend:
                 pixel_values=pixel_values,
                 grid_thws=grid_thws,
             )
-            generated = self.model.llm.generate(
-                inputs=None,
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                **generation_kwargs,
-            )
 
-        limit = int(generation_kwargs["max_new_tokens"])
+        if (
+            decoder is not None
+            and greedy
+            and decoder.supports(max_length)
+        ):
+            try:
+                tokens_by_row, complete = decoder.decode(
+                    inputs_embeds, attention_mask, max(row_limits), self._eos_lookup
+                )
+                graph_used = complete
+            except Exception as error:  # noqa: BLE001 - 图解码失败就退回 generate
+                LOGGER.warning("CUDA Graph 解码失败，回退到 generate：%s", error)
+                tokens_by_row = None
+            if not graph_used:
+                tokens_by_row = None
+                if self.stats is not None:
+                    self.stats.add_graph_fallback()
+
+        if tokens_by_row is None:
+            with torch.inference_mode():
+                generated = self.model.llm.generate(
+                    inputs=None,
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    **generation_kwargs,
+                )
+            tokens_by_row = [row.tolist() for row in generated]
+
         results = []
         produced_tokens = 0
-        for row, row_limit in enumerate(limits or [limit] * len(prepared)):
-            tokens = generated[row].tolist()
+        for row, row_limit in enumerate(row_limits):
+            tokens = tokens_by_row[row]
             cut = len(tokens)
             for position, token in enumerate(tokens):
                 if token in self._eos_lookup:
@@ -551,7 +916,10 @@ class OXRTextBackend:
 
         if self.stats is not None:
             self.stats.add_generate(
-                len(prepared), produced_tokens, time.perf_counter() - started
+                len(prepared),
+                produced_tokens,
+                time.perf_counter() - started,
+                graph_used,
             )
         return results
 
@@ -625,19 +993,36 @@ class LocalOXRClient:
         self._workers.append(loop.create_task(self._generate_loop()))
 
     async def _next_group(self) -> List[_PendingRequest]:
-        """取出队首请求所在的一批同类型请求。"""
+        """取出队首请求所在的一批同类型请求。
+
+        生成阶段是瓶颈、而且批大小几乎不影响单步耗时（CUDA Graph 下批 1 与
+        批 4 只差几毫秒），所以这里愿意多等一小会儿把一批攒满：36 个请求
+        分成 24 批和分成 9 批，解码时间差一倍以上。
+        """
         async with self._condition:
             while not self._pending:
                 await self._condition.wait()
             first = self._pending[0]
+            deadline = time.monotonic() + GROUP_WAIT_SECONDS
+            while True:
+                same = [r for r in self._pending if r.key == first.key]
+                if len(same) >= self.batch_size:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(self._condition.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
             group: List[_PendingRequest] = []
-            remaining: List[_PendingRequest] = []
+            rest: List[_PendingRequest] = []
             for request in self._pending:
                 if request.key == first.key and len(group) < self.batch_size:
                     group.append(request)
                 else:
-                    remaining.append(request)
-            self._pending = remaining
+                    rest.append(request)
+            self._pending = rest
             return group
 
     async def _prepare_loop(self) -> None:
@@ -935,7 +1320,14 @@ class LocalEngine:
         # 打开后 orchestrator 会在 metadata 里带上各阶段耗时，用于进度输出。
         settings.debug = True
 
-        text_backend = OXRTextBackend(model_dir, device, self.stats)
+        text_backend = OXRTextBackend(
+            model_dir,
+            device,
+            self.stats,
+            graph_decode=self.args.graph_decode != "off",
+            graph_batch=max(1, int(self.args.batch_size)),
+            graph_cache_len=max(256, int(self.args.graph_cache_len)),
+        )
         oxr_client = LocalOXRClient(
             text_backend, settings.oxr_model, self.args.batch_size
         )

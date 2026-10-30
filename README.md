@@ -107,6 +107,8 @@ python pdf2md.py -d path/to/dir -o path/to/out --formats md
 | `--layout-batch-size 8` | 版面分析批大小 |
 | `--layout-concurrency 2` | 版面分析在途批数（单卡实际仍串行） |
 | `--torch-threads 0` | torch/OpenCV 的 CPU 线程数，0 表示保持默认；GPU 推理时调小有时反而更快 |
+| `--graph-decode auto` | 是否把逐 token 的解码捕获成 CUDA Graph，`auto`/`on`/`off`；仅 NVIDIA CUDA 生效 |
+| `--graph-cache-len 2048` | 图解码预留的 KV 缓存长度；prompt 与生成长度之和超过它时回退到普通生成 |
 | `--model <目录>` | 换一份模型权重 |
 | `--verbose` | 打印调试日志 |
 
@@ -147,6 +149,8 @@ python normalize_docx.py path/to/file.docx
 - **清理** — 去重、去重叠、合并碎片，丢弃页眉页脚，最后组装成 Markdown 与 JSON。
 
 本地推理分两步：CPU 侧预处理（缩放、拼模板、做张量）和 GPU 侧生成分别放在不同线程，前一页在 GPU 上跑的时候下一页已经在 CPU 上准备好；同一类型的多个文字块会拼成一批跑一次生成（`--batch-size`），比逐块推理快。整篇文档按 `--chunk-pages` 分块送进流水线，每块结束就落盘一次，长文档中断也不至于白跑，控制台会逐块打印页范围、耗时与块数，全部结束后再打一行调用次数与平均耗时。
+
+在 NVIDIA 显卡上，解码段还会被捕获成一张 CUDA Graph（`--graph-decode`）：逐 token 解码本来是几百次 kernel 提交，Windows 上 CPU 提交的时间比 GPU 计算还长，捕获之后每步只剩一次 `graph.replay()`。同时 SDPA 会走 `enable_gqa`，省掉每层两次 K/V 整段拷贝。两者都只在数值上等价、不改变输出；显存不够或缓存长度不够（`--graph-cache-len`）时自动回退到 `transformers.generate`。AMD（ROCm）与 CPU 上不会尝试捕获，行为与之前一致。
 
 JSON 与官方服务的返回一致：`{"pages": [{page_num, page_size, blocks: [{idx, type, bbox, content, format}]}]}`，`bbox` 是渲染图上的像素坐标；分块处理时 `page_num` 仍是原文档的页号。
 

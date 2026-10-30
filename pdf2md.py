@@ -973,10 +973,14 @@ class LocalOXRClient:
         """流水线用它限制在途请求数。
 
         本地实现里真正的串行点是对 GPU 的独占，用 1 会让请求永远无法攒成
-        一批；这里放宽到批大小的两倍，只作为内存/背压上限。
+        一批；这里放宽到批大小的 8 倍，只作为内存/背压上限。
         """
         loop = asyncio.get_running_loop()
-        limit = max(self.batch_size * 2, 4)
+        # 只在途请求数上限，同时也是识别阶段的内存背压。本地实现里独占 GPU
+        # 的是生成线程，卡住请求数只会让攒批攒不满（16 页规范有 123 个块，
+        # 上限 8 时队列经常只剩一两个同类请求），所以放宽一些：排队的请求
+        # 只占着已经裁好的图，不再额外占显存。
+        limit = max(self.batch_size * 8, 16)
         if self._semaphore_loop is not loop or self._semaphore is None:
             self._semaphore = asyncio.Semaphore(limit)
             self._semaphore_loop = loop
@@ -993,20 +997,20 @@ class LocalOXRClient:
         self._workers.append(loop.create_task(self._generate_loop()))
 
     async def _next_group(self) -> List[_PendingRequest]:
-        """取出队首请求所在的一批同类型请求。
+        """取出“能凑满一批”的那一类请求。
 
         生成阶段是瓶颈、而且批大小几乎不影响单步耗时（CUDA Graph 下批 1 与
-        批 4 只差几毫秒），所以这里愿意多等一小会儿把一批攒满：36 个请求
-        分成 24 批和分成 9 批，解码时间差一倍以上。
+        批 4 只差几毫秒），所以这里愿意多等一小会儿、并优先挑同类里排队最多
+        的，把一批攒满：一份规范类文档 16 页有 123 个块，按“先到先得”只能
+        凑出 68 批（平均 1.8 行），预填充和补行的开销全白花。
         """
         async with self._condition:
             while not self._pending:
                 await self._condition.wait()
-            first = self._pending[0]
             deadline = time.monotonic() + GROUP_WAIT_SECONDS
             while True:
-                same = [r for r in self._pending if r.key == first.key]
-                if len(same) >= self.batch_size:
+                key, count = self._busiest_key()
+                if count >= self.batch_size:
                     break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -1015,15 +1019,29 @@ class LocalOXRClient:
                     await asyncio.wait_for(self._condition.wait(), timeout=remaining)
                 except asyncio.TimeoutError:
                     break
+            key, _count = self._busiest_key()
             group: List[_PendingRequest] = []
             rest: List[_PendingRequest] = []
             for request in self._pending:
-                if request.key == first.key and len(group) < self.batch_size:
+                if request.key == key and len(group) < self.batch_size:
                     group.append(request)
                 else:
                     rest.append(request)
             self._pending = rest
             return group
+
+    def _busiest_key(self) -> Tuple[Any, int]:
+        """排队最多的请求类型（并列时取最早到达的，保证先进先出）。"""
+        counts: Dict[Any, int] = {}
+        for request in self._pending:
+            counts[request.key] = counts.get(request.key, 0) + 1
+        best_key = self._pending[0].key if self._pending else None
+        best = counts.get(best_key, 0)
+        for request in self._pending:
+            count = counts[request.key]
+            if count > best:
+                best_key, best = request.key, count
+        return best_key, best
 
     async def _prepare_loop(self) -> None:
         loop = asyncio.get_running_loop()

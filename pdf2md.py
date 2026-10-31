@@ -30,14 +30,16 @@ OXR/ 子目录（从 SoMarkAI/OXR 复制的最小运行子集）：
     # 只跑第 1~5 页做效果/速度验证
     python pdf2md.py D:\\docs\\a.pdf --pages 1-5
 
-结果默认写到源 PDF 所在目录，文件名与源文件相同，扩展名为 .md / .json；
+结果默认写到源 PDF 所在目录，文件名与源文件相同，默认只输出 .md
+（加 --formats json 会同时输出 .json）；
 PDF 里的图片导出到同目录的 <文件名>_media/。
 
 速度相关的几个旋钮（默认值按“单卡、可中断”调过）：
 
     --batch-size      文本模型的批大小。流水线原本面向 vLLM 的连续批处理，
                       本地串行时把同一类型的多个识别请求拼成一批，能把
-                      每 token 都要重读一遍模型权重的开销摊薄，4~8 收益明显。
+                      每 token 都要重读一遍模型权重的开销摊薄，16 左右最优
+                      （实测 10 页：4→91 ms/token，16→38 ms/token，32→41）。
     --chunk-pages     每批送进流水线的页数。越小越省显存、进度越细，
                       但单批的固定开销占比越高。
     --pages           页码范围（1 起），只在选中的页上工作。
@@ -58,6 +60,7 @@ import contextlib
 import importlib
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -83,6 +86,15 @@ FORMAT_ALIASES = {
     "json": "json",
 }
 
+# ROCm 性能环境变量，必须在 torch 导入前设置（进程启动时生效）：
+# TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL：启用 AOTriton flash attention。
+# 实测带 mask 的注意力从 ~7 ms 降到 ~1 ms（8 倍），ROCm 上不开这个开关
+# 会退化到 math 内核，是解码阶段最大的单点瓶颈。
+os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
+# MIOpen：FAST 模式不做穷举寻优（默认 EXTENSIVE 在 gfx1103 上首次跑
+# 版面模型的卷积要编译/搜索二十分钟以上），一次性推理收益最大。
+os.environ.setdefault("MIOPEN_FIND_MODE", "2")
+os.environ.setdefault("MIOPEN_SEARCH_CUTOFF", "1")
 
 def _setup_stdio() -> None:
     for stream in (sys.stdout, sys.stderr):
@@ -167,7 +179,7 @@ def select_page_indices(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="使用 OXR-1.0 把 PDF 转成 Markdown，输出同名 .md / .json 文件。",
+        description="使用 OXR-1.0 把 PDF 转成 Markdown，默认输出同名 .md 文件。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例：\n"
@@ -189,8 +201,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--recursive", action="store_true", help="配合 -d 递归处理子目录"
     )
     parser.add_argument(
-        "--formats", type=_parse_formats, default=["markdown", "json"],
-        help="输出格式，逗号分隔，可选 md、json（默认：md,json）",
+        "--formats", type=_parse_formats, default=["markdown"],
+        help="输出格式，逗号分隔，可选 md、json（默认：md，只输出 Markdown）",
     )
     parser.add_argument(
         "--pages", type=_parse_pages, default=None,
@@ -201,8 +213,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="每批送进流水线的页数（默认：8，越小越省内存、进度越细）",
     )
     parser.add_argument(
-        "--batch-size", type=int, default=4,
-        help="文本模型的批大小，同类型请求合批推理（默认：4，1 表示不合批）",
+        "--batch-size", type=int, default=16,
+        help="文本模型的批大小，同类型请求合批推理（默认：16，1 表示不合批；"
+             "本地串行推理下 16 比 4 快约 2 倍，32 以上反而变慢）",
     )
     parser.add_argument(
         "--model", default=str(DEFAULT_MODEL_DIR),
@@ -375,7 +388,9 @@ def _load_model_module(model_dir: Path):
 GRAPH_CHUNK_STEPS = 16
 
 # 攒批时最多等这么久；本地生成是瓶颈，等一小会儿换更高的一批利用率更划算。
-GROUP_WAIT_SECONDS = 0.05
+# 等同一类型请求凑满一批的超时（秒）。攒批越满，视觉编码器与预填充的
+# 固定开销摊得越薄；0.5s 在实测里已能把批填满，再长只增加尾延迟。
+GROUP_WAIT_SECONDS = 0.5
 
 
 def _cuda_graph_supported(torch, device) -> bool:

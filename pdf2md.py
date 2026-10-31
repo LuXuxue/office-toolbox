@@ -218,6 +218,14 @@ def build_parser() -> argparse.ArgumentParser:
              "本地串行推理下 16 比 4 快约 2 倍，32 以上反而变慢）",
     )
     parser.add_argument(
+        "--reading-order", choices=("geo", "llm"), default="llm",
+        help=(
+            "块阅读序的确定方式：llm=上游原行为，把每页整页图片再送模型推理一轮"
+            "（更贵，但阅读序质量最高，默认）；geo=XY-Cut++ 几何排序（零 GPU 开销，"
+            "可提速约 1/6，但对多栏、复杂版式等场景有局限，输出顺序可能不准）"
+        ),
+    )
+    parser.add_argument(
         "--model", default=str(DEFAULT_MODEL_DIR),
         help=f"OXR 模型目录（默认：{DEFAULT_MODEL_DIR}）",
     )
@@ -1374,6 +1382,28 @@ class LocalEngine:
         orchestrator_module.model_client = oxr_client
         reading_order_module.model_client = oxr_client
         recognition_module.model_client = oxr_client
+
+        # 阅读序：版面模型不提供阅读序时，上游编排器会把每页整页图片再送
+        # 模型推理一轮（每页一次整页请求，视觉开销约为文本块的 5~6 倍）。
+        # 默认走上游原行为保证阅读序质量；--reading-order geo 改用 XY-Cut++
+        # 几何排序（零 GPU 开销，可提速约 1/6，但多栏/复杂版式有局限）。
+        if self.args.reading_order == "geo":
+            from oxr.pipeline.xycut_order import xycut_plus_order
+
+            async def _geometric_reading_orders(pages_blocks, pages_images, semaphore, **kwargs):
+                orders = []
+                for blocks in pages_blocks:
+                    try:
+                        orders.append(xycut_plus_order(blocks))
+                    except Exception:
+                        LOGGER.warning("XY-Cut++ 未能产生阅读序，该页回退为版面顺序")
+                        orders.append(list(range(len(blocks))))
+                return orders
+
+            # orchestrator 在模块顶部直接 from-import 了该函数，
+            # 两个命名空间都要替换才生效
+            reading_order_module.resolve_reading_orders = _geometric_reading_orders
+            orchestrator_module.resolve_reading_orders = _geometric_reading_orders
 
         self.settings = settings
         self.pdf_to_images = pdf_to_images

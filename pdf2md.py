@@ -1298,6 +1298,126 @@ def _resolve_device(name: str):
     return torch.device(name)
 
 
+# 句子级终止标点：行尾是这些字符说明句子已结束，不与下一页续接。
+# 逗号、分号、冒号、顿号都是句内停顿，句子仍在延续，允许跨页合并。
+_TERMINAL_END_CHARS = "。？！….!?|>"
+
+
+def _merge_adjacent_text_blocks(pages_blocks):
+    """把同栏、纵向紧邻的纯文本块合并成更少、更高的裁切块。
+
+    视觉塔按裁切面积计费，一行一块时每个块都要付一次视觉编码的固定开销。
+    把相邻行合并成一块，请求数下降数倍，视觉开销随之下降；识别后按行自然
+    成段，段落结构比逐行识别更合理。layout 返回的块是检测序而非垂直序，
+    故先把纯文本块按 y 排序再贪心分组（同栏、组高不超上限），合并时拷贝
+    新块并扩展 bbox，不改动 layout 原块对象（避免连带影响 JSON 输出的框）。
+    """
+    from dataclasses import replace
+
+    from oxr.pipeline.models import BlockType
+
+    # 组高上限（px）：约 10 行。太高则裁切缩到 512 后纵向拉伸失真，
+    # 太低则请求数降得少。
+    max_group_h = 250.0
+    merged_pages = []
+    for blocks in pages_blocks:
+        text_blocks = [
+            b for b in blocks
+            if b.type == BlockType.TEXT and not b.generated_role
+        ]
+        non_text_blocks = [
+            b for b in blocks
+            if b.type != BlockType.TEXT or b.generated_role
+        ]
+        # 单栏文档按 y 即垂直序；多栏会交错，但 _mergeable 的水平重叠
+        # 检查会阻止跨栏误并。
+        text_blocks.sort(key=lambda b: (b.bbox[1] + b.bbox[3]) / 2)
+        groups: list = []
+        for b in text_blocks:
+            if groups:
+                g = groups[-1]
+                g_h = max(x.bbox[3] for x in g) - min(x.bbox[1] for x in g)
+                if (
+                    _mergeable_text_blocks(g[-1], b)
+                    and g_h + (b.bbox[3] - b.bbox[1]) <= max_group_h
+                ):
+                    g.append(b)
+                    continue
+            groups.append([b])
+        out = []
+        for g in groups:
+            if len(g) == 1:
+                out.append(replace(g[0], bbox=list(g[0].bbox)))
+                continue
+            x0 = min(b.bbox[0] for b in g)
+            y0 = min(b.bbox[1] for b in g)
+            x1 = max(b.bbox[2] for b in g)
+            y1 = max(b.bbox[3] for b in g)
+            out.append(replace(g[0], bbox=[x0, y0, x1, y1]))
+        for b in non_text_blocks:
+            out.append(replace(b, bbox=list(b.bbox)))
+        # 按 y 中心排序，给识别/阅读序一个合理顺序
+        out.sort(key=lambda b: (b.bbox[1] + b.bbox[3]) / 2)
+        merged_pages.append(out)
+    return merged_pages
+
+
+def _mergeable_text_blocks(a, b) -> bool:
+    """判断两个纯文本块可否纵向合并：同栏、间距小、合并后不过高（上下顺序无关）。"""
+    ax0, ay0, ax1, ay1 = a.bbox
+    bx0, by0, bx1, by1 = b.bbox
+    # 同栏：水平重叠至少占较窄块宽度的一半
+    overlap_x = min(ax1, bx1) - max(ax0, bx0)
+    if overlap_x < 0.5 * min(ax1 - ax0, bx1 - bx0):
+        return False
+    # 纵向紧邻：间距不超过较短块高的一倍（也设 20px 绝对上限），上下顺序无关。
+    # 同段行距小、段间空白大，一倍的行高可区分两者。
+    gap = (by0 - ay1) if ay1 <= by0 else (ay0 - by1)
+    line_h = min(ay1 - ay0, by1 - by0)
+    if gap < 0 or gap > min(20.0, 1.0 * line_h):
+        return False
+    # 合并后总高度上限：避免裁切长边超过模型像素上限
+    if max(ay1, by1) - min(ay0, by0) > 900.0:
+        return False
+    return True
+
+
+def _join_markdown_across_pages(pages_markdown):
+    """跨页段落合并：页尾未以终止标点结束且页首是延续内容时，把两段并成一段。
+
+    按页识别时，一个自然段落若跨页会被拆成两段，md 里出现不自然的中断。
+    这里在页边界处做启发式合并，让跨页段落恢复为完整段落。同一函数既用于
+    一个 chunk 内的页边界（包装 assemble_markdown），也用于 chunk 之间。
+    """
+    parts = [part for part in pages_markdown if part]
+    if len(parts) <= 1:
+        return "".join(parts)
+    joined = [parts[0]]
+    for part in parts[1:]:
+        if _should_join_at_boundary(joined[-1], part):
+            # 去掉页尾的尾随空行与页首的前导空行，用单个换行连成同一段
+            joined[-1] = joined[-1].rstrip("\n") + "\n" + part.lstrip("\n")
+        else:
+            joined.append(part)
+    return "\n\n".join(joined)
+
+
+def _should_join_at_boundary(prev: str, cur: str) -> bool:
+    """页尾行与页首行是否属于同一段落的延续。"""
+    prev_lines = [line for line in prev.splitlines() if line.strip()]
+    cur_lines = [line for line in cur.splitlines() if line.strip()]
+    if not prev_lines or not cur_lines:
+        return False
+    last = prev_lines[-1].rstrip()
+    first = cur_lines[0].lstrip()
+    if not last or last[-1] in _TERMINAL_END_CHARS:
+        return False
+    # 页首是标题/表格/代码/公式/列表/图表等结构开头时不合并
+    if first.startswith(("#", "|", "```", "$$", "<", "- ", "* ", "1. ", "1) ")):
+        return False
+    return True
+
+
 class LocalEngine:
     """加载两个本地模型，并把它们接入仓库原有的流水线。"""
 
@@ -1404,6 +1524,105 @@ class LocalEngine:
             # 两个命名空间都要替换才生效
             reading_order_module.resolve_reading_orders = _geometric_reading_orders
             orchestrator_module.resolve_reading_orders = _geometric_reading_orders
+
+        # PDF2MD_LEGACY=1 时跳过全部优化（合并/缓存/段落合并/预取），用于测基线
+        import os as _legacy_os
+
+        self._legacy = _legacy_os.environ.get("PDF2MD_LEGACY") == "1"
+        if self._legacy:
+            self.settings = settings
+            self.pdf_to_images = pdf_to_images
+            self.process_decoded_document = process_decoded_document
+            self._loaded = True
+            return
+
+        # --- #1 合并相邻文本块：更少、更高的裁切，视觉开销下降数倍 ---
+        # orchestrator 在模块顶部 from-import 了这两个函数，替换其命名空间即可。
+        # 合并在识别/阅读序之前统一做，两边看到的是同一份合并结果。
+        _orig_recognize_pages = orchestrator_module.recognize_pages
+        _orig_resolve_reading_orders = orchestrator_module.resolve_reading_orders
+
+        def _wrap_with_merge(async_fn):
+            async def _wrapped(pages_blocks, *args, **kwargs):
+                return await async_fn(
+                    _merge_adjacent_text_blocks(pages_blocks), *args, **kwargs
+                )
+
+            return _wrapped
+
+        orchestrator_module.recognize_pages = _wrap_with_merge(_orig_recognize_pages)
+        orchestrator_module.resolve_reading_orders = _wrap_with_merge(
+            _orig_resolve_reading_orders
+        )
+
+        # --- #3 裁切去重缓存：相同裁切（页眉/页脚/页码）只识别一次 ---
+        import copy as _copy
+        import hashlib as _hashlib
+        import numpy as _np
+        from oxr.utils.image import crop_image as _crop_image
+
+        _orig_recognize_block = recognition_module.recognize_block
+        _crop_cache: Dict[bytes, Any] = {}
+
+        async def _cached_recognize_block(
+            block, page_image, sem, file_name, page_num,
+            model_options=None, element_formats=None, table_images=None,
+        ):
+            # PICTURE 块要落盘图片文件、表格占位图裁切不固定，二者不缓存
+            from oxr.pipeline.models import BlockType as _BlockType
+
+            if block.type == _BlockType.PICTURE or table_images is not None:
+                return await _orig_recognize_block(
+                    block, page_image, sem, file_name, page_num,
+                    model_options, element_formats, table_images,
+                )
+            crop = _crop_image(page_image, block.bbox)
+            key = _hashlib.md5(_np.ascontiguousarray(crop).tobytes()).digest()
+            cached = _crop_cache.get(key)
+            if cached is not None:
+                # 结果块里的 idx 属于原页，命中时改回当前块的 idx 保持顺序
+                hit = _copy.deepcopy(cached)
+                hit.idx = block.idx
+                return hit
+            result = await _orig_recognize_block(
+                block, page_image, sem, file_name, page_num,
+                model_options, element_formats, table_images,
+            )
+            if len(_crop_cache) < 2048:
+                _crop_cache[key] = result
+            return result
+
+        recognition_module.recognize_block = _cached_recognize_block
+
+        # --- #4 跨页段落合并：逐页组装后在页边界处合并跨页段落 ---
+        # 贴近原 assemble_markdown：逐页 blocks_to_markdown + 整体 space_markdown_math，
+        # 只在页边界处插入段落合并。
+        from oxr.pipeline.postprocess.assembly_postprocess import (
+            blocks_to_markdown as _blocks_to_markdown,
+        )
+        from oxr.pipeline.postprocess.formula_postprocess import (
+            space_markdown_math as _space_markdown_math,
+        )
+
+        def _merged_assemble_markdown(pages_blocks):
+            page_parts = [
+                _blocks_to_markdown(blocks) for blocks in pages_blocks
+            ]
+            return _space_markdown_math(_join_markdown_across_pages(page_parts))
+
+        orchestrator_module.assemble_markdown = _merged_assemble_markdown
+
+        # --- #2 chunk 级重叠：本 chunk 识别时预取下一 chunk 的版面 ---
+        self._layout_prefetched: Dict[int, Any] = {}
+        self._orig_analyze_layouts = orchestrator_module.analyze_layouts
+
+        async def _prefetched_analyze_layouts(images, model_options):
+            prefetched = self._layout_prefetched.pop(id(images), None)
+            if prefetched is not None:
+                return prefetched
+            return await self._orig_analyze_layouts(images, model_options)
+
+        orchestrator_module.analyze_layouts = _prefetched_analyze_layouts
 
         self.settings = settings
         self.pdf_to_images = pdf_to_images
@@ -1528,17 +1747,42 @@ async def process_one(
     # 几千张裁剪图全部 copy 进内存，很容易把机器压到换页。
     chunk_size = max(1, int(args.chunk_pages))
     chunk_count = (len(selected) + chunk_size - 1) // chunk_size
+    # 预先建好每个 chunk 的图像列表：同一列表对象既用于预取版面、也传给流水线，
+    # 这样 analyze_layouts 里能用 id() 对上预取结果。
+    chunk_images_list = [
+        [images[index] for index in selected[offset:offset + chunk_size]]
+        for offset in range(0, len(selected), chunk_size)
+    ]
     markdown_parts: List[str] = []
     json_pages: List[Dict[str, Any]] = []
     totals = {"layout": 0.0, "recognition": 0.0, "assembly": 0.0}
     block_total = 0
     written: List[Path] = []
+    pending_layout_task: Optional[asyncio.Task] = None
 
-    for chunk_no, offset in enumerate(range(0, len(selected), chunk_size), start=1):
-        chunk = selected[offset:offset + chunk_size]
+    for chunk_no, chunk_images in enumerate(chunk_images_list, start=1):
+        chunk = selected[(chunk_no - 1) * chunk_size:chunk_no * chunk_size]
+        if engine._legacy:
+            # 基线模式：不做版面预取，直接走原流水线。
+            pass
+        else:
+            # 收上一轮发起的版面预取（即本 chunk 的版面）；未完成则等它，失败回退常规计算。
+            if pending_layout_task is not None:
+                try:
+                    engine._layout_prefetched[id(chunk_images)] = (
+                        await pending_layout_task
+                    )
+                except Exception:
+                    engine._layout_prefetched.pop(id(chunk_images), None)
+                pending_layout_task = None
+            # 与本 chunk 的识别并行预取下一 chunk 的版面。
+            if chunk_no < len(chunk_images_list):
+                pending_layout_task = asyncio.create_task(
+                    engine._orig_analyze_layouts(chunk_images_list[chunk_no], None)
+                )
         chunk_started = time.perf_counter()
         result = await engine.process_decoded_document(
-            [images[index] for index in chunk],
+            chunk_images,
             pdf_path.name,
             list(formats),
             keep_header_footer=args.keep_header_footer,
@@ -1564,7 +1808,15 @@ async def process_one(
             outputs["json"] = {"pages": json_pages}
         if "markdown" in outputs:
             markdown_parts.append(outputs["markdown"])
-            outputs["markdown"] = "\n\n".join(part for part in markdown_parts if part)
+            if engine._legacy:
+                outputs["markdown"] = "\n\n".join(
+                    part for part in markdown_parts if part
+                )
+            else:
+                # 跨 chunk 的页边界同样做段落合并（与 chunk 内 assemble 一致）。
+                outputs["markdown"] = _join_markdown_across_pages(
+                    part for part in markdown_parts if part
+                )
 
         # 增量落盘：长文档跑到一半也能先看结果。
         written = write_outputs(base, outputs, formats)

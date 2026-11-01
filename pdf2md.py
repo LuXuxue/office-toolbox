@@ -1382,27 +1382,63 @@ def _mergeable_text_blocks(a, b) -> bool:
     return True
 
 
-def _join_markdown_across_pages(pages_markdown):
-    """跨页段落合并：页尾未以终止标点结束且页首是延续内容时，把两段并成一段。
+def _last_text_width_pct(blocks) -> float:
+    """阅读序中最后一个文本块的宽度占页宽的百分比（几何法）。
 
-    按页识别时，一个自然段落若跨页会被拆成两段，md 里出现不自然的中断。
-    这里在页边界处做启发式合并，让跨页段落恢复为完整段落。同一函数既用于
-    一个 chunk 内的页边界（包装 assemble_markdown），也用于 chunk 之间。
+    末行若是标题，宽度占比明显偏小；正文行通常接近满宽。返回 0~1。
     """
-    parts = [part for part in pages_markdown if part]
+    from oxr.pipeline.models import BlockType
+
+    last_text = None
+    for block in reversed(blocks):
+        if block.type == BlockType.TEXT and not block.generated_role:
+            last_text = block
+            break
+    if last_text is None:
+        return 1.0
+    page_width = max((b.bbox[2] for b in blocks), default=0.0)
+    block_width = last_text.bbox[2] - last_text.bbox[0]
+    return block_width / page_width if page_width > 0 else 1.0
+
+
+def _estimate_width_pct(markdown: str) -> float:
+    """用文本估算末行宽度占比：末行长度 / 该段最长行长度。
+
+    跨 chunk 边界拿不到几何 bbox（默认不输出 json），用相对长度近似。
+    """
+    lines = [line for line in markdown.splitlines() if line.strip()]
+    if not lines:
+        return 1.0
+    max_len = max(len(line) for line in lines)
+    return len(lines[-1]) / max_len if max_len > 0 else 1.0
+
+
+def _join_markdown_across_pages(parts):
+    """跨页段落合并：页尾未以终止标点结束、末行不满宽且页首是延续内容时并段。
+
+    parts 为 (markdown, 末行宽度占比) 元组序列。按页识别时，一个自然段落若跨页
+    会被拆成两段，md 里出现不自然的中断。这里在页边界处做启发式合并，让跨页
+    段落恢复为完整段落。同一函数既用于一个 chunk 内的页边界（包装 assemble_
+    markdown），也用于 chunk 之间。
+    """
+    parts = [part for part in parts if part[0]]
     if len(parts) <= 1:
-        return "".join(parts)
+        return "".join(md for md, _ in parts)
     joined = [parts[0]]
     for part in parts[1:]:
-        if _should_join_at_boundary(joined[-1], part):
-            # 去掉页尾的尾随空行与页首的前导空行，用单个换行连成同一段
-            joined[-1] = joined[-1].rstrip("\n") + "\n" + part.lstrip("\n")
+        if _should_join_at_boundary(joined[-1][0], joined[-1][1], part[0]):
+            # 去掉页尾的尾随空行与页首的前导空行，用单个换行连成同一段；
+            # 合并后末行变为当前页的末行，宽度占比随之更新。
+            joined[-1] = (
+                joined[-1][0].rstrip("\n") + "\n" + part[0].lstrip("\n"),
+                part[1],
+            )
         else:
             joined.append(part)
-    return "\n\n".join(joined)
+    return "\n\n".join(md for md, _ in joined)
 
 
-def _should_join_at_boundary(prev: str, cur: str) -> bool:
+def _should_join_at_boundary(prev: str, prev_width_pct: float, cur: str) -> bool:
     """页尾行与页首行是否属于同一段落的延续。"""
     prev_lines = [line for line in prev.splitlines() if line.strip()]
     cur_lines = [line for line in cur.splitlines() if line.strip()]
@@ -1411,6 +1447,9 @@ def _should_join_at_boundary(prev: str, cur: str) -> bool:
     last = prev_lines[-1].rstrip()
     first = cur_lines[0].lstrip()
     if not last or last[-1] in _TERMINAL_END_CHARS:
+        return False
+    # 末行宽度占比过小（偏标题/短片段）时不合并，避免把标题并进下一段
+    if prev_width_pct < 0.5:
         return False
     # 页首是标题/表格/代码/公式/列表/图表等结构开头时不合并
     if first.startswith(("#", "|", "```", "$$", "<", "- ", "* ", "1. ", "1) ")):
@@ -1595,7 +1634,11 @@ class LocalEngine:
 
         def _merged_assemble_markdown(pages_blocks):
             page_parts = [
-                _blocks_to_markdown(blocks) for blocks in pages_blocks
+                (
+                    _blocks_to_markdown(blocks),
+                    _last_text_width_pct(blocks),
+                )
+                for blocks in pages_blocks
             ]
             return _space_markdown_math(_join_markdown_across_pages(page_parts))
 
@@ -1742,7 +1785,7 @@ async def process_one(
         [images[index] for index in selected[offset:offset + chunk_size]]
         for offset in range(0, len(selected), chunk_size)
     ]
-    markdown_parts: List[str] = []
+    markdown_parts: List[Tuple[str, float]] = []
     json_pages: List[Dict[str, Any]] = []
     totals = {"layout": 0.0, "recognition": 0.0, "assembly": 0.0}
     block_total = 0
@@ -1792,11 +1835,11 @@ async def process_one(
             json_pages.extend(pages)
             outputs["json"] = {"pages": json_pages}
         if "markdown" in outputs:
-            markdown_parts.append(outputs["markdown"])
+            md = outputs["markdown"]
+            # 跨 chunk 拿不到几何 bbox，用文本相对长度估算末行宽度占比。
+            markdown_parts.append((md, _estimate_width_pct(md)))
             # 跨 chunk 的页边界同样做段落合并（与 chunk 内 assemble 一致）。
-            outputs["markdown"] = _join_markdown_across_pages(
-                part for part in markdown_parts if part
-            )
+            outputs["markdown"] = _join_markdown_across_pages(markdown_parts)
 
         # 增量落盘：长文档跑到一半也能先看结果。
         written = write_outputs(base, outputs, formats)

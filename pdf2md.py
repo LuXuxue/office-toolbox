@@ -1525,17 +1525,6 @@ class LocalEngine:
             reading_order_module.resolve_reading_orders = _geometric_reading_orders
             orchestrator_module.resolve_reading_orders = _geometric_reading_orders
 
-        # PDF2MD_LEGACY=1 时跳过全部优化（合并/缓存/段落合并/预取），用于测基线
-        import os as _legacy_os
-
-        self._legacy = _legacy_os.environ.get("PDF2MD_LEGACY") == "1"
-        if self._legacy:
-            self.settings = settings
-            self.pdf_to_images = pdf_to_images
-            self.process_decoded_document = process_decoded_document
-            self._loaded = True
-            return
-
         # --- #1 合并相邻文本块：更少、更高的裁切，视觉开销下降数倍 ---
         # orchestrator 在模块顶部 from-import 了这两个函数，替换其命名空间即可。
         # 合并在识别/阅读序之前统一做，两边看到的是同一份合并结果。
@@ -1762,24 +1751,20 @@ async def process_one(
 
     for chunk_no, chunk_images in enumerate(chunk_images_list, start=1):
         chunk = selected[(chunk_no - 1) * chunk_size:chunk_no * chunk_size]
-        if engine._legacy:
-            # 基线模式：不做版面预取，直接走原流水线。
-            pass
-        else:
-            # 收上一轮发起的版面预取（即本 chunk 的版面）；未完成则等它，失败回退常规计算。
-            if pending_layout_task is not None:
-                try:
-                    engine._layout_prefetched[id(chunk_images)] = (
-                        await pending_layout_task
-                    )
-                except Exception:
-                    engine._layout_prefetched.pop(id(chunk_images), None)
-                pending_layout_task = None
-            # 与本 chunk 的识别并行预取下一 chunk 的版面。
-            if chunk_no < len(chunk_images_list):
-                pending_layout_task = asyncio.create_task(
-                    engine._orig_analyze_layouts(chunk_images_list[chunk_no], None)
+        # 收上一轮发起的版面预取（即本 chunk 的版面）；未完成则等它，失败回退常规计算。
+        if pending_layout_task is not None:
+            try:
+                engine._layout_prefetched[id(chunk_images)] = (
+                    await pending_layout_task
                 )
+            except Exception:
+                engine._layout_prefetched.pop(id(chunk_images), None)
+            pending_layout_task = None
+        # 与本 chunk 的识别并行预取下一 chunk 的版面。
+        if chunk_no < len(chunk_images_list):
+            pending_layout_task = asyncio.create_task(
+                engine._orig_analyze_layouts(chunk_images_list[chunk_no], None)
+            )
         chunk_started = time.perf_counter()
         result = await engine.process_decoded_document(
             chunk_images,
@@ -1808,15 +1793,10 @@ async def process_one(
             outputs["json"] = {"pages": json_pages}
         if "markdown" in outputs:
             markdown_parts.append(outputs["markdown"])
-            if engine._legacy:
-                outputs["markdown"] = "\n\n".join(
-                    part for part in markdown_parts if part
-                )
-            else:
-                # 跨 chunk 的页边界同样做段落合并（与 chunk 内 assemble 一致）。
-                outputs["markdown"] = _join_markdown_across_pages(
-                    part for part in markdown_parts if part
-                )
+            # 跨 chunk 的页边界同样做段落合并（与 chunk 内 assemble 一致）。
+            outputs["markdown"] = _join_markdown_across_pages(
+                part for part in markdown_parts if part
+            )
 
         # 增量落盘：长文档跑到一半也能先看结果。
         written = write_outputs(base, outputs, formats)

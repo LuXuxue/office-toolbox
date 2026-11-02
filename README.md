@@ -31,6 +31,12 @@ huggingface-cli download SoMarkAI/OXR-1.0 --local-dir ./OXR/models/OXR-1.0
 
 推理走本机 GPU（`torch` + `transformers`）；模型加载约 4 秒，之后每页视版面复杂度约 2～20 秒。没有 CUDA 时也能用 `--device cpu` 跑，但会慢一个数量级。`OXR/models/` 已写进 `.gitignore`。
 
+## 便携版
+
+python_embeded 目录包含无 GPU 加速的 torch/torchvision 运行环境，可用于无 python 环境机器的运行和测试。
+用法章节中的各命令前的 `python` 替换成 `.\python_embeded\python.exe` 即可使用便携版内置的运行库。
+推荐在使用 `pdf2md.py` 前安装 GPU 加速的 torch/torchvision 。
+
 ## 用法
 
 ### docx → md

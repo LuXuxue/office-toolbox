@@ -1,3 +1,6 @@
+# 便携python运行环境
+python_embeded/
+# 临时目录
 __pycache__/
 # pdf2md.py 的模型权重，自行下载（约 3 GB）
 OXR/models/

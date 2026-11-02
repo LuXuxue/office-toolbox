@@ -1,0 +1,591 @@
+@charset "UTF-8";
+.somarkdown-container {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+  line-height: 1.6;
+  word-wrap: break-word;
+}
+.somarkdown-container h1, .somarkdown-container h2, .somarkdown-container h3, .somarkdown-container h4, .somarkdown-container h5, .somarkdown-container h6 {
+  margin-top: 24px;
+  margin-bottom: 16px;
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--text-color);
+}
+.somarkdown-container h1 {
+  font-size: 2em;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--h1-border-color);
+}
+.somarkdown-container h2 {
+  font-size: 1.5em;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--h2-border-color);
+}
+.somarkdown-container h3 {
+  font-size: 1.25em;
+}
+.somarkdown-container h4 {
+  font-size: 1em;
+}
+.somarkdown-container h5 {
+  font-size: 0.875em;
+}
+.somarkdown-container h6 {
+  font-size: 0.85em;
+  color: var(--h6-color);
+}
+.somarkdown-container blockquote {
+  margin: 0;
+  padding: 0 1em;
+  color: var(--blockquote-text-color);
+  border-left: 0.25em solid var(--blockquote-border-color);
+}
+.somarkdown-container hr {
+  border: none;
+  height: 1px;
+  background-color: var(--hr-bg-color);
+}
+.somarkdown-container table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  margin: 1rem auto;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+.somarkdown-container table th, .somarkdown-container table td {
+  border: 1px solid var(--table-border-color);
+  padding: 0.5rem 1rem;
+}
+.somarkdown-container img {
+  max-width: 100%;
+  width: var(--img-width);
+  margin: 0 auto;
+  display: block;
+  transition: transform 0.3s ease, box-shadow 0.3s ease, border-radius 0.3s ease;
+}
+.somarkdown-container img:hover {
+  transform: scale(var(--img-hover-scale));
+  box-shadow: var(--img-hover-shadow);
+  border-radius: var(--img-hover-radius);
+}
+.somarkdown-container p img {
+  display: inline-block;
+  max-width: var(--img-width);
+  vertical-align: middle;
+  margin: 0 0.2em;
+}
+.somarkdown-container ul, .somarkdown-container ol {
+  padding-left: 2em;
+}
+.somarkdown-container ul li::marker, .somarkdown-container ol li::marker {
+  color: var(--list-marker-color);
+}
+.somarkdown-container a {
+  text-decoration: none;
+  color: var(--link-color);
+}
+.somarkdown-container a:visited {
+  color: var(--link-color);
+}
+.somarkdown-container a:hover {
+  text-decoration: underline;
+}
+
+/* Katex styles are imported via CDN or standard css in the example, 
+   but we should provide overrides or base structure if needed */
+.katex-block {
+  overflow-x: auto;
+  overflow-y: hidden;
+  text-align: center;
+}
+
+.table-of-contents ul {
+  list-style: none;
+  padding-left: 1.5em;
+}
+.table-of-contents li {
+  margin-bottom: 0.5em;
+  position: relative;
+  padding-left: 1.2em;
+}
+.table-of-contents li::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0.4em;
+  width: 6px;
+  height: 6px;
+  border: 1px solid var(--toc-marker-color);
+  border-radius: 50%;
+  box-shadow: var(--toc-marker-glow);
+  background: transparent;
+}
+.table-of-contents a {
+  text-decoration: none;
+  color: var(--toc-text-color);
+}
+.table-of-contents a:visited {
+  color: var(--toc-text-color);
+}
+.table-of-contents a:hover {
+  text-decoration: underline;
+}
+
+.somarkdown-container code, .somarkdown-container kbd, .somarkdown-container pre {
+  font-family: var(--code-font-family);
+  font-size: 1em;
+}
+.somarkdown-container code {
+  padding: 0.2em 0.4em;
+  margin: 0;
+  font-size: 85%;
+  background-color: var(--code-bg-color);
+  border-radius: 6px;
+}
+.somarkdown-container pre {
+  margin-top: 0;
+  margin-bottom: 16px;
+  word-wrap: normal;
+  padding: 16px;
+  background-color: var(--pre-bg-color);
+  border-radius: 6px;
+  font-size: 85%;
+  line-height: 1.45;
+  overflow-x: auto;
+  position: relative;
+}
+.somarkdown-container pre code {
+  padding: 0;
+  margin: 0;
+  font-size: 100%;
+  word-break: normal;
+  white-space: pre;
+  background: transparent;
+  border: 0;
+}
+.somarkdown-container pre code.hljs {
+  display: block;
+  overflow-x: auto;
+  padding: 0;
+  background-color: transparent;
+  border-radius: 0;
+  font-size: 100%;
+  line-height: inherit;
+}
+.somarkdown-container {
+  /* Language Tag Base Style */
+}
+.somarkdown-container pre code.language-makefile::before, .somarkdown-container pre code.language-diff::before, .somarkdown-container pre code.language-markdown::before, .somarkdown-container pre code.language-md::before, .somarkdown-container pre code.language-latex::before, .somarkdown-container pre code.language-tex::before, .somarkdown-container pre code.language-dockerfile::before, .somarkdown-container pre code.language-docker::before, .somarkdown-container pre code.language-shell::before, .somarkdown-container pre code.language-sh::before, .somarkdown-container pre code.language-bash::before, .somarkdown-container pre code.language-sql::before, .somarkdown-container pre code.language-xml::before, .somarkdown-container pre code.language-yml::before, .somarkdown-container pre code.language-yaml::before, .somarkdown-container pre code.language-json::before, .somarkdown-container pre code.language-less::before, .somarkdown-container pre code.language-sass::before, .somarkdown-container pre code.language-scss::before, .somarkdown-container pre code.language-css::before, .somarkdown-container pre code.language-html::before, .somarkdown-container pre code.language-rs::before, .somarkdown-container pre code.language-rust::before, .somarkdown-container pre code.language-golang::before, .somarkdown-container pre code.language-go::before, .somarkdown-container pre code.language-c\#::before, .somarkdown-container pre code.language-csharp::before, .somarkdown-container pre code.language-cs::before, .somarkdown-container pre code.language-c\+\+::before, .somarkdown-container pre code.language-cpp::before, .somarkdown-container pre code.language-c::before, .somarkdown-container pre code.language-java::before, .somarkdown-container pre code.language-ruby::before, .somarkdown-container pre code.language-rb::before, .somarkdown-container pre code.language-python::before, .somarkdown-container pre code.language-py::before, .somarkdown-container pre code.language-typescript::before, .somarkdown-container pre code.language-ts::before, .somarkdown-container pre code.language-javascript::before, .somarkdown-container pre code.language-js::before {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  left: auto;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-family: var(--code-font-family);
+  font-weight: 600;
+  line-height: 1;
+  color: var(--code-tag-text-color);
+  background-color: var(--code-tag-bg);
+  border-radius: 6px;
+  z-index: 1;
+  pointer-events: none;
+}
+.somarkdown-container {
+  /* Language Tag Content Mapping */
+}
+.somarkdown-container pre code.language-js::before {
+  content: "js";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-javascript::before {
+  content: "js";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-ts::before {
+  content: "ts";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-typescript::before {
+  content: "ts";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-py::before {
+  content: "py";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-python::before {
+  content: "py";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-rb::before {
+  content: "rb";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-ruby::before {
+  content: "rb";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-java::before {
+  content: "java";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-c::before {
+  content: "c";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-cpp::before {
+  content: "cpp";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-c\+\+::before {
+  content: "cpp";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-cs::before {
+  content: "c#";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-csharp::before {
+  content: "c#";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-c\#::before {
+  content: "c#";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-go::before {
+  content: "go";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-golang::before {
+  content: "go";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-rust::before {
+  content: "rust";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-rs::before {
+  content: "rust";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-html::before {
+  content: "html";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-css::before {
+  content: "css";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-scss::before {
+  content: "scss";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-sass::before {
+  content: "sass";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-less::before {
+  content: "less";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-json::before {
+  content: "json";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-yaml::before {
+  content: "yaml";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-yml::before {
+  content: "yaml";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-xml::before {
+  content: "xml";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-sql::before {
+  content: "sql";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-bash::before {
+  content: "bash";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-sh::before {
+  content: "sh";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-shell::before {
+  content: "shell";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-docker::before {
+  content: "docker";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-dockerfile::before {
+  content: "docker";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-tex::before {
+  content: "tex";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-latex::before {
+  content: "latex";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-md::before {
+  content: "md";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-markdown::before {
+  content: "md";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-diff::before {
+  content: "diff";
+  text-transform: uppercase;
+}
+.somarkdown-container pre code.language-makefile::before {
+  content: "make";
+  text-transform: uppercase;
+}
+
+.somarkdown-container caption {
+  caption-side: top;
+  text-align: center;
+  color: var(--caption-color);
+  font-size: var(--caption-font-size);
+  margin-bottom: 0.5em;
+  padding: 0.5em;
+}
+.somarkdown-container figure {
+  margin: 1em auto;
+  display: table;
+  max-width: 100%;
+  text-align: center;
+}
+.somarkdown-container figure img {
+  display: block;
+  margin: 0 auto;
+  max-width: 100%;
+}
+.somarkdown-container figure figcaption {
+  display: block;
+  text-align: center;
+  color: var(--caption-color);
+  font-size: var(--caption-font-size);
+  margin-top: 0.5em;
+}
+
+.somarkdown-container p.img-frame, .somarkdown-container figure.img-frame {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 80%;
+  max-width: 100%;
+  width: fit-content;
+  margin: 2.5em auto;
+  padding: 1.5em;
+  border: 1px solid var(--img-frame-border-color); /* Thinner border, neutral color */
+  border-radius: 6px; /* Rounded corners */
+  position: relative;
+  box-sizing: border-box;
+  color: var(--img-frame-color);
+}
+.somarkdown-container p.img-frame::before, .somarkdown-container figure.img-frame::before {
+  content: "图片理解";
+  position: absolute;
+  top: -0.9em;
+  left: 2em;
+  background-color: var(--img-frame-label-bg);
+  color: var(--img-frame-color);
+  padding: 0.2em 0.8em;
+  border-radius: 4px;
+  font-size: 0.9em;
+  font-weight: normal; /* Removed bold */
+  line-height: 1.4;
+  white-space: nowrap;
+  z-index: 1; /* Ensure it's above border */
+}
+.somarkdown-container p.img-frame::after, .somarkdown-container figure.img-frame::after {
+  content: attr(data-alt);
+  display: block;
+  width: 100%;
+  margin-bottom: 1em;
+  order: 1;
+  text-align: left;
+  font-size: 1em;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+.somarkdown-container p.img-frame img, .somarkdown-container figure.img-frame img {
+  order: 2;
+  margin: 0;
+}
+.somarkdown-container p.img-frame figcaption, .somarkdown-container figure.img-frame figcaption {
+  order: 3;
+  width: 100%;
+  margin-top: 0.5em;
+}
+
+/* Variables should be defined in _variables.scss */
+/* Solid Very Light Orange */
+/* Solid Dark Orange-ish for Dark Mode */
+/* Default Theme */
+:root {
+  --text-color: #24292e;
+  --bg-color: #ffffff;
+  --table-border-color: #dfe2e5;
+  --caption-color: #6a737d;
+  --caption-font-size: 0.9em;
+  --img-width: 30%;
+  --img-hover-scale: 1.02;
+  --img-hover-shadow: 0 0 10px rgba(0, 0, 0, 0.2);
+  --img-hover-radius: 4px;
+  --code-bg-color: rgba(27, 31, 35, 0.05);
+  --pre-bg-color: #f6f8fa;
+  --blockquote-text-color: #6a737d;
+  --blockquote-border-color: #dfe2e5;
+  --code-font-family: ui-monospace, SFMono-Regular, SF Mono, Menlo, Consolas, Liberation Mono, monospace;
+  --h1-border-color: #eaecef;
+  --h2-border-color: #eaecef;
+  --h6-color: #6a737d;
+  --list-marker-color: #EF871B;
+  --toc-marker-color: #EF871B;
+  --toc-marker-glow: 0 0 5px rgba(239, 135, 27, 0.4);
+  --toc-text-color: #EF871B;
+  --link-color: #EF871B;
+  --hr-bg-color: rgba(0, 0, 0, 0.5019607843);
+  --code-tag-bg: #ffffff;
+  --code-tag-text-color: #EF871B;
+  --somarkdown-smiles-theme: light;
+  --img-frame-color: #EF871B;
+  --img-frame-border-color: #dfe2e5;
+  --img-frame-label-bg: #FFF5EB;
+}
+
+.somarkdown-container {
+  color: var(--text-color);
+  background-color: var(--bg-color);
+  --somarkdown-smiles-color-text: var(--text-color);
+}
+
+/* Light Theme */
+.theme-light {
+  --text-color: #24292e;
+  --bg-color: #ffffff;
+  --table-border-color: #dfe2e5;
+  --caption-color: #6a737d;
+  --caption-font-size: 0.9em;
+  --img-width: 30%;
+  --img-hover-scale: 1.02;
+  --img-hover-shadow: 0 0 10px rgba(0, 0, 0, 0.2);
+  --img-hover-radius: 4px;
+  --code-bg-color: rgba(27, 31, 35, 0.05);
+  --pre-bg-color: #f6f8fa;
+  --blockquote-text-color: #6a737d;
+  --blockquote-border-color: #dfe2e5;
+  --code-font-family: ui-monospace, SFMono-Regular, SF Mono, Menlo, Consolas, Liberation Mono, monospace;
+  --h1-border-color: #eaecef;
+  --h2-border-color: #eaecef;
+  --h6-color: #6a737d;
+  --list-marker-color: #EF871B;
+  --toc-marker-color: #EF871B;
+  --toc-marker-glow: 0 0 5px rgba(239, 135, 27, 0.4);
+  --toc-text-color: #EF871B;
+  --link-color: #EF871B;
+  --hr-bg-color: rgba(0, 0, 0, 0.5019607843);
+  --code-tag-bg: #ffffff;
+  --code-tag-text-color: #EF871B;
+  --somarkdown-smiles-theme: light;
+  --img-frame-color: #EF871B;
+  --img-frame-border-color: #dfe2e5;
+  --img-frame-label-bg: #FFF5EB;
+  color: var(--text-color);
+  background-color: var(--bg-color);
+}
+
+/* Dark Theme */
+.theme-dark {
+  --text-color: #c9d1d9;
+  --bg-color: #0d1117;
+  --table-border-color: #30363d;
+  --caption-color: #8b949e;
+  --caption-font-size: 0.9em;
+  --img-width: 30%;
+  --img-hover-scale: 1.02;
+  --img-hover-shadow: 0 0 10px rgba(255, 255, 255, 0.6);
+  --img-hover-radius: 4px;
+  --code-bg-color: rgba(110, 118, 129, 0.4);
+  --pre-bg-color: #161b22;
+  --blockquote-text-color: #8b949e;
+  --blockquote-border-color: #30363d;
+  --code-font-family: ui-monospace, SFMono-Regular, SF Mono, Menlo, Consolas, Liberation Mono, monospace;
+  --h1-border-color: #21262d;
+  --h2-border-color: #21262d;
+  --h6-color: #8b949e;
+  --list-marker-color: #EF871B;
+  --toc-marker-color: #EF871B;
+  --toc-marker-glow: 0 0 5px rgba(239, 135, 27, 0.4);
+  --toc-text-color: #EF871B;
+  --link-color: #EF871B;
+  --hr-bg-color: rgba(255, 255, 255, 0.5019607843);
+  --code-tag-bg: #0d1117;
+  --code-tag-text-color: #EF871B;
+  --somarkdown-smiles-theme: dark;
+  --img-frame-color: #EF871B;
+  --img-frame-border-color: #30363d;
+  --img-frame-label-bg: #3E2C1E;
+  color: var(--text-color);
+  background-color: var(--bg-color);
+}
+
+/* Academic Theme - Serif fonts, more formal */
+.theme-academic {
+  --text-color: #333;
+  --bg-color: #fff;
+  --table-border-color: #dfe2e5;
+  --caption-color: #6a737d;
+  --caption-font-size: 0.9em;
+  --img-width: 30%;
+  --img-hover-scale: 1.02;
+  --img-hover-shadow: 0 0 10px rgba(0, 0, 0, 0.2);
+  --img-hover-radius: 4px;
+  --code-bg-color: rgba(27, 31, 35, 0.05);
+  --pre-bg-color: #f6f8fa;
+  --blockquote-text-color: #6a737d;
+  --blockquote-border-color: #dfe2e5;
+  --code-font-family: ui-monospace, SFMono-Regular, SF Mono, Menlo, Consolas, Liberation Mono, monospace;
+  --h1-border-color: #eaecef;
+  --h2-border-color: #eaecef;
+  --h6-color: #000000;
+  --list-marker-color: #000000;
+  --toc-marker-color: #000000;
+  --toc-marker-glow: none;
+  --toc-text-color: #000000;
+  --link-color: #0969da;
+  --hr-bg-color: rgba(0, 0, 0, 0.5019607843);
+  --code-tag-bg: #ffffff;
+  --code-tag-text-color: #EF871B;
+  --somarkdown-smiles-theme: light;
+  --img-frame-color: #EF871B;
+  --img-frame-border-color: #dfe2e5;
+  --img-frame-label-bg: #FFF5EB;
+  font-family: "Palatino Linotype", "Book Antiqua", Palatino, serif;
+  color: var(--text-color);
+  background-color: var(--bg-color);
+}
+.theme-academic h1, .theme-academic h2, .theme-academic h3 {
+  border-bottom: 1px solid #eaecef;
+  padding-bottom: 0.3em;
+}
+.theme-academic h1 {
+  text-align: center;
+}
+/*# sourceMappingURL=somarkdown.css.map */

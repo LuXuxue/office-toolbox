@@ -9,7 +9,7 @@
 | `fix_punct.py` | `.md` 标点修正 | 把中文文本里夹杂的英文标点（`,. :;?!` 与双引号、英文括号 `()`）替换为中文标点，英文段落、公式、代码、URL 不动 |
 | `normalize_docx.py` | `.docx` 格式标准化 | 把已有 docx 的字体（标题黑体/宋体正文、英文 Times New Roman）、字号行距、标题加粗与多级列表统一到一套标准（正文小四 1.5 倍行距、标题 1 小三、标题 2~9 小四、标题 1~9 加粗、无倾斜、段前段后为 0、标题 8/9 居中、标题 1~9 多级编号、标题 8/9 图表编号、无间隔样式五号 1 倍行距、自动替换如 m3/h→m³/h） |
 | `pdf2md.py` | `.pdf` → `.md` / `.json` | 使用 OXR-1.0 进行 OCR，还原正文、公式、表格、代码与图片 |
-
+| `mdviewer.html` | 独立的 Markdown 查看器：浏览器打开即用，支持按钮选文件与拖入 `.md` |
 
 ## 安装
 
@@ -237,3 +237,4 @@ PowerPoint 没有 Word 那样的段落样式和内置编号，脚本按版式与
 - **`pdf2md` 需要 GPU 才实用**：首次运行加载约 3 GB 权重（4 秒左右），之后每页视版面复杂度约 2～20 秒；`--device cpu` 能跑但可能慢一个数量级。
 - **`pdf2md` 的插图是位图**：按版面分析检测到的图片区域裁切导出，不是从 PDF 里抽原始对象；图表里的数据不会变成表格。
 - **`pdf2md` 依赖 `OXR/` 子目录**：`oxr/` 流水线与 `services/layout_analyze` 是从上游 [SoMarkAI/OXR](https://github.com/SoMarkAI/OXR) 复制的最小运行子集（Apache-2.0，见 `OXR/LICENSE`、`OXR/NOTICE`），不是本仓库原创代码；模型权重另按上游条款分发，不在仓库里。
+- **`mdviewer` 依赖 `lib/` 子目录**：`lib/` 是从上游 [SoMarkAI/SoMarkDownViewer](https://github.com/SoMarkAI/SoMarkDownViewer) 复制的最小资源子集（MIT，见 `lib/LICENSE`），不是本仓库原创代码。

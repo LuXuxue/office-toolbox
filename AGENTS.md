@@ -5,14 +5,17 @@
 ## 仓库里有什么
 
 ```
-docx2md.py         .docx → .md
-md2docx.py         .md → .docx
-docx2pdf.py        .doc / .docx → .pdf
-pptx2md.py         .pptx → .md
-pdf2md.py          .pdf → .md / .json（本地 OXR 推理，依赖 OXR/）
-fix_punct.py       .md 标点修正（英文标点 → 中文标点）
-normalize_docx.py  .docx 格式标准化（主题字体、字号行距、标题多级列表）
+docx2md.py                .docx → .md
+md2docx.py                .md → .docx
+docx2pdf.py               .doc / .docx → .pdf
+pptx2md.py                .pptx → .md
+pdf2md.py                 .pdf → .md / .json（本地 OXR 推理，依赖 OXR/）
+fix_punct.py              .md 标点修正（英文标点 → 中文标点）
+normalize_docx.py         .docx 格式标准化（主题字体、字号行距、标题多级列表）
+mdviewer.html             独立的 Markdown 查看器（浏览器打开即用，按钮选文件/拖入 .md，配色跟随系统）
+mdviewer_update_smd.bat   mdviewer.html 的后端渲染组件更新程序
 requirements.txt
+lib/                      mdviewer.html 的后端渲染组件资源库
 OXR/
   oxr/                        上游流水线最小子集（版面结果 → md/json）
   services/layout_analyze/    D-FINE 版面分析推理代码
@@ -23,10 +26,12 @@ OXR/
 
 `pdf2md.py` 是 pdf → md/json 的单向转换器（md 之后可以交给 `md2docx.py`）。它自己只负责 CLI、PDF 渲染、本地模型加载和文件输出，版面分析之后的流水线全部复用 `OXR/oxr/pipeline` 里的上游代码。`OXR/` 是从 [SoMarkAI/OXR](https://github.com/SoMarkAI/OXR) 复制的最小运行子集：`oxr/`（去掉 `cli/`、`server/`）加 `services/layout_analyze/dfine_la`，许可证见 `OXR/LICENSE`、`OXR/NOTICE`。模型权重 `OXR/models/OXR-1.0` 不在库里，用 modelscope 或 huggingface-cli 下载。
 
+`mdviewer.html` 使用的渲染程序来自于 [SoMarkAI/SoMarkDownViewer](https://github.com/SoMarkAI/SoMarkDownViewer)，这里只保留最小需要的资源子集：`lib/`（去掉编辑功能）。许可证见 `lib/LICENSE`。
+
 ## 硬性约束
 
 1. 注释用中文。
-2. **`OXR/` 是上游代码子集，能不改就不改**。本地推理的接线（替换 `model_client` / `layout_client`、prompt、生成参数）都在 `pdf2md.py` 里；确实要改 `OXR/` 时在提交说明里写清改了什么、为什么，因为升级上游时会整块覆盖。
+2. **`OXR/` 和 `lib/` 是上游代码子集，能不改就不改**。本地推理的接线（替换 `model_client` / `layout_client`、prompt、生成参数）都在 `pdf2md.py` 里；确实要改 `OXR/` 时在提交说明里写清改了什么、为什么，因为升级上游时会整块覆盖。
 3. 不要提交模型权重、`OXR/models/` 与转换产物（`*_media/`、`outputs/`）。
 
 ## 环境陷阱

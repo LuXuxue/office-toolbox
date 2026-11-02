@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SoMark Viewer</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="lib/deps/katex.min.css">
+    <link rel="stylesheet" href="lib/deps/highlight.js.default.min.css">
+    <link rel="stylesheet" href="lib/somarkdown/somarkdown.css">
+    <style>
+        :root {
+            --accent: #ef871b;
+            --bg: #ffffff;
+            --bg-header: #fafafa;
+            --bg-preview: #ffffff;
+            --text: #24292e;
+            --text-muted: #6a737e;
+            --text-dim: #8b949e;
+            --border: #dfe2e5;
+            --btn-border: #d0d7de;
+            --btn-bg: transparent;
+            --btn-bg-hover: rgba(239, 135, 27, 0.12);
+            --overlay-bg: rgba(255, 255, 255, 0.7);
+            --overlay-border: rgba(239, 135, 27, 0.55);
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #0d1117;
+                --bg-header: #010409;
+                --bg-preview: #0d1117;
+                --text: #c9d1d9;
+                --text-muted: #8b949e;
+                --text-dim: #6e7681;
+                --border: #30363d;
+                --btn-border: #30363d;
+                --btn-bg: transparent;
+                --btn-bg-hover: rgba(239, 135, 27, 0.14);
+                --overlay-bg: rgba(13, 17, 23, 0.7);
+                --overlay-border: rgba(239, 135, 27, 0.55);
+            }
+        }
+
+        html, body {
+            height: 100%;
+        }
+
+        body {
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            background-color: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        }
+
+        .viewer-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+            padding: 0.6rem 1rem;
+            border-bottom: 1px solid var(--border);
+            background-color: var(--bg-header);
+            flex-shrink: 0;
+        }
+
+        .viewer-title {
+            font-size: 0.95rem;
+            font-weight: 600;
+            letter-spacing: -0.02em;
+            user-select: none;
+            white-space: nowrap;
+        }
+
+        .viewer-title .viewer-title-accent {
+            color: var(--accent);
+        }
+
+        .file-path {
+            flex: 1;
+            min-width: 0;
+            color: var(--text-muted);
+            font-size: 0.78rem;
+            font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            text-align: center;
+        }
+
+        .line-count {
+            color: var(--text-dim);
+            font-size: 0.75rem;
+            font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+            white-space: nowrap;
+            user-select: none;
+        }
+
+        .open-file-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.45rem 0.8rem;
+            font-size: 0.8rem;
+            color: var(--text);
+            background: var(--btn-bg);
+            border: 1px solid var(--btn-border);
+            border-radius: 0.5rem;
+            cursor: pointer;
+            transition: background-color 0.2s, border-color 0.2s, color 0.2s;
+        }
+
+        .open-file-btn:hover {
+            background: var(--btn-bg-hover);
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
+        .open-file-btn:focus-visible {
+            outline: none;
+            box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+        }
+
+        .open-file-btn svg {
+            width: 1rem;
+            height: 1rem;
+            flex-shrink: 0;
+            pointer-events: none;
+        }
+
+        .viewer-main {
+            flex: 1;
+            min-height: 0;
+            overflow: auto;
+            background-color: var(--bg-preview);
+        }
+
+        .viewer-preview {
+            padding: 1.25rem 2rem;
+            min-height: calc(100% - 2.5rem);
+        }
+
+        .drop-hint {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 0.6rem;
+            padding: 4rem 1rem;
+            color: var(--text-muted);
+            text-align: center;
+        }
+
+        .drop-hint svg {
+            width: 2.5rem;
+            height: 2.5rem;
+            opacity: 0.45;
+        }
+
+        .drop-hint-text {
+            font-size: 0.9rem;
+        }
+
+        .drop-hint-sub {
+            font-size: 0.78rem;
+            color: var(--text-dim);
+        }
+
+        .drop-overlay {
+            position: fixed;
+            inset: 0;
+            z-index: 10;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background-color: var(--overlay-bg);
+            border: 2px dashed var(--overlay-border);
+            margin: 0.4rem;
+            border-radius: 0.6rem;
+            color: var(--accent);
+            font-size: 1rem;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.15s ease;
+        }
+
+        .drop-overlay.is-visible {
+            opacity: 1;
+        }
+    </style>
+</head>
+<body>
+    <header class="viewer-header">
+        <span class="viewer-title"><span class="viewer-title-accent">SoMark</span> Viewer</span>
+        <span class="file-path" id="file-path">未打开文件</span>
+        <span class="line-count" id="line-count" hidden></span>
+        <button class="open-file-btn" id="open-file-btn" type="button">
+            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-8l-2-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2Z"></path><path d="M2 10h20"></path></svg>
+            打开文件
+        </button>
+    </header>
+    <input type="file" id="local-file-input" accept=".md,.smd,.txt,text/markdown,text/plain" hidden>
+    <main class="viewer-main" id="viewer-main">
+        <div class="viewer-preview somarkdown-container" id="markdown-preview">
+            <div class="drop-hint" id="drop-hint">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><path d="m17 8-5-5-5 5"></path><path d="M12 3v12"></path></svg>
+                <div class="drop-hint-text">将 Markdown 文件拖入窗口，或点击「打开文件」</div>
+                <div class="drop-hint-sub">支持 .md / .smd / .txt</div>
+            </div>
+        </div>
+    </main>
+    <div class="drop-overlay" id="drop-overlay">松开以打开文件</div>
+    <script src="lib/somarkdown/somarkdown.umd.min.js"></script>
+    <script>
+        (function () {
+            "use strict";
+
+            const fileInput = document.getElementById("local-file-input");
+            const openBtn = document.getElementById("open-file-btn");
+            const filePathEl = document.getElementById("file-path");
+            const lineCountEl = document.getElementById("line-count");
+            const preview = document.getElementById("markdown-preview");
+            const dropHint = document.getElementById("drop-hint");
+            const dropOverlay = document.getElementById("drop-overlay");
+
+            let renderer = null;
+            let renderPending = false;
+            let dragDepth = 0;
+            let readFileText = "";
+
+            const supportsDrag = "draggable" in document.createElement("span");
+            const isMarkdownFile = (name) => /\.(md|smd|txt)$/i.test(name || "");
+
+            function applyTheme() {
+                const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+                const themeClass = dark ? "theme-dark" : "theme-light";
+                preview.classList.remove("theme-dark", "theme-light");
+                preview.classList.add(themeClass);
+            }
+
+            window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", applyTheme);
+            applyTheme();
+
+            function createRenderer() {
+                const SoMarkDown = window.SoMarkDown;
+                if (!SoMarkDown) {
+                    return null;
+                }
+                return new SoMarkDown({
+                    html: true,
+                    typographer: true,
+                    imgDescEnabled: true,
+                    lineNumbers: { enable: false, nested: false },
+                    smiles: { disableColors: false },
+                    toc: { includeLevel: [1, 2, 3] }
+                });
+            }
+
+            function ensurePreviewLinksOpenInNewPage() {
+                preview.querySelectorAll("a[href]").forEach((link) => {
+                    link.setAttribute("target", "_blank");
+                    link.setAttribute("rel", "noopener noreferrer");
+                });
+            }
+
+            function renderMarkdown() {
+                if (renderPending) {
+                    return;
+                }
+                renderPending = true;
+                window.requestAnimationFrame(() => {
+                    renderPending = false;
+                    dropHint.hidden = true;
+                    try {
+                        renderer = createRenderer();
+                        if (!renderer) {
+                            preview.innerHTML = "<p>SoMarkDown 未加载。</p>";
+                            return;
+                        }
+                        preview.innerHTML = renderer.render(readFileText);
+                    } catch (error) {
+                        preview.innerHTML = `<p>${String(error)}</p>`;
+                    }
+                    ensurePreviewLinksOpenInNewPage();
+                });
+            }
+
+            function updateFileMeta(name) {
+                filePathEl.textContent = name;
+                const lines = readFileText.split(/\r\n|\r|\n/).length;
+                lineCountEl.textContent = `${lines} 行`;
+                lineCountEl.hidden = false;
+            }
+
+            async function loadFile(file) {
+                if (!file) {
+                    return;
+                }
+                if (!isMarkdownFile(file.name)) {
+                    filePathEl.textContent = `${file.name}（不支持的类型）`;
+                    return;
+                }
+                try {
+                    readFileText = await file.text();
+                } catch (error) {
+                    filePathEl.textContent = `${file.name}（读取失败）`;
+                    return;
+                }
+                updateFileMeta(file.name);
+                renderMarkdown();
+            }
+
+            openBtn.addEventListener("click", () => fileInput.click());
+            fileInput.addEventListener("change", () => {
+                loadFile(fileInput.files?.[0]);
+                fileInput.value = "";
+            });
+
+            if (supportsDrag) {
+                document.addEventListener("dragenter", (event) => {
+                    if (event.dataTransfer?.types?.includes("Files")) {
+                        dragDepth += 1;
+                        dropOverlay.classList.add("is-visible");
+                    }
+                });
+                document.addEventListener("dragleave", () => {
+                    dragDepth = Math.max(0, dragDepth - 1);
+                    if (dragDepth === 0) {
+                        dropOverlay.classList.remove("is-visible");
+                    }
+                });
+                document.addEventListener("dragover", (event) => {
+                    if (event.dataTransfer?.types?.includes("Files")) {
+                        event.preventDefault();
+                    }
+                });
+                document.addEventListener("drop", (event) => {
+                    dragDepth = 0;
+                    dropOverlay.classList.remove("is-visible");
+                    if (!event.dataTransfer?.files?.length) {
+                        return;
+                    }
+                    event.preventDefault();
+                    loadFile(event.dataTransfer.files[0]);
+                });
+            }
+
+            // 支持通过 URL 参数指定初始文件（file:// 协议下可用）
+            const params = new URLSearchParams(window.location.search);
+            const initialPath = params.get("file");
+            if (initialPath) {
+                fetch(initialPath).then((response) => {
+                    if (!response.ok) {
+                        throw new Error(String(response.status));
+                    }
+                    return response.text();
+                }).then((text) => {
+                    readFileText = text;
+                    const name = initialPath.split("/").pop();
+                    updateFileMeta(name);
+                    renderMarkdown();
+                }).catch(() => {
+                    filePathEl.textContent = `加载失败：${initialPath}`;
+                });
+            }
+        })();
+    </script>
+</body>
+</html>

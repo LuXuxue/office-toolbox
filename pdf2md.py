@@ -37,15 +37,23 @@ PDF 里的图片导出到同目录的 <文件名>_media/。
 速度相关的几个旋钮（默认值按“单卡、可中断”调过）：
 
     --batch-size      文本模型的批大小。流水线原本面向 vLLM 的连续批处理，
-                      本地串行时把同一类型的多个识别请求拼成一批，能把
-                      每 token 都要重读一遍模型权重的开销摊薄，16 左右最优
-                      （实测 10 页：4→91 ms/token，16→38 ms/token，32→41）。
-    --chunk-pages     每批送进流水线的页数。越小越省显存、进度越细，
-                      但单批的固定开销占比越高。
+                      本地串行时把同一类型的识别请求拼成一批，能把每 token
+                      都要重读一遍模型权重的开销摊薄，16 左右最优
+                      （实测 16 页：16→36 s，24→57 s、峰值显存涨到 9.9 GB）。
+    --chunk-pages     每批送进流水线的页数。它是本机最不能放松的一个：
+                      显存峰值基本随它线性上涨，一旦逼近 12 GB 就开始抖动，
+                      实测 16 页 chunk 8→38 s、chunk 12→129 s、chunk 16→90 s。
     --pages           页码范围（1 起），只在选中的页上工作。
     --layout-concurrency  版面分析的在途批数（单卡串行，一般不用改）。
     --graph-decode    解码段是否捕获成 CUDA Graph（auto/on/off，仅 NVIDIA）。
-    --graph-cache-len 图解码预留的缓存长度，超出的请求回退到普通生成。
+                      图按「批大小 × 缓存长度」分桶复用，小批用小图，免得
+                      1 行请求按 16 行做一遍预填充。
+    --graph-cache-len 图解码预留的缓存上限（默认：2048）。实际每批按
+                      「prompt + 预留」取 256 的整数倍，桶切换时重新捕获。
+                      超出的请求续跑一段或回退到普通生成。
+
+内部还有两处不对外暴露的并行：PDF 按 chunk 懒渲染（渲染与上一块推理重叠，
+不再整本前置渲染），版面分析预取下一块。
 
 依赖（GPU 版 torch 请按 https://pytorch.org 的说明安装）：
 
@@ -210,12 +218,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--chunk-pages", type=int, default=8,
-        help="每批送进流水线的页数（默认：8，越小越省内存、进度越细）",
+        help="每批送进流水线的页数（默认：8）。越小越省显存、进度越细；"
+             "调大会抬高显存峰值，本机 12 GB 显存在 12 页以上明显变慢",
     )
     parser.add_argument(
         "--batch-size", type=int, default=16,
         help="文本模型的批大小，同类型请求合批推理（默认：16，1 表示不合批；"
-             "本地串行推理下 16 比 4 快约 2 倍，32 以上反而变慢）",
+             "本地串行推理下 16 比 4 快约 2 倍，24 以上反而变慢）",
     )
     parser.add_argument(
         "--reading-order", choices=("geo", "llm"), default="llm",
@@ -395,6 +404,20 @@ def _load_model_module(model_dir: Path):
 # CUDA Graph 解码的分块大小：每跑这么多步同步一次，看是否已经有结论。
 GRAPH_CHUNK_STEPS = 16
 
+# 单次图解码最多跑多少步；超出（或缓存装不下）时把没结束的行续跑一段。
+# 正常情况下一次就跑完，这个值只是给超长输出兜底。
+GRAPH_STAGE_STEPS = 4096
+
+# 图解码的缓存长度按 256 的整数倍分桶（每桶捕获一张图复用），并在 prompt
+# 之外预留这么多 token 给生成；预留越多，单步解码越慢（整段缓存每步都要读），
+# 预留越少，超出容量的批越可能退回普通 generate。
+GRAPH_CACHE_STEP = 256
+GRAPH_CACHE_RESERVE = 512
+
+# 图解码的 KV 缓存：每行每 token = 28 层 × 2（K/V）× 8 个 KV 头 × 128 维
+# × 2 字节（bf16）。显存预算和 --graph-cache-len 的说明都用它换算。
+GRAPH_KV_BYTES_PER_TOKEN = 28 * 2 * 8 * 128 * 2
+
 # 攒批时最多等这么久；本地生成是瓶颈，等一小会儿换更高的一批利用率更划算。
 # 等同一类型请求凑满一批的超时（秒）。攒批越满，视觉编码器与预填充的
 # 固定开销摊得越薄；0.5s 在实测里已能把批填满，再长只增加尾延迟。
@@ -460,6 +483,109 @@ def _probe_sdpa_gqa(torch, config, device, dtype) -> bool:
         return bool(torch.isfinite(out).all().item())
     except Exception:  # noqa: BLE001 - 不支持就退回 repeat_kv 的写法
         return False
+
+
+class GreedyGraphDecoderPool:
+    """按 (批大小, 缓存长度) 复用图解码器，避免为每种组合重复捕获。
+
+    显存和速度都由「批 × 缓存长度」决定：每行每 token 的 KV 是 28 层 ×
+    2 × 8 头 × 128 维 × 2 字节 = 112 KB/千 token（见 --graph-cache-len 说明）。
+    一步解码要读完整段预留缓存，所以缓存长度直接决定单步耗时（实测批 16：
+    缓存 2048 → 38.8 ms/步，512 → 18.6 ms/步）。预填充也要按补齐后的行数算，
+    所以 1 行请求塞进 16 行的图里，光预填充就要多花十几倍——小批必须用小图。
+
+    因此这里按「实际行数向上取到 2 的幂」和「prompt 长度 + 预留量」选一张
+    现成的图；池子只保留最近用到的几张，换出时释放其 KV 缓存。
+
+    池子的字节预算不能按“显存还空着多少”给满：本机 12 GB 卡上留到 4 GiB
+    就开始抖动（32 页实测：3 GiB→64 s，4 GiB→106 s，5 GiB→215 s），
+    所以默认只给 3 GiB，宁可每个 chunk 重新捕获一次（0.2~0.5 s）。
+    """
+
+    # 批大小阶梯：补齐到不小于实际行数的 2 的幂
+    _LADDER = (1, 2, 4, 8, 16, 32, 48, 64)
+
+    def __init__(
+        self,
+        llm,
+        max_batch: int,
+        max_cache_len: int,
+        device,
+        max_bytes: int = 3 * 1024 ** 3,
+        max_entries: int = 4,
+    ) -> None:
+        self.llm = llm
+        self.max_batch = max(1, int(max_batch))
+        self.max_cache_len = max(256, int(max_cache_len))
+        self.device = device
+        self.max_bytes = max(0, int(max_bytes))
+        self.max_entries = max(1, int(max_entries))
+        self._decoders: Dict[Tuple[int, int], GreedyGraphDecoder] = {}
+        self._order: List[Tuple[int, int]] = []
+        self._lock = threading.Lock()
+
+    def _batch_bucket(self, rows: int) -> int:
+        for size in self._LADDER:
+            if rows <= size:
+                return min(size, self.max_batch)
+        return self.max_batch
+
+    def cache_bucket(self, prompt_length: int, reserve: Optional[int] = None) -> int:
+        """给摸清长度的请求选缓存长度：prompt + 预留，向上取整到 256。"""
+        if reserve is None:
+            reserve = GRAPH_CACHE_RESERVE
+        wanted = prompt_length + max(1, int(reserve))
+        bucket = -(-wanted // GRAPH_CACHE_STEP) * GRAPH_CACHE_STEP
+        return max(GRAPH_CACHE_STEP, min(self.max_cache_len, bucket))
+
+    def acquire(
+        self, rows: int, prompt_length: int, cache_len: Optional[int] = None
+    ) -> Optional[GreedyGraphDecoder]:
+        """取一张能覆盖 (rows, prompt_length) 的图解码器，必要时现场捕获。"""
+        if rows > self.max_batch:
+            return None
+        if cache_len is None:
+            cache_len = self.cache_bucket(prompt_length)
+        key = (self._batch_bucket(rows), int(cache_len))
+        with self._lock:
+            decoder = self._decoders.pop(key, None)
+            if decoder is not None:
+                self._decoders[key] = decoder
+                self._order = [item for item in self._order if item != key] + [key]
+                return decoder
+        batch, cache_len = key
+        if cache_len <= prompt_length + 2:
+            return None
+        try:
+            decoder = GreedyGraphDecoder(
+                self.llm, batch=batch, cache_len=cache_len, device=self.device
+            )
+        except Exception as error:  # noqa: BLE001 - 捕获失败就退回 generate
+            LOGGER.warning(
+                "CUDA Graph 解码器创建失败（批 %d，缓存 %d）：%s", batch, cache_len, error
+            )
+            return None
+        with self._lock:
+            self._decoders[key] = decoder
+            self._order.append(key)
+            # KV 缓存是「批 × 缓存长度 × 112 KB」量级，留太多张会把显存吃光，
+            # 但留太少又会因为桶来回切换而反复捕获（每次 0.2~0.5 s）。按总字节
+            # 数淘汰，块大小不同的几张图才能长期共存。
+            while self._order and (
+                len(self._order) > self.max_entries
+                or self._decoder_bytes() > self.max_bytes and len(self._order) > 1
+            ):
+                stale = self._order.pop(0)
+                self._decoders.pop(stale, None)
+        LOGGER.info("图解码器就绪：批 %d，缓存 %d token", batch, cache_len)
+        return decoder
+
+    def _decoder_bytes(self) -> int:
+        total = 0
+        for key in self._order:
+            batch, cache_len = key
+            total += batch * cache_len * GRAPH_KV_BYTES_PER_TOKEN
+        return total
 
 
 class GreedyGraphDecoder:
@@ -735,24 +861,23 @@ class OXRTextBackend:
 
         # 图解码只在 NVIDIA 的 CUDA 上、且是贪心生成时可用；创建实例不占多少
         # 显存，StaticCache 由第一次使用时的一次真实预填充惰性分配。
-        self.graph_decoder: Optional[GreedyGraphDecoder] = None
+        self.graph_pool: Optional[GreedyGraphDecoderPool] = None
         if graph_decode and _cuda_graph_supported(torch, device):
             try:
-                self.graph_decoder = GreedyGraphDecoder(
+                self.graph_pool = GreedyGraphDecoderPool(
                     self.model.llm,
-                    batch=max(1, int(graph_batch)),
-                    cache_len=int(graph_cache_len),
+                    max_batch=max(1, int(graph_batch)),
+                    max_cache_len=max(256, int(graph_cache_len)),
                     device=device,
                 )
                 LOGGER.info(
-                    "CUDA Graph 解码可用（批 %d，缓存 %d token，SDPA %s）",
-                    self.graph_decoder.batch,
-                    self.graph_decoder.cache_len,
-                    "GQA" if self.graph_decoder.use_gqa else "repeat_kv",
+                    "CUDA Graph 解码可用（最大批 %d，缓存上限 %d token）",
+                    self.graph_pool.max_batch,
+                    self.graph_pool.max_cache_len,
                 )
             except Exception as error:  # noqa: BLE001 - 退化为普通 generate
                 LOGGER.warning("CUDA Graph 解码不可用，回退到 generate：%s", error)
-                self.graph_decoder = None
+                self.graph_pool = None
         elif graph_decode:
             LOGGER.info(
                 "当前设备不是 NVIDIA CUDA（%s，torch %s），保留 transformers.generate；"
@@ -826,6 +951,115 @@ class OXRTextBackend:
             generation_kwargs["do_sample"] = False
         return generation_kwargs
 
+    def _graph_decode_rows(
+        self,
+        inputs_embeds,
+        attention_mask,
+        row_limits: Sequence[int],
+    ) -> Optional[List[List[int]]]:
+        """用图解码跑完整批；缓存装不下时长出来的行续跑，而不是整批重来。
+
+        一批里的行是同步推进的：只要还有一条长请求没结束，整批都得陪着跑，
+        所以理想情况是让已经结束的行早点退出。但实测「按步数分段 + 把结束行
+        剔出去续跑」在本机并不划算——每次续跑都要按新 prompt 换一张图（重新
+        捕获 0.2~0.5 s）并重做一遍预填充，省的步数全被吃掉（16 页实测慢 5%）。
+        真正划得来的是只在**缓存装不下**时才续跑：那本来要退回普通 generate
+        把整批重跑一遍，代价大得多。
+
+        返回每行的 token 列表；图解码用不上（显存/长度不够）时返回 None，
+        由调用方回退到普通 generate。
+        """
+        torch = self.torch
+        pool = self.graph_pool
+        if pool is None:
+            return None
+
+        eos_lookup = self._eos_lookup
+        rows = int(inputs_embeds.shape[0])
+        tokens: List[List[int]] = [[] for _ in range(rows)]
+        active = list(range(rows))
+        embeds = inputs_embeds
+        mask = attention_mask
+        embedding = self.model.llm.get_input_embeddings()
+        # 缓存长度按「prompt + 预留」一次定好，正常情况下整批只用一张图。
+        reserve = max(1, min(GRAPH_CACHE_RESERVE, max(row_limits) - 1))
+        cache_len = pool.cache_bucket(int(mask.shape[1]), reserve)
+
+        while active:
+            prompt_length = int(mask.shape[1])
+            decoder = pool.acquire(len(active), prompt_length, cache_len)
+            if decoder is None or not decoder.supports(prompt_length):
+                # 这一行长到了预留量之外：按当前长度重新规划缓存长度再取图。
+                cache_len = pool.cache_bucket(prompt_length, reserve)
+                decoder = pool.acquire(len(active), prompt_length, cache_len)
+            if decoder is None or not decoder.supports(prompt_length):
+                LOGGER.debug(
+                    "图解码放弃：行数 %d，prompt %d，缓存 %d",
+                    len(active), prompt_length, cache_len,
+                )
+                return None
+            budget = max(row_limits[row] - len(tokens[row]) for row in active)
+            budget = min(budget, GRAPH_STAGE_STEPS)
+            if budget <= 0:
+                break
+            stage, _complete = decoder.decode(embeds, mask, budget, eos_lookup)
+
+            pending: List[Tuple[int, int]] = []
+            for slot, row in enumerate(active):
+                produced = stage[slot]
+                tokens[row].extend(produced)
+                if len(tokens[row]) >= row_limits[row]:
+                    continue
+                if any(token in eos_lookup for token in produced):
+                    continue
+                pending.append((slot, row))
+            if not pending:
+                return tokens
+
+            # 只把没结束的行拼回下一轮：原 prompt 的合法区间（mask 为真的部分）
+            # 加上已经生成的前缀，右侧对齐后统一左填充。
+            pieces = []
+            for slot, row in pending:
+                piece_embeds = embeds[slot:slot + 1]
+                piece_mask = mask[slot:slot + 1]
+                prefix = tokens[row]
+                if prefix:
+                    index = torch.tensor(
+                        [prefix], dtype=torch.long, device=embeds.device
+                    )
+                    piece_embeds = torch.cat(
+                        [piece_embeds, embedding(index)], dim=1
+                    )
+                    piece_mask = torch.cat(
+                        [
+                            piece_mask,
+                            torch.ones(
+                                (1, len(prefix)), dtype=torch.bool,
+                                device=embeds.device,
+                            ),
+                        ],
+                        dim=1,
+                    )
+                pieces.append((piece_embeds, piece_mask))
+
+            width = max(int(piece.shape[1]) for piece, _ in pieces)
+            next_embeds = torch.zeros(
+                (len(pieces), width, embeds.shape[2]),
+                dtype=embeds.dtype,
+                device=embeds.device,
+            )
+            next_mask = torch.zeros(
+                (len(pieces), width), dtype=torch.bool, device=embeds.device
+            )
+            for index, (piece_embeds, piece_mask) in enumerate(pieces):
+                length = int(piece_embeds.shape[1])
+                next_embeds[index:index + 1, width - length:] = piece_embeds
+                next_mask[index, width - length:] = piece_mask[0]
+            embeds, mask = next_embeds, next_mask
+            active = [row for _slot, row in pending]
+
+        return tokens
+
     def generate_batch(
         self,
         prepared: Sequence[Any],
@@ -879,7 +1113,6 @@ class OXRTextBackend:
             generation_kwargs.get("do_sample") is False
             and "repetition_penalty" not in generation_kwargs
         )
-        decoder = self.graph_decoder
         graph_used = False
         tokens_by_row = None
 
@@ -890,23 +1123,20 @@ class OXRTextBackend:
                 grid_thws=grid_thws,
             )
 
-        if (
-            decoder is not None
-            and greedy
-            and decoder.supports(max_length)
-        ):
+        if self.graph_pool is not None and greedy:
             try:
-                tokens_by_row, complete = decoder.decode(
-                    inputs_embeds, attention_mask, max(row_limits), self._eos_lookup
-                )
-                graph_used = complete
+                with torch.inference_mode():
+                    decoded = self._graph_decode_rows(
+                        inputs_embeds, attention_mask, row_limits
+                    )
             except Exception as error:  # noqa: BLE001 - 图解码失败就退回 generate
                 LOGGER.warning("CUDA Graph 解码失败，回退到 generate：%s", error)
-                tokens_by_row = None
-            if not graph_used:
-                tokens_by_row = None
-                if self.stats is not None:
-                    self.stats.add_graph_fallback()
+                decoded = None
+            if decoded is not None:
+                tokens_by_row = decoded
+                graph_used = True
+            elif self.stats is not None:
+                self.stats.add_graph_fallback()
 
         if tokens_by_row is None:
             with torch.inference_mode():
@@ -922,8 +1152,10 @@ class OXRTextBackend:
         produced_tokens = 0
         for row, row_limit in enumerate(row_limits):
             tokens = tokens_by_row[row]
-            cut = len(tokens)
-            for position, token in enumerate(tokens):
+            # 合批后整批按最大的行上限生成，本行要按自己的上限截断，
+            # 否则一条短请求会白等最长的那条。
+            cut = min(len(tokens), row_limit)
+            for position, token in enumerate(tokens[:cut]):
                 if token in self._eos_lookup:
                     cut = position
                     break
@@ -953,14 +1185,21 @@ class _PendingRequest:
     __slots__ = ("prompt", "image", "limit", "options", "key", "future")
 
     def __init__(
-        self, prompt: str, image, limit: int, options: Dict[str, float]
+        self,
+        prompt: str,
+        image,
+        limit: int,
+        options: Dict[str, float],
+        kind: Optional[str] = None,
     ) -> None:
         self.prompt = prompt
         self.image = image
         self.limit = limit
         self.options = options
-        # 提示词相同、token 上限相同、采样参数相同 -> 输出长度分布接近，适合合批
-        self.key = (prompt, limit, tuple(sorted(options.items())))
+        # 同类任务的输出长度分布接近，适合合批；提示词本身只是“同类”的粗判据，
+        # 阅读序的提示词里带本页 bbox（每页都不同），所以允许调用方给一个
+        # 更粗的类别名，否则每页都会各自成批。
+        self.key = (kind or prompt, tuple(sorted(options.items())))
         self.future: Optional[asyncio.Future] = None
 
 
@@ -1160,6 +1399,7 @@ class LocalOXRClient:
         timeout: int,
         model_options: Optional[Dict[str, Any]] = None,
         max_tokens: Optional[int] = None,
+        kind: Optional[str] = None,
     ):
         from oxr.model.client import resolve_model_options
 
@@ -1170,7 +1410,7 @@ class LocalOXRClient:
         self._ensure_workers()
         options = resolve_model_options(model_options)
         limit = int(max_tokens or self.config.max_tokens or 8192)
-        request = _PendingRequest(prompt, image, limit, dict(options))
+        request = _PendingRequest(prompt, image, limit, dict(options), kind)
         request.future = asyncio.get_running_loop().create_future()
 
         async with self._condition:
@@ -1181,9 +1421,11 @@ class LocalOXRClient:
     # 以下方法复用 oxr.model.client.OXRModelClient 的实现（prompt 与参数一致），
     # 通过继承在 _install 中绑定即可。
     async def request_reading_order(self, prompt, image, max_tokens):
+        # 阅读序的提示词里带本页 bbox，逐页不同；按类别合批才能把整章页面
+        # 拼成一批，否则每页一条、每条都要按 16 行补齐做一遍预填充。
         return await self._call_vision_model(
             prompt=prompt, image=image, timeout=self.config.timeout,
-            model_options=None, max_tokens=max_tokens,
+            model_options=None, max_tokens=max_tokens, kind="reading_order",
         )
 
     async def recognize_text(self, image, model_options=None):
@@ -1471,11 +1713,11 @@ class LocalEngine:
 
         try:
             import cv2  # noqa: F401
+            import sopdf  # noqa: F401
             import torch  # noqa: F401
             import transformers  # noqa: F401
             from oxr.config.settings import settings
             from oxr.pipeline.orchestrator import process_decoded_document
-            from oxr.utils.pdf import pdf_to_images
         except ImportError as exc:  # pragma: no cover - 依赖缺失时的提示
             raise SystemExit(
                 "缺少依赖：%s\n请先安装：\n"
@@ -1657,7 +1899,6 @@ class LocalEngine:
         orchestrator_module.analyze_layouts = _prefetched_analyze_layouts
 
         self.settings = settings
-        self.pdf_to_images = pdf_to_images
         self.process_decoded_document = process_decoded_document
         self._loaded = True
 
@@ -1742,6 +1983,35 @@ def _debug_timing(result: Dict[str, Any]) -> Tuple[Dict[str, float], int]:
     return timing, int(stats.get("total_blocks", 0))
 
 
+def _pdf_page_count(pdf_bytes: bytes) -> int:
+    import sopdf
+
+    with sopdf.open(stream=pdf_bytes) as doc:
+        return len(doc.pages)
+
+
+def _render_pdf_pages(pdf_bytes: bytes, dpi: int, indices: Sequence[int]) -> List[Any]:
+    """只渲染指定页（0 起下标），逐页解码成 BGR ndarray。
+
+    整本一次性渲染时，所有页的位图会一直占着内存（150 dpi 约 6.5 MB/页，
+    一百页就是 650 MB），而且渲染全部页之后才算真正开始推理。按 chunk 渲染
+    可以把渲染藏进上一个 chunk 的 GPU 时间里，峰值内存也只和 chunk 有关。
+    """
+    import cv2
+    import numpy as np
+    import sopdf
+
+    images: List[Any] = []
+    with sopdf.open(stream=pdf_bytes) as doc:
+        pages = list(doc.pages)
+        for index in indices:
+            if index < 0 or index >= len(pages):
+                continue
+            buffer = np.frombuffer(pages[index].render(dpi=dpi), np.uint8)
+            images.append(cv2.imdecode(buffer, cv2.IMREAD_COLOR))
+    return images
+
+
 async def process_one(
     engine: LocalEngine,
     pdf_path: Path,
@@ -1752,12 +2022,10 @@ async def process_one(
 ) -> List[Path]:
     started = time.perf_counter()
     pdf_bytes = pdf_path.read_bytes()
-    images = await asyncio.to_thread(engine.pdf_to_images, pdf_bytes, args.dpi)
-    render_elapsed = time.perf_counter() - started
-    if not images:
+    total_pages = await asyncio.to_thread(_pdf_page_count, pdf_bytes)
+    if not total_pages:
         raise ValueError("PDF 没有可渲染的页面")
 
-    total_pages = len(images)
     selected = (
         select_page_indices(total_pages, args.pages)
         if args.pages
@@ -1779,10 +2047,8 @@ async def process_one(
     # 几千张裁剪图全部 copy 进内存，很容易把机器压到换页。
     chunk_size = max(1, int(args.chunk_pages))
     chunk_count = (len(selected) + chunk_size - 1) // chunk_size
-    # 预先建好每个 chunk 的图像列表：同一列表对象既用于预取版面、也传给流水线，
-    # 这样 analyze_layouts 里能用 id() 对上预取结果。
-    chunk_images_list = [
-        [images[index] for index in selected[offset:offset + chunk_size]]
+    chunk_pages_list = [
+        selected[offset:offset + chunk_size]
         for offset in range(0, len(selected), chunk_size)
     ]
     markdown_parts: List[Tuple[str, float]] = []
@@ -1790,25 +2056,42 @@ async def process_one(
     totals = {"layout": 0.0, "recognition": 0.0, "assembly": 0.0}
     block_total = 0
     written: List[Path] = []
-    pending_layout_task: Optional[asyncio.Task] = None
+    render_seconds = 0.0
+    pending_chunk_task: Optional[asyncio.Task] = None
 
-    for chunk_no, chunk_images in enumerate(chunk_images_list, start=1):
-        chunk = selected[(chunk_no - 1) * chunk_size:chunk_no * chunk_size]
-        # 收上一轮发起的版面预取（即本 chunk 的版面）；未完成则等它，失败回退常规计算。
-        if pending_layout_task is not None:
-            try:
-                engine._layout_prefetched[id(chunk_images)] = (
-                    await pending_layout_task
-                )
-            except Exception:
-                engine._layout_prefetched.pop(id(chunk_images), None)
-            pending_layout_task = None
-        # 与本 chunk 的识别并行预取下一 chunk 的版面。
-        if chunk_no < len(chunk_images_list):
-            pending_layout_task = asyncio.create_task(
-                engine._orig_analyze_layouts(chunk_images_list[chunk_no], None)
+    async def _render_and_prefetch(pages: Sequence[int]) -> List[Any]:
+        """渲染一个 chunk 的页面，紧接着把它的版面分析也做掉。
+
+        渲染是纯 CPU（PDFium）、版面是 GPU，两者与上一个 chunk 的识别并行，
+        所以这一段的墙钟时间基本被前一个 chunk 的推理吃掉。返回的列表对象
+        既是流水线的输入，也是版面预取结果的 id() 键，两边必须是同一个对象。
+        """
+        images = await asyncio.to_thread(_render_pdf_pages, pdf_bytes, args.dpi, pages)
+        try:
+            engine._layout_prefetched[id(images)] = await engine._orig_analyze_layouts(
+                images, None
             )
+        except Exception as error:  # noqa: BLE001 - 预取失败就回退常规计算
+            engine._layout_prefetched.pop(id(images), None)
+            LOGGER.warning("版面预取失败，本块回退为常规分析：%s", error)
+        return images
+
+    for chunk_no, chunk in enumerate(chunk_pages_list, start=1):
         chunk_started = time.perf_counter()
+        if pending_chunk_task is not None:
+            chunk_images = await pending_chunk_task
+            pending_chunk_task = None
+        else:
+            render_started = time.perf_counter()
+            chunk_images = await asyncio.to_thread(
+                _render_pdf_pages, pdf_bytes, args.dpi, chunk
+            )
+            render_seconds += time.perf_counter() - render_started
+        # 与本 chunk 的识别并行：预渲染 + 预分析下一个 chunk。
+        if chunk_no < len(chunk_pages_list):
+            pending_chunk_task = asyncio.create_task(
+                _render_and_prefetch(chunk_pages_list[chunk_no])
+            )
         result = await engine.process_decoded_document(
             chunk_images,
             pdf_path.name,
@@ -1844,8 +2127,8 @@ async def process_one(
         # 增量落盘：长文档跑到一半也能先看结果。
         written = write_outputs(base, outputs, formats)
 
-        for index in chunk:
-            images[index] = None  # 尽早释放已处理页的位图
+        # 本块的页面位图只在这一轮用得到，及早释放（渲染下一块时会重新解码）。
+        chunk_images.clear()
 
         elapsed = time.perf_counter() - chunk_started
         detail = "".join(
@@ -1868,7 +2151,7 @@ async def process_one(
 
     print(
         f"{prefix} 完成：{len(selected)}/{total_pages} 页，"
-        f"渲染 {render_elapsed:.1f}s，块 {block_total}，"
+        f"渲染 {render_seconds:.1f}s，块 {block_total}，"
         f"合计 {time.perf_counter() - started:.1f}s",
         flush=True,
     )

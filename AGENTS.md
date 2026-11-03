@@ -143,6 +143,17 @@ modelscope download SoMark/OXR-1.0 --local_dir ./OXR/models/OXR-1.0
 
 `pdf2md.py` 校验 `OXR/models/OXR-1.0/config.json` 与 `layout_analysis/last.pth`，缺了会直接退出并打印这条命令。
 
+### 16. `pdf2md.py` 的提速结构不能被“顺手简化”掉
+
+现有的速度来自几处互相咬合的改动，单独拿掉任一处都会退回原来的数倍耗时（67 页实测 177.8 s，10 页 28.6 s；改动前 10 页 58.9 s）：
+
+- **合批的 key 是 `(kind, options)`，不含 `limit`**。阅读序的提示词里带本页 bbox、token 上限也随本页块数变，按 prompt 或 limit 分桶会让每页各自成批，每批都要按 16 行补齐做预填充（10 页实测占生成时间 41%）。阅读序必须传 `kind="reading_order"`，长短差异由 `generate_batch` 里的按行 `row_limit` 截断兜住。别把 `limit` 加回 key。
+- **图解码器按「批大小 × 缓存长度」分桶复用**（`GreedyGraphDecoderPool`）。单步解码要读完整段预留缓存（批 16：缓存 2048→38.8 ms/步，512→18.6 ms/步），所以 1 行请求不能塞进 16 行的图；而 24 行以上的图一步更贵，`--batch-size` 超过 16 反而慢。
+- **池子的字节预算只能给 3 GiB**。32 页实测 3 GiB→64 s、4 GiB→106 s、5 GiB→215 s：显存一紧就开始抖动，比重新捕获几张图贵得多。
+- **`--chunk-pages` 默认 8 是有原因的**。显存峰值随它线性上涨，16 页实测 chunk 8→38 s、chunk 12→129 s、chunk 16→90 s。
+- **分段解码在本机不划算**。按步数切段、把已结束的行剔出去续跑，每次续跑都要换一张图并重做预填充，省下的步数全被吃掉（16 页慢 5%）。只在缓存装不下时才续跑。
+- **PDF 按 chunk 懒渲染，版面预取下一块**。渲染与上一块的推理重叠，`_layout_prefetched` 用 `id(images)` 作键，所以「渲染 + 版面预取」返回的列表对象必须原样传给流水线，别中途再复制一份。
+
 ## 改完自检
 
 - [ ] 行尾仍是 CRLF

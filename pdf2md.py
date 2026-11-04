@@ -52,8 +52,10 @@ PDF 里的图片导出到同目录的 <文件名>_media/。
                       「prompt + 预留」取 256 的整数倍，桶切换时重新捕获。
                       超出的请求续跑一段或回退到普通生成。
 
-内部还有两处不对外暴露的并行：PDF 按 chunk 懒渲染（渲染与上一块推理重叠，
-不再整本前置渲染），版面分析预取下一块。
+内部还有三处不对外暴露的并行：PDF 按 chunk 懒渲染（渲染与上一块推理重叠，
+不再整本前置渲染）、版面分析预取下一块、视觉塔跑在独立 CUDA 流上与下一批的
+解码重叠（视觉受限算力、解码受限带宽，互相当填空；按 patch 切块以免两条流
+的显存池叠加顶满 12 GB 卡）。
 
 依赖（GPU 版 torch 请按 https://pytorch.org 的说明安装）：
 
@@ -423,6 +425,29 @@ GRAPH_KV_BYTES_PER_TOKEN = 28 * 2 * 8 * 128 * 2
 # 固定开销摊得越薄；0.5s 在实测里已能把批填满，再长只增加尾延迟。
 GROUP_WAIT_SECONDS = 0.5
 
+# 视觉塔与解码重叠的总开关：视觉塔是算力受限、解码是带宽受限，两条流上
+# 同时跑能互相填空（16 页实测视觉塔约占识别时间 31%）。视觉塔一失败就会
+# 自动关掉重叠，退回串行路径。
+VISION_OVERLAP = True
+
+# 单次视觉前向最多吃这么多 patch。重叠时视觉塔跑在独立流上，两条流各有各
+# 的显存池（显存块只能被同一条流复用），整批整页图一次前向要吃掉 2~5 GB，
+# 和 KV 缓存挤在一起会把 reserved 顶到 12 GB 卡的边界、触发驱动换页 ——
+# 实测不是慢一点，而是慢 2~3 倍（32 页 55s 变 124s）。按 patch 数切块后峰值
+# 只和这一块有关，视觉总计算量不变。
+#
+# 上限也不是越大越好：16384 与 14000 在 16 页内看不出问题（32.3s、62.6s），
+# 但连续跑几个 chunk 之后就开始抖动（32 页 135s、124s）。8192 与 6144 一样
+# 稳定（32 页 54.7s、55.0s），全本 67 页识别 123.5s vs 123.6s，而切得少
+# 意味着 bf16 累加顺序更接近整批前向 —— 输出与串行路径的差异从 3 处降到
+# 1 处（“2.8 扶手”多一个空格）。所以取 8192。
+VISION_CHUNK_PATCHES = 8192
+
+# 图捕获必须在「没有别的流在提交 kernel」时进行，否则 capture 会报
+# “operation not permitted when stream is capturing”。视觉塔的提交与捕获
+# 共用这把锁：两边都只锁提交、不锁等待，所以重叠照样成立。
+_CUDA_CAPTURE_LOCK = threading.Lock()
+
 
 def _cuda_graph_supported(torch, device) -> bool:
     """CUDA Graph 只在 NVIDIA 的 CUDA 上启用。
@@ -742,12 +767,15 @@ class GreedyGraphDecoder:
 
         produced = 1
         finished = [token in eos_lookup for token in self.first[:rows, 0].tolist()]
+        stream = torch.cuda.current_stream(self.device)
         while produced < budget and not all(finished):
             steps = min(GRAPH_CHUNK_STEPS, budget - produced)
             with torch.inference_mode():
                 for _ in range(steps):
                     self.graph.replay()
-                torch.cuda.synchronize(self.device)
+                # 只等自己这条流：视觉塔可能同时在另一条流上跑，等整卡会把
+                # 那点重叠抹掉（实测重叠收益的大头就丢在这里）。
+                stream.synchronize()
             produced += steps
             fresh = self.history[:rows, produced - steps : produced].tolist()
             for row in range(rows):
@@ -761,19 +789,23 @@ class GreedyGraphDecoder:
     def _capture(self) -> None:
         torch = self.torch
         started = time.perf_counter()
-        stream = torch.cuda.Stream(device=self.device)
-        stream.wait_stream(torch.cuda.current_stream(self.device))
-        with torch.inference_mode(), torch.cuda.stream(stream):
-            for _ in range(2):  # 预热：把 cuBLAS/算子句柄都建好再捕获
+        # 捕获期间不能让另一条流（视觉塔）提交 kernel，否则 capture 会报
+        # “operation not permitted when stream is capturing”。两边只锁“提交”
+        # 这一段，不锁等待，所以不会把重叠吃掉。
+        with _CUDA_CAPTURE_LOCK:
+            stream = torch.cuda.Stream(device=self.device)
+            stream.wait_stream(torch.cuda.current_stream(self.device))
+            with torch.inference_mode(), torch.cuda.stream(stream):
+                for _ in range(2):  # 预热：把 cuBLAS/算子句柄都建好再捕获
+                    self._step()
+            torch.cuda.current_stream(self.device).wait_stream(stream)
+            torch.cuda.synchronize(self.device)
+            self._reset()
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.inference_mode(), torch.cuda.graph(self.graph):
                 self._step()
-        torch.cuda.current_stream(self.device).wait_stream(stream)
-        torch.cuda.synchronize(self.device)
-        self._reset()
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.inference_mode(), torch.cuda.graph(self.graph):
-            self._step()
-        torch.cuda.synchronize(self.device)
-        self._reset()
+            torch.cuda.synchronize(self.device)
+            self._reset()
         LOGGER.info(
             "CUDA Graph 解码已捕获：批 %d，缓存 %d token，耗时 %.1fs",
             self.batch,
@@ -923,6 +955,10 @@ class OXRTextBackend:
             self.stats.add_prepare(time.perf_counter() - started)
         return prepared, failures
 
+    def can_overlap_vision(self) -> bool:
+        """视觉塔能否挪到独立流上、与上一批的解码重叠（只有 CUDA 能）。"""
+        return bool(VISION_OVERLAP) and self.device.type == "cuda"
+
     # -- 生成（GPU） ------------------------------------------------------- #
 
     def _generation_kwargs(
@@ -1060,26 +1096,17 @@ class OXRTextBackend:
 
         return tokens
 
-    def generate_batch(
-        self,
-        prepared: Sequence[Any],
-        max_new_tokens: int,
-        model_options: Optional[Dict[str, Any]] = None,
-        limits: Optional[Sequence[int]] = None,
-    ):
-        """把若干条预处理结果拼成一个 batch 一次性生成。
+    # -- 视觉前向与解码拆开，方便两者在两条流上重叠 ------------------------ #
+
+    def build_batch(self, prepared: Sequence[Any]) -> Dict[str, Any]:
+        """把预处理结果拼成一个 batch（纯 CPU 侧拼装，暂不搬显存）。
 
         左填充到等长，靠 attention_mask 屏蔽填充位；视觉 token 用负数的
         指示 ID 占位，merge_multimodal 会按行序填回视觉特征，所以填充用的
-        pad_token_id（正数）不会和它们冲突。
+        pad_token_id（正数）不会和它们冲突。搬显存的动作用 merge_batch 做，
+        好让它和视觉前向落在同一条流上。
         """
-        from oxr.model.client import ModelOutput
-
         torch = self.torch
-        if not prepared:
-            return []
-
-        started = time.perf_counter()
         lengths = [int(input_ids.shape[0]) for input_ids, _, _ in prepared]
         max_length = max(lengths)
         rows = []
@@ -1091,37 +1118,136 @@ class OXRTextBackend:
                     input_ids,
                 ])
             rows.append(input_ids)
-        batch_input_ids = torch.stack(rows).to(self.device)
+        input_ids = torch.stack(rows)
 
-        attention_mask = torch.zeros_like(batch_input_ids, dtype=torch.bool)
+        attention_mask = torch.zeros_like(input_ids, dtype=torch.bool)
         for row, length in enumerate(lengths):
             attention_mask[row, max_length - length:] = True
 
-        pixel_values = None
-        if prepared[0][1] is not None:
-            pixel_values = torch.cat([item[1] for item in prepared], dim=0).to(
-                self.device, dtype=self.dtype
-            )
-        grid_thws = None
-        if prepared[0][2] is not None:
-            grid_thws = torch.cat([item[2] for item in prepared], dim=0).to(self.device)
+        pixel_values = [item[1] for item in prepared]
+        grid_thws = [item[2] for item in prepared]
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "pixel_values": pixel_values,
+            "grid_thws": grid_thws,
+            "rows": len(prepared),
+        }
 
+    def _vision_groups(self, grid_thws: Sequence[Any], rows: int) -> List[List[int]]:
+        """按 patch 数把行切成若干组，组内一次视觉前向。
+
+        行与行在视觉塔里完全独立，切开再拼回来内容不变；之所以要切，是因为
+        视觉塔跑在独立流上、显存池和 KV 缓存那条流不共享，一整批整页图
+        （8 页阅读序就是 27648 patch）会顶到 12 GB 卡的容量上限。
+        """
+        groups: List[List[int]] = []
+        current: List[int] = []
+        patches = 0
+        for row in range(rows):
+            grid = grid_thws[row]
+            if grid is None:  # 没有图的行单独成组，走不带像素的那条路
+                if current:
+                    groups.append(current)
+                    current, patches = [], 0
+                groups.append([row])
+                continue
+            count = int(grid.prod().item())
+            if current and patches + count > VISION_CHUNK_PATCHES:
+                groups.append(current)
+                current, patches = [], 0
+            current.append(row)
+            patches += count
+        if current:
+            groups.append(current)
+        return groups
+
+    def _merge_rows(
+        self,
+        input_ids,
+        rows: Sequence[int],
+        pixel_values: Sequence[Any],
+        grid_thws: Sequence[Any],
+    ):
+        """只给指定行做一次视觉前向 + 嵌入合并（行序、宽度都不变）。"""
+        torch = self.torch
+        pixels = [pixel_values[row] for row in rows if pixel_values[row] is not None]
+        grids = [grid_thws[row] for row in rows if grid_thws[row] is not None]
+        pv = None
+        if pixels:
+            pv = torch.cat(pixels, dim=0).to(self.device, dtype=self.dtype)
+        gt = None
+        if grids:
+            gt = torch.cat(grids, dim=0).to(self.device)
+        with torch.inference_mode():
+            return self.model.merge_multimodal(
+                input_ids=input_ids,
+                pixel_values=pv,
+                grid_thws=gt,
+            )
+
+    def merge_batch(self, batch: Dict[str, Any]):
+        """视觉塔前向 + 文本嵌入合并，在调用方当前的 CUDA 流上执行。
+
+        视觉塔是算力受限、解码是带宽受限，两者在 GPU 上能互相填空，所以
+        这一步允许跑在独立流上，与上一批的解码重叠。patch 多的时候按组
+        分批前向，把这次前向的显存峰值压住（见 VISION_CHUNK_PATCHES）。
+        """
+        torch = self.torch
+        input_ids = batch["input_ids"].to(self.device)
+        groups = self._vision_groups(batch["grid_thws"], int(batch["rows"]))
+        if len(groups) <= 1:
+            return self._merge_rows(
+                input_ids, groups[0] if groups else [],
+                batch["pixel_values"], batch["grid_thws"],
+            )
+        parts = [
+            self._merge_rows(
+                input_ids[group], group, batch["pixel_values"], batch["grid_thws"]
+            )
+            for group in groups
+        ]
+        # 各组都是原批里连续的一段，直接按顺序拼回整批。
+        return torch.cat(parts, dim=0)
+
+    def run_batch(
+        self,
+        batch: Dict[str, Any],
+        inputs_embeds,
+        max_new_tokens: int,
+        model_options: Optional[Dict[str, Any]] = None,
+        limits: Optional[Sequence[int]] = None,
+        started: Optional[float] = None,
+        vision_event=None,
+    ):
+        """拿已合并好的嵌入跑预填充 + 解码。
+
+        vision_event 是视觉塔在另一条流上跑完后记下的事件：解码前等它一次
+        即可，不能再去等整卡（那会把重叠整个抹掉）。
+        """
+        from oxr.model.client import ModelOutput
+
+        torch = self.torch
+        if started is None:
+            started = time.perf_counter()
+        if vision_event is not None:
+            stream = torch.cuda.current_stream(self.device)
+            stream.wait_event(vision_event)
+            # 嵌入是在视觉那条流上分配的，这里要告诉分配器“它也会在本流
+            # 用过”，否则视觉流上的下一批可能提前复用这块显存。
+            if isinstance(inputs_embeds, torch.Tensor):
+                inputs_embeds.record_stream(stream)
+
+        attention_mask = batch["attention_mask"].to(self.device)
         generation_kwargs = self._generation_kwargs(max_new_tokens, model_options)
         limit = int(generation_kwargs["max_new_tokens"])
-        row_limits = list(limits or [limit] * len(prepared))
+        row_limits = list(limits or [limit] * int(batch["rows"]))
         greedy = (
             generation_kwargs.get("do_sample") is False
             and "repetition_penalty" not in generation_kwargs
         )
         graph_used = False
         tokens_by_row = None
-
-        with torch.inference_mode():
-            inputs_embeds = self.model.merge_multimodal(
-                input_ids=batch_input_ids,
-                pixel_values=pixel_values,
-                grid_thws=grid_thws,
-            )
 
         if self.graph_pool is not None and greedy:
             try:
@@ -1171,12 +1297,29 @@ class OXRTextBackend:
 
         if self.stats is not None:
             self.stats.add_generate(
-                len(prepared),
+                int(batch["rows"]),
                 produced_tokens,
                 time.perf_counter() - started,
                 graph_used,
             )
         return results
+
+    def generate_batch(
+        self,
+        prepared: Sequence[Any],
+        max_new_tokens: int,
+        model_options: Optional[Dict[str, Any]] = None,
+        limits: Optional[Sequence[int]] = None,
+    ):
+        """不分流地做完视觉前向与解码（对照用，也是重叠失败时的退路）。"""
+        if not prepared:
+            return []
+        started = time.perf_counter()
+        batch = self.build_batch(prepared)
+        inputs_embeds = self.merge_batch(batch)
+        return self.run_batch(
+            batch, inputs_embeds, max_new_tokens, model_options, limits, started
+        )
 
 
 class _PendingRequest:
@@ -1204,17 +1347,20 @@ class _PendingRequest:
 
 
 class LocalOXRClient:
-    """替换 OXRModelClient：把本机模型调用聚合成批，单卡串行执行。
+    """替换 OXRModelClient：把本机模型调用聚合成批，单卡流水执行。
 
     流水线本身是按“HTTP 服务端有连续批处理”设计的，每个 block 发一次请求。
     本地推理如果照单全收就退化成几千次 batch=1 的生成，而 batch=1 时每生成
-    一个 token 都要把整份权重读一遍显存。这里用两个常驻协程把请求攒起来：
+    一个 token 都要把整份权重读一遍显存。这里用三个常驻协程把请求攒起来：
 
         _prepare_loop  : 按 key 取一组请求 -> 线程池里做 CPU 预处理
-        _generate_loop : 取预处理结果 -> 线程里做一次批量 GPU 生成
+        _vision_loop   : 取预处理结果 -> 视觉塔前向（独立 CUDA 流）
+        _generate_loop : 取已合并的嵌入 -> 预填充 + 解码
 
-    预处理队列深度为 2，所以第 N 批在 GPU 上跑的时候，第 N+1 批已经在
-    CPU 上准备好了。
+    _prepare_loop 与 _vision_loop 的队列深度都是 2，所以第 N 批在 GPU 上解码
+    的时候，第 N+1 批的视觉塔已经在另一条流上跑完了 —— 视觉塔是算力受限、
+    解码是带宽受限，两者在 GPU 上能互相填空（16 页实测视觉塔本来要占识别
+    时间的 31%）。
     """
 
     def __init__(self, backend: OXRTextBackend, config, batch_size: int = 4) -> None:
@@ -1224,10 +1370,12 @@ class LocalOXRClient:
         self._pending: List[_PendingRequest] = []
         self._condition = asyncio.Condition()
         self._prepared: Optional[asyncio.Queue] = None
+        self._embedded: Optional[asyncio.Queue] = None
         self._workers: List[asyncio.Task] = []
         self._prepare_pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="oxr-prepare"
         )
+        self._vision_stream = None
         self._semaphore: Optional[asyncio.Semaphore] = None
         self._semaphore_loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -1254,8 +1402,14 @@ class LocalOXRClient:
         if self._workers:
             return
         self._prepared = asyncio.Queue(maxsize=2)
+        self._embedded = asyncio.Queue(maxsize=2)
+        if self.backend.can_overlap_vision():
+            self._vision_stream = self.backend.torch.cuda.Stream(
+                device=self.backend.device
+            )
         loop = asyncio.get_running_loop()
         self._workers.append(loop.create_task(self._prepare_loop()))
+        self._workers.append(loop.create_task(self._vision_loop()))
         self._workers.append(loop.create_task(self._generate_loop()))
 
     async def _next_group(self) -> List[_PendingRequest]:
@@ -1338,20 +1492,72 @@ class LocalOXRClient:
             except Exception as error:  # noqa: BLE001 - 工作协程不能退出
                 LOGGER.exception("预处理协程异常：%s", error)
 
-    async def _generate_loop(self) -> None:
+    def _encode_group(self, prepared: Sequence[Any]):
+        """视觉塔前向 + 文本嵌入合并，返回 (batch, embeds, 完成事件)。
+
+        整段提交到视觉那条流上并记一个事件，解码前等这个事件即可。视觉流
+        已经因为报错被关掉时，退回当前流（等于串行），保证不出错。
+        """
+        backend = self.backend
+        batch = backend.build_batch(prepared)
+        stream = self._vision_stream
+        if stream is None:
+            return batch, backend.merge_batch(batch), None
+        torch = backend.torch
+        with _CUDA_CAPTURE_LOCK:
+            with torch.cuda.stream(stream):
+                embeds = backend.merge_batch(batch)
+                event = torch.cuda.Event()
+                event.record(stream)
+        return batch, embeds, event
+
+    async def _vision_loop(self) -> None:
+        loop = asyncio.get_running_loop()
         while True:
             try:
                 group, prepared = await self._prepared.get()
+                batch = embeds = event = None
+                if self._vision_stream is not None:
+                    try:
+                        batch, embeds, event = await loop.run_in_executor(
+                            None, self._encode_group, prepared
+                        )
+                    except Exception as error:  # noqa: BLE001 - 之后退回串行路径
+                        LOGGER.warning("视觉前向失败，之后退回串行路径：%s", error)
+                        self._vision_stream = None
+                        batch = embeds = event = None
+                await self._embedded.put((group, prepared, batch, embeds, event))
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - 工作协程不能退出
+                LOGGER.exception("视觉协程异常：%s", error)
+
+    async def _generate_loop(self) -> None:
+        while True:
+            try:
+                group, prepared, batch, embeds, event = await self._embedded.get()
                 limits = [request.limit for request in group]
                 options = group[0].options
                 try:
-                    outputs = await asyncio.to_thread(
-                        self.backend.generate_batch,
-                        prepared,
-                        max(limits),
-                        options,
-                        limits,
-                    )
+                    if batch is None:  # 视觉塔没跑成，整批走串行路径
+                        outputs = await asyncio.to_thread(
+                            self.backend.generate_batch,
+                            prepared,
+                            max(limits),
+                            options,
+                            limits,
+                        )
+                    else:
+                        outputs = await asyncio.to_thread(
+                            self.backend.run_batch,
+                            batch,
+                            embeds,
+                            max(limits),
+                            options,
+                            limits,
+                            time.perf_counter(),
+                            event,
+                        )
                 except Exception as error:  # noqa: BLE001 - 单批失败不影响后续
                     LOGGER.error("批量生成失败（%d 条）：%s", len(group), error)
                     for request in group:

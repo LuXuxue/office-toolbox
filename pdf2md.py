@@ -2077,7 +2077,12 @@ class LocalEngine:
         from oxr.utils.image import crop_image as _crop_image
 
         _orig_recognize_block = recognition_module.recognize_block
-        _crop_cache: Dict[bytes, Any] = {}
+        # 键是「裁切像素 + 块类型」，值只存识别出的正文与格式。不能把整个
+        # Block 存下来复用：Block 里的 bbox / text_before / text_after 属于被
+        # 命中的那一个块，复用时会把这套上下文带到别的块上（实测同一份 PDF
+        # 跑第二遍会多出一个重复的标题块）。缓存归 LocalEngine 管，每次
+        # process_one 开头清空，避免跨文档、跨参数复用。
+        self._crop_cache: Dict[bytes, Tuple[str, Any]] = {}
 
         async def _cached_recognize_block(
             block, page_image, sem, file_name, page_num,
@@ -2092,19 +2097,22 @@ class LocalEngine:
                     model_options, element_formats, table_images,
                 )
             crop = _crop_image(page_image, block.bbox)
-            key = _hashlib.md5(_np.ascontiguousarray(crop).tobytes()).digest()
-            cached = _crop_cache.get(key)
+            key = (
+                _hashlib.md5(_np.ascontiguousarray(crop).tobytes()).digest()
+                + block.type.value.encode("utf-8")
+            )
+            cached = self._crop_cache.get(key)
             if cached is not None:
-                # 结果块里的 idx 属于原页，命中时改回当前块的 idx 保持顺序
-                hit = _copy.deepcopy(cached)
-                hit.idx = block.idx
+                # 只借用识别结果，bbox / idx / 跨块上下文一律沿用当前块
+                hit = _copy.deepcopy(block)
+                hit.content, hit.format = cached
                 return hit
             result = await _orig_recognize_block(
                 block, page_image, sem, file_name, page_num,
                 model_options, element_formats, table_images,
             )
-            if len(_crop_cache) < 2048:
-                _crop_cache[key] = result
+            if len(self._crop_cache) < 2048:
+                self._crop_cache[key] = (result.content, result.format)
             return result
 
         recognition_module.recognize_block = _cached_recognize_block
@@ -2266,6 +2274,11 @@ async def process_one(
     prefix: str = "",
 ) -> List[Path]:
     started = time.perf_counter()
+    # 裁切去重缓存只在本次文件内有效：跨文件/跨次复用它，等于拿上一次的
+    # 识别结果替代本次推理，既掩盖了真实开销，也会带进上一次的块上下文。
+    cache = getattr(engine, "_crop_cache", None)
+    if cache is not None:
+        cache.clear()
     pdf_bytes = pdf_path.read_bytes()
     total_pages = await asyncio.to_thread(_pdf_page_count, pdf_bytes)
     if not total_pages:

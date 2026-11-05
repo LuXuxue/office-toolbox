@@ -1372,9 +1372,11 @@ class LocalOXRClient:
         self._prepared: Optional[asyncio.Queue] = None
         self._embedded: Optional[asyncio.Queue] = None
         self._workers: List[asyncio.Task] = []
+        self._worker_loop: Optional[asyncio.AbstractEventLoop] = None
         self._prepare_pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="oxr-prepare"
         )
+        self._prepare_pool_closed = False
         self._vision_stream = None
         self._semaphore: Optional[asyncio.Semaphore] = None
         self._semaphore_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -1399,18 +1401,47 @@ class LocalOXRClient:
     # -- 常驻协程 ---------------------------------------------------------- #
 
     def _ensure_workers(self) -> None:
-        if self._workers:
+        loop = asyncio.get_running_loop()
+        if (
+            self._workers
+            and self._worker_loop is loop
+            and not any(task.done() for task in self._workers)
+        ):
             return
+        if self._workers:
+            # 上一轮协程属于别的（已经关闭的）事件循环，或者中途退出了。
+            # 队列和协程都绑在那个循环上，只能整套重建；否则新请求会静静地
+            # 躺在队列里没人取，表现为调用方永远等下去（不是报错，是挂死）。
+            LOGGER.debug("事件循环已更换，重建 OXR 客户端的工作协程")
+            self._abandon_workers()
+        self._condition = asyncio.Condition()
         self._prepared = asyncio.Queue(maxsize=2)
         self._embedded = asyncio.Queue(maxsize=2)
-        if self.backend.can_overlap_vision():
+        if self._prepare_pool_closed:
+            # aclose() 关掉的线程池不能再用，换一个新的。
+            self._prepare_pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="oxr-prepare"
+            )
+            self._prepare_pool_closed = False
+        if self.backend.can_overlap_vision() and self._vision_stream is None:
             self._vision_stream = self.backend.torch.cuda.Stream(
                 device=self.backend.device
             )
-        loop = asyncio.get_running_loop()
+        self._worker_loop = loop
         self._workers.append(loop.create_task(self._prepare_loop()))
         self._workers.append(loop.create_task(self._vision_loop()))
         self._workers.append(loop.create_task(self._generate_loop()))
+
+    def _abandon_workers(self) -> None:
+        """丢弃上一轮事件循环留下的协程与排队请求（这里不能 await）。"""
+        for task in self._workers:
+            if not task.done():
+                task.cancel()
+        self._workers.clear()
+        self._worker_loop = None
+        for request in self._pending:
+            self._reject(request, RuntimeError("客户端已更换事件循环"))
+        self._pending.clear()
 
     async def _next_group(self) -> List[_PendingRequest]:
         """取出“能凑满一批”的那一类请求。
@@ -1574,13 +1605,19 @@ class LocalOXRClient:
     def _resolve(request: _PendingRequest, value) -> None:
         future = request.future
         if future is not None and not future.done():
-            future.set_result(value)
+            try:
+                future.set_result(value)
+            except RuntimeError:  # 事件循环已经关了，回调没人收
+                pass
 
     @staticmethod
     def _reject(request: _PendingRequest, error: BaseException) -> None:
         future = request.future
         if future is not None and not future.done():
-            future.set_exception(error)
+            try:
+                future.set_exception(error)
+            except RuntimeError:  # 事件循环已经关了，回调没人收
+                pass
 
     # -- 与流水线对接 ------------------------------------------------------ #
 
@@ -1593,10 +1630,12 @@ class LocalOXRClient:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         self._workers.clear()
+        self._worker_loop = None
         for request in self._pending:
             self._reject(request, RuntimeError("客户端已关闭"))
         self._pending.clear()
         self._prepare_pool.shutdown(wait=False)
+        self._prepare_pool_closed = True
 
     async def _call_vision_model(
         self,

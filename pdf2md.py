@@ -38,8 +38,9 @@ PDF 里的图片导出到同目录的 <文件名>_media/。
 
     --batch-size      文本模型的批大小。流水线原本面向 vLLM 的连续批处理，
                       本地串行时把同一类型的识别请求拼成一批，能把每 token
-                      都要重读一遍模型权重的开销摊薄，16 左右最优
-                      （实测 16 页：16→36 s，24→57 s、峰值显存涨到 9.9 GB）。
+                      都要重读一遍模型权重的开销摊薄。单步耗时主要由权重
+                      带宽决定、几乎不随批大小增长（实测 8 与 16 持平、
+                      20/24 没有净收益，4 明显慢 158 s），故默认 16。
     --chunk-pages     每批送进流水线的页数。它是本机最不能放松的一个：
                       显存峰值基本随它线性上涨，一旦逼近 12 GB 就开始抖动，
                       实测 16 页 chunk 8→38 s、chunk 12→129 s、chunk 16→90 s。
@@ -226,7 +227,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--batch-size", type=int, default=16,
         help="文本模型的批大小，同类型请求合批推理（默认：16，1 表示不合批；"
-             "本地串行推理下 16 比 4 快约 2 倍，24 以上反而变慢）",
+             "本地串行推理下 4 明显慢（约 158 s，对照 16 约 37 s）；"
+             "8 与 16 持平；20/24 没有净收益）",
     )
     parser.add_argument(
         "--reading-order", choices=("geo", "llm"), default="llm",
@@ -424,9 +426,10 @@ GRAPH_CACHE_RESERVE = 512
 # × 2 字节（bf16）。显存预算和 --graph-cache-len 的说明都用它换算。
 GRAPH_KV_BYTES_PER_TOKEN = 28 * 2 * 8 * 128 * 2
 
-# 攒批时最多等这么久；本地生成是瓶颈，等一小会儿换更高的一批利用率更划算。
-# 等同一类型请求凑满一批的超时（秒）。攒批越满，视觉编码器与预填充的
-# 固定开销摊得越薄；0.5s 在实测里已能把批填满，再长只增加尾延迟。
+# 攒批的最长等待（秒）。攒满的批能把视觉编码器与预填充的固定开销摊薄，所以
+# 愿意多等一小会儿；但本地生成本来就是瓶颈，密集到一定程度后继续等只会多
+# 添延迟。0.5s 只是上限——真正的停止判据是「队列连着 30 ms 没再增长」
+# 或「够两批」（见 _next_group），到点就走。
 GROUP_WAIT_SECONDS = 0.5
 
 # 视觉塔与解码重叠的总开关：视觉塔是算力受限、解码是带宽受限，两条流上
@@ -1412,10 +1415,11 @@ class LocalOXRClient:
         一批；这里放宽到批大小的 8 倍，只作为内存/背压上限。
         """
         loop = asyncio.get_running_loop()
-        # 只在途请求数上限，同时也是识别阶段的内存背压。本地实现里独占 GPU
-        # 的是生成线程，卡住请求数只会让攒批攒不满（16 页规范有 123 个块，
-        # 上限 8 时队列经常只剩一两个同类请求），所以放宽一些：排队的请求
-        # 只占着已经裁好的图，不再额外占显存。
+        # 只在途请求数上限，同时也是识别阶段的内存背压。本地实现里独占 GPU 的
+        # 是生成线程（asyncio.to_thread 派遣，不占事件循环），卡住请求数只会让
+        # 攒批攒不满（16 页规范有 123 个块，太小的上限队列经常只剩一两个同类
+        # 请求），所以放宽到批大小的 8 倍：排队的请求只占着已经裁好的图，不再
+        # 额外占显存。
         limit = max(self.batch_size * 8, 16)
         if self._semaphore_loop is not loop or self._semaphore is None:
             self._semaphore = asyncio.Semaphore(limit)
@@ -1535,7 +1539,9 @@ class LocalOXRClient:
             group_max = ordered[end - 1].hint
             for size in range(1, min(maximum, end) + 1):
                 start = end - size
-                if size < minimum and not (start == 0 and end == total):
+                # 尾组也不例外：总长都能划成若干 [minimum, maximum] 的组合，
+                # 用不着为"不满一组"开后门（穷举过 17~64 都能覆盖）。
+                if size < minimum:
                     continue
                 cost = best[start] + group_max
                 if cost < best[end]:
@@ -1545,7 +1551,8 @@ class LocalOXRClient:
         sizes = []
         end = total
         while end > 0:
-            size = step[end]
+            # 防御性兜底：DP 下 end 必然可达，万一没覆盖就拿剩下的全部当一组
+            size = step[end] or min(maximum, end)
             sizes.append(size)
             end -= size
         return ordered[: sizes[-1]]

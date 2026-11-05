@@ -108,7 +108,7 @@ python pdf2md.py -d path/to/dir -o path/to/out --formats md
 | `--keep-header-footer` | 保留页眉页脚（默认丢弃） |
 | `--device auto/cuda/cpu` | 推理设备，默认有 CUDA 就用 CUDA |
 | `--max-tokens 8192` | 单个版面块的最大生成 token 数 |
-| `--batch-size 16` | 文本模型合批的批大小；1 表示不合批。同一页的多个文字块拼成一批推理，比逐块推理快（本地串行下 16 比 4 快约 2 倍，32 以上反而变慢） |
+| `--batch-size 16` | 文本模型合批的批大小；1 表示不合批。同一页的多个文字块拼成一批推理，比逐块推理快（本地串行下 4 明显慢，8 与 16 持平，20 以上没有净收益） |
 | `--reading-order llm/geo` | 块阅读序的确定方式；`llm`（默认）把每页整页图片再送模型推理一轮，阅读序质量最高，`geo` 用 XY-Cut++ 几何排序，零 GPU 开销、可提速约 1/6，但对多栏/复杂版式有局限，顺序可能不准 |
 | `--chunk-pages 8` | 每批送进流水线的页数；越小越省内存、进度越细，每批结束都会落盘 |
 | `--layout-batch-size 8` | 版面分析批大小 |

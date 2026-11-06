@@ -190,6 +190,45 @@
         .drop-overlay.is-visible {
             opacity: 1;
         }
+
+        /* 本地图片加载失败提示条 */
+        .image-notice {
+            position: fixed;
+            left: 50%;
+            bottom: 1rem;
+            transform: translateX(-50%);
+            z-index: 11;
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            max-width: min(90vw, 560px);
+            padding: 0.5rem 0.8rem;
+            border: 1px solid var(--overlay-border);
+            border-radius: 0.5rem;
+            background-color: var(--bg-header);
+            color: var(--text);
+            font-size: 0.8rem;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+        }
+
+        .image-notice[hidden] {
+            display: none;
+        }
+
+        .image-notice button {
+            flex-shrink: 0;
+            padding: 0.3rem 0.6rem;
+            font-size: 0.78rem;
+            color: var(--accent);
+            background: transparent;
+            border: 1px solid var(--overlay-border);
+            border-radius: 0.4rem;
+            cursor: pointer;
+        }
+
+        .image-notice button:hover {
+            background: var(--btn-bg-hover);
+        }
     </style>
 </head>
 <body>
@@ -212,6 +251,10 @@
             </div>
         </div>
     </main>
+    <div class="image-notice" id="image-notice" hidden>
+        <span id="image-notice-text"></span>
+        <button type="button" id="image-notice-authorize">授权打开所在文件夹…</button>
+    </div>
     <div class="drop-overlay" id="drop-overlay">松开以打开文件</div>
     <script src="lib/somarkdown/somarkdown.umd.min.js"></script>
     <script>
@@ -231,8 +274,241 @@
             let dragDepth = 0;
             let readFileText = "";
 
+            // ---------- 本地图片解析 ----------
+            // 浏览器不会暴露本地文件的绝对路径，md 里的相对路径图片（如 ./xxx_media/a.png）
+            // 无法直接定位到 md 旁边的媒体目录。思路：通过「拖入包含 md 的文件夹」或
+            // 「授权打开 md 所在文件夹」拿到目录访问权，建立「相对路径 → File」索引，
+            // 渲染后把相对 <img> 的 src 换成 object URL。
+            let currentFileName = "";
+            // undefined：?file= 流程（已通过 <base> 指定 md 目录，交给浏览器自己解析）
+            // null：未关联本地目录（普通「打开文件」/单个文件拖入），相对图找不到就记为失败
+            // 字符串：已知 md 所在目录（相对拖入/选择的根目录，"" 表示根目录本身）
+            let currentMdDir = null;
+            let imageFileMap = new Map();     // 规范化路径(小写) → () => Promise<File>
+            let imageBaseNameMap = new Map(); // 文件名(小写) → [{ path, getFile }]
+            let imageFileOrig = new Map();    // 规范化路径(小写) → 原始大小写路径（用于显示文件名）
+            let activeObjectUrls = [];
+            // 提示条「授权」按钮的当前动作：'retry-images' = 授权后重试相对图；'open-md' = 授权后读取并打开 md（?file= 读取失败时）
+            let imageNoticeAction = "retry-images";
+            let pendingMdName = "";
+            const imageNotice = document.getElementById("image-notice");
+            const imageNoticeText = document.getElementById("image-notice-text");
+            const imageNoticeAuthorize = document.getElementById("image-notice-authorize");
+
             const supportsDrag = "draggable" in document.createElement("span");
             const isMarkdownFile = (name) => /\.(md|smd|txt)$/i.test(name || "");
+
+            // 统一路径分隔符、消解 . 和 ..，再转小写作为索引键
+            function normalizePathKey(p) {
+                const parts = [];
+                for (const part of String(p).replace(/\\/g, "/").split("/")) {
+                    if (!part || part === ".") continue;
+                    if (part === "..") { parts.pop(); continue; }
+                    parts.push(part);
+                }
+                return parts.join("/").toLowerCase();
+            }
+
+            function pathBasename(p) {
+                const parts = String(p).replace(/\\/g, "/").split("/").filter(Boolean);
+                return parts.length ? parts[parts.length - 1] : "";
+            }
+
+            function pathDirname(p) {
+                const parts = String(p).replace(/\\/g, "/").split("/");
+                parts.pop();
+                return parts.join("/");
+            }
+
+            function registerImageFile(relPath, getFile) {
+                const key = normalizePathKey(relPath);
+                imageFileMap.set(key, getFile);
+                imageFileOrig.set(key, relPath);
+                const base = pathBasename(key);
+                if (!base) return;
+                if (!imageBaseNameMap.has(base)) {
+                    imageBaseNameMap.set(base, []);
+                }
+                imageBaseNameMap.get(base).push({ path: key, getFile });
+            }
+
+            function clearImageState() {
+                for (const url of activeObjectUrls) {
+                    URL.revokeObjectURL(url);
+                }
+                activeObjectUrls = [];
+                imageFileMap = new Map();
+                imageBaseNameMap = new Map();
+                imageFileOrig = new Map();
+                currentMdDir = null;
+            }
+
+            // File System Access API 的目录句柄遍历（授权所在文件夹时用）
+            async function walkDirHandle(dirHandle, prefix) {
+                if (typeof dirHandle.entries === "function") {
+                    for await (const [name, handle] of dirHandle.entries()) {
+                        const relPath = prefix ? prefix + "/" + name : name;
+                        if (handle.kind === "directory") {
+                            await walkDirHandle(handle, relPath);
+                        } else {
+                            registerImageFile(relPath, () => handle.getFile());
+                        }
+                    }
+                    return;
+                }
+                for await (const handle of dirHandle.values()) {
+                    const relPath = prefix ? prefix + "/" + handle.name : handle.name;
+                    if (handle.kind === "directory") {
+                        await walkDirHandle(handle, relPath);
+                    } else {
+                        registerImageFile(relPath, () => handle.getFile());
+                    }
+                }
+            }
+
+            function findMarkdownRelPath(mdName) {
+                const target = String(mdName || "").toLowerCase();
+                let best = null;
+                for (const key of imageFileMap.keys()) {
+                    if (isMarkdownFile(key) && pathBasename(key) === target) {
+                        if (!best || key.length < best.length) {
+                            best = key;
+                        }
+                    }
+                }
+                return best;
+            }
+
+            function showImageNotice(failed) {
+                // 支持 File System Access API 时给「授权打开所在文件夹」按钮，否则只提示拖入整个文件夹
+                if (window.showDirectoryPicker) {
+                    imageNoticeAuthorize.hidden = false;
+                    imageNoticeAuthorize.textContent = "授权打开所在文件夹…";
+                    imageNoticeAction = "retry-images";
+                    imageNoticeText.textContent = `本文件有 ${failed} 张相对路径图片未能加载。`;
+                } else {
+                    imageNoticeAuthorize.hidden = true;
+                    imageNoticeText.textContent = `本文件有 ${failed} 张相对路径图片未能加载，请拖入包含该 md 与媒体文件夹的整个文件夹。`;
+                }
+                imageNotice.hidden = false;
+            }
+
+            // ?file= 直接 fetch 被浏览器禁止时：请用户授权 md 所在文件夹后再读取
+            function showMdOpenFallback(name) {
+                if (window.showDirectoryPicker) {
+                    imageNoticeAuthorize.hidden = false;
+                    imageNoticeAuthorize.textContent = "授权并打开…";
+                    imageNoticeAction = "open-md";
+                    pendingMdName = name;
+                    imageNoticeText.textContent = `浏览器禁止 file:// 页面直接读取本地文件，需要授权打开该 md 所在的文件夹。`;
+                } else {
+                    imageNoticeAuthorize.hidden = true;
+                    imageNoticeText.textContent = `浏览器禁止 file:// 页面直接读取本地文件，请改用「打开文件」按钮，或把包含该 md 的文件夹拖入窗口。`;
+                }
+                imageNotice.hidden = false;
+            }
+
+            function hideImageNotice() {
+                imageNotice.hidden = true;
+            }
+
+            const isExternalOrDataUrl = (src) => /^(https?:|data:|blob:|file:|\/\/|\\|[a-zA-Z]:[\\/])/.test(src);
+
+            // 渲染后把相对路径的 <img> 换成 object URL；找不到的计数并弹提示条
+            async function resolvePreviewImages() {
+                hideImageNotice();
+                if (currentMdDir === undefined) {
+                    // ?file= 流程：<base> 已指向 md 目录，交给浏览器解析
+                    return;
+                }
+                const imgs = [...preview.querySelectorAll("img")];
+                if (!imgs.length) {
+                    return;
+                }
+                let failed = 0;
+                await Promise.all(imgs.map(async (img) => {
+                    // 用 dataset 记住 md 里的原始 src，避免重复解析时把自己换的 blob: 地址当成原始地址
+                    const rawSrc = (img.dataset.origSrc ?? img.getAttribute("src") ?? "").trim();
+                    if (!rawSrc || isExternalOrDataUrl(rawSrc)) {
+                        return;
+                    }
+                    if (!img.dataset.origSrc) {
+                        img.dataset.origSrc = rawSrc;
+                    }
+                    // 去掉 query/hash 再解码，和 normalizePathKey 对齐
+                    let decoded = rawSrc.split("#")[0].split("?")[0];
+                    try {
+                        decoded = decodeURIComponent(decoded);
+                    } catch (error) {
+                        // 不是合法的百分号编码就按原样处理
+                    }
+                    let entry = null;
+                    if (typeof currentMdDir === "string") {
+                        entry = imageFileMap.get(normalizePathKey(currentMdDir + "/" + decoded)) || null;
+                    }
+                    if (!entry) {
+                        // 退化到按文件名匹配（拖入零散文件时用）；优先路径更短的
+                        const candidates = imageBaseNameMap.get(pathBasename(decoded).toLowerCase());
+                        if (candidates && candidates.length) {
+                            candidates.sort((a, b) => a.path.length - b.path.length);
+                            entry = candidates[0].getFile;
+                        }
+                    }
+                    if (entry) {
+                        try {
+                            const file = await entry();
+                            const url = URL.createObjectURL(file);
+                            activeObjectUrls.push(url);
+                            img.src = url;
+                            return;
+                        } catch (error) {
+                            // 读文件失败，落到失败计数
+                        }
+                    }
+                    failed += 1;
+                }));
+                if (failed > 0) {
+                    showImageNotice(failed);
+                }
+            }
+
+            // 行内图片 ![alt](dest) / ![alt](dest "title")；dest 含裸空格时 markdown-it 不解析，
+            // 图片会原样显示成文本，这里先给空格做百分号编码（不动代码块）
+            function encodeImageDestinations(text) {
+                const lines = text.split("\n");
+                let inFence = false;
+                let fenceMark = "";
+                return lines.map((line) => {
+                    const fence = line.match(/^\s*(```|~~~)/);
+                    if (fence) {
+                        if (!inFence) {
+                            inFence = true;
+                            fenceMark = fence[1];
+                        } else if (fence[1] === fenceMark) {
+                            inFence = false;
+                        }
+                        return line;
+                    }
+                    if (inFence) {
+                        return line;
+                    }
+                    return line.replace(/!\[([^\]]*)\]\(([^)]*)\)/g, (match, alt, inner) => {
+                        if (!/\s/.test(inner)) {
+                            return match; // 没有空格，原样返回
+                        }
+                        const trimmed = inner.trim();
+                        if (trimmed.startsWith("<")) {
+                            return match; // <...> 形式已合法
+                        }
+                        // 分出「路径」和可选的 "title" / 'title'
+                        const titleMatch = trimmed.match(/^(.*?)(\s+["'][^"']*["'])$/);
+                        const dest = titleMatch ? titleMatch[1].trim() : trimmed;
+                        const title = titleMatch ? titleMatch[2] : "";
+                        const encoded = encodeURI(dest);
+                        return `![${alt}](${encoded}${title})`;
+                    });
+                }).join("\n");
+            }
 
             function applyTheme() {
                 const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
@@ -274,21 +550,25 @@
                 window.requestAnimationFrame(() => {
                     renderPending = false;
                     dropHint.hidden = true;
+                    hideImageNotice();
                     try {
                         renderer = createRenderer();
                         if (!renderer) {
                             preview.innerHTML = "<p>SoMarkDown 未加载。</p>";
                             return;
                         }
-                        preview.innerHTML = renderer.render(readFileText);
+                        preview.innerHTML = renderer.render(encodeImageDestinations(readFileText));
                     } catch (error) {
                         preview.innerHTML = `<p>${String(error)}</p>`;
                     }
                     ensurePreviewLinksOpenInNewPage();
+                    // 相对路径图片换成 object URL（异步，失败的图片弹提示条）
+                    resolvePreviewImages();
                 });
             }
 
             function updateFileMeta(name) {
+                currentFileName = name;
                 filePathEl.textContent = name;
                 const lines = readFileText.split(/\r\n|\r|\n/).length;
                 lineCountEl.textContent = `${lines} 行`;
@@ -303,6 +583,9 @@
                     filePathEl.textContent = `${file.name}（不支持的类型）`;
                     return;
                 }
+                // 普通文件选择/单个文件拖入拿不到 md 的目录，相对图只能靠后续「授权打开所在文件夹」补齐
+                clearImageState();
+                currentFileName = file.name;
                 try {
                     readFileText = await file.text();
                 } catch (error) {
@@ -317,6 +600,61 @@
             fileInput.addEventListener("change", () => {
                 loadFile(fileInput.files?.[0]);
                 fileInput.value = "";
+            });
+
+            // 弹目录选择器并重建「相对路径 → File」索引；成功返回 md 的位置信息，失败返回 null
+            async function pickDirectoryAndIndex(mdName) {
+                let dirHandle = null;
+                try {
+                    dirHandle = await window.showDirectoryPicker({ mode: "read" });
+                } catch (error) {
+                    return null; // 用户取消选择
+                }
+                clearImageState();
+                try {
+                    await walkDirHandle(dirHandle, "");
+                } catch (error) {
+                    currentMdDir = null;
+                    return null;
+                }
+                // 优先定位到 md 在所选目录里的位置（md 可能在子目录中），找不到就按根目录处理
+                const mdPath = findMarkdownRelPath(mdName);
+                currentMdDir = mdPath ? pathDirname(mdPath) : "";
+                return mdPath;
+            }
+
+            // 「授权」按钮：动作由 imageNoticeAction 决定
+            imageNoticeAuthorize.addEventListener("click", async () => {
+                if (!window.showDirectoryPicker) {
+                    return;
+                }
+                if (imageNoticeAction === "open-md") {
+                    // ?file= 读取失败后的兜底：授权目录后读取并打开 md（含相对图）
+                    const mdPath = await pickDirectoryAndIndex(pendingMdName);
+                    if (!mdPath) {
+                        imageNoticeText.textContent = `所选文件夹中未找到 ${pendingMdName}，请重新授权。`;
+                        return;
+                    }
+                    const getFile = imageFileMap.get(mdPath);
+                    try {
+                        const file = await getFile();
+                        readFileText = await file.text();
+                    } catch (error) {
+                        imageNoticeText.textContent = `读取 ${pendingMdName} 失败。`;
+                        return;
+                    }
+                    currentFileName = pathBasename(imageFileOrig.get(mdPath) ?? mdPath);
+                    updateFileMeta(currentFileName);
+                    renderMarkdown();
+                    return;
+                }
+                // 默认：授权 md 所在文件夹后重试相对图
+                const result = await pickDirectoryAndIndex(currentFileName);
+                if (!result && currentMdDir === null) {
+                    resolvePreviewImages(); // 重新计数并恢复提示条
+                    return;
+                }
+                resolvePreviewImages();
             });
 
             if (supportsDrag) {
@@ -337,33 +675,105 @@
                         event.preventDefault();
                     }
                 });
+                // 只保留拖入 .md / .smd / .txt 文件本身；文件夹不支持（提示直接拖 md），
+                // 图片和「打开文件」按钮一样，加载失败后在提示条授权打开图片所在文件夹即可
                 document.addEventListener("drop", (event) => {
                     dragDepth = 0;
                     dropOverlay.classList.remove("is-visible");
-                    if (!event.dataTransfer?.files?.length) {
+                    // 判断是不是文件夹拖放：items 里能拿到目录条目，或 files 里是 0 字节且无扩展名的项
+                    const items = event.dataTransfer?.items;
+                    let isFolderDrop = false;
+                    if (items && items.length) {
+                        for (const item of items) {
+                            if (item.kind !== "file") {
+                                continue;
+                            }
+                            const entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
+                            if (entry && entry.isDirectory) {
+                                isFolderDrop = true;
+                                break;
+                            }
+                        }
+                    }
+                    const file = event.dataTransfer?.files?.[0] || null;
+                    if (!isFolderDrop && file && file.size === 0 && !/\.[a-z0-9]+$/i.test(file.name || "")) {
+                        isFolderDrop = true;
+                    }
+                    if (isFolderDrop) {
+                        event.preventDefault();
+                        filePathEl.textContent = "暂不支持拖入文件夹，请直接拖入 .md 文件";
+                        return;
+                    }
+                    if (!file) {
                         return;
                     }
                     event.preventDefault();
-                    loadFile(event.dataTransfer.files[0]);
+                    loadFile(file);
                 });
+            }
+
+            // 把本地绝对路径或 file:// URL 换算成编码后的 file:// URL（盘符段保持原样）
+            function pathToFileUrl(p) {
+                let s = String(p).trim().replace(/\\/g, "/");
+                if (/^file:\/\//i.test(s)) {
+                    return s;
+                }
+                if (!/^([a-zA-Z]:\/|\/)/.test(s)) {
+                    return s; // 相对路径或 http(s) 地址原样返回
+                }
+                const isDrive = /^[a-zA-Z]:\//.test(s);
+                const enc = s.split("/").map((seg, i) => {
+                    if (isDrive && i === 0) {
+                        return seg; // 盘符段保持原样
+                    }
+                    return encodeURIComponent(seg);
+                }).join("/");
+                return "file:///" + enc.replace(/^\/+/, "");
+            }
+
+            // 把 ?file= 的绝对路径换算成 md 所在目录的 file:// URL，插入 <base>，
+            // 让相对路径图片按 md 的位置解析（file:// 页面里 <img> 允许加载 file:// 资源）
+            function setBaseToFileDir(initialPath) {
+                const fileUrl = pathToFileUrl(initialPath);
+                if (!/^file:\/\//i.test(fileUrl)) {
+                    return; // 非本地绝对路径，不设置 base
+                }
+                const s = decodeURI(fileUrl.replace(/^file:\/\//i, ""));
+                const idx = s.lastIndexOf("/");
+                if (idx < 0) {
+                    return;
+                }
+                const base = document.createElement("base");
+                base.href = pathToFileUrl(s.slice(0, idx + 1));
+                document.head.insertBefore(base, document.head.firstChild);
             }
 
             // 支持通过 URL 参数指定初始文件（file:// 协议下可用）
             const params = new URLSearchParams(window.location.search);
             const initialPath = params.get("file");
             if (initialPath) {
-                fetch(initialPath).then((response) => {
+                try {
+                    setBaseToFileDir(initialPath);
+                } catch (error) {
+                    // base 设置失败不阻断后续加载
+                }
+                currentMdDir = undefined; // <base> 生效，图片交给浏览器解析，不计入失败
+                fetch(pathToFileUrl(initialPath)).then((response) => {
                     if (!response.ok) {
                         throw new Error(String(response.status));
                     }
                     return response.text();
                 }).then((text) => {
                     readFileText = text;
-                    const name = initialPath.split("/").pop();
+                    const name = decodeURI(initialPath.split(/[\\/]/).pop() || "");
                     updateFileMeta(name);
                     renderMarkdown();
                 }).catch(() => {
-                    filePathEl.textContent = `加载失败：${initialPath}`;
+                    const name = decodeURI(initialPath.split(/[\\/]/).pop() || String(initialPath));
+                    filePathEl.textContent = `无法直接读取：${name}`;
+                    // file:// 页面 fetch 本地文件被浏览器禁止时，提示用户授权该目录后再读取（需要用户手势）
+                    currentMdDir = null;
+                    showMdOpenFallback(name);
                 });
             }
         })();

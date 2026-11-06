@@ -12,7 +12,7 @@ pptx2md.py                .pptx → .md
 pdf2md.py                 .pdf → .md / .json（本地 OXR 推理，依赖 OXR/）
 fix_punct.py              .md 标点修正（英文标点 → 中文标点）
 normalize_docx.py         .docx 格式标准化（主题字体、字号行距、标题多级列表）
-mdviewer.html             独立的 Markdown 查看器（浏览器打开即用，按钮选文件/拖入 .md，配色跟随系统）
+mdviewer.html             独立的 Markdown 查看器（浏览器打开即用，按钮选文件/拖入 .md，配色跟随系统，相对图需在提示条授权所在文件夹一次）
 mdviewer_update_smd.bat   mdviewer.html 的后端渲染组件更新程序
 requirements.txt
 lib/                      mdviewer.html 的后端渲染组件资源库
@@ -26,7 +26,7 @@ OXR/
 
 `pdf2md.py` 是 pdf → md/json 的单向转换器（md 之后可以交给 `md2docx.py`）。它自己只负责 CLI、PDF 渲染、本地模型加载和文件输出，版面分析之后的流水线全部复用 `OXR/oxr/pipeline` 里的上游代码。`OXR/` 是从 [SoMarkAI/OXR](https://github.com/SoMarkAI/OXR) 复制的最小运行子集：`oxr/`（去掉 `cli/`、`server/`）加 `services/layout_analyze/dfine_la`，许可证见 `OXR/LICENSE`、`OXR/NOTICE`。模型权重 `OXR/models/OXR-1.0` 不在库里，用 modelscope 或 huggingface-cli 下载。
 
-`mdviewer.html` 使用的渲染程序来自于 [SoMarkAI/SoMarkDownViewer](https://github.com/SoMarkAI/SoMarkDownViewer)，这里只保留最小需要的资源子集：`lib/`（去掉编辑功能）。许可证见 `lib/LICENSE`。
+`mdviewer.html` 使用的渲染程序来自于 [SoMarkAI/SoMarkDownViewer](https://github.com/SoMarkAI/SoMarkDownViewer)，这里只保留最小需要的资源子集：`lib/`（去掉编辑功能）。许可证见 `lib/LICENSE`。本地相对路径图片通过渲染后把 `<img>` 换成 object URL 来显示，详见「环境陷阱」第 17 条。
 
 ## 硬性约束
 
@@ -165,6 +165,14 @@ modelscope download SoMark/OXR-1.0 --local_dir ./OXR/models/OXR-1.0
 - **合批要按「预估输出长度」挑，不能让短请求陪跑**（`_length_hint` / `_best_length_group`）。一批里的行同步推进，解码步数等于最长那条的输出长度，短请求全程陪跑。hint 用裁切像素面积估识别长度、用提示词长度估阅读序长度，按 hint 排序后用 DP 把序列切成若干**连续**的组（每组代价 = 组内最大 hint，组大小 ∈ [`batch_size`/2, `batch_size`]），每次只交出一组。两条约束：
   - hint 只能用于排序，不能进 `key`。进了 key 就会把同类拆成许多小批，预填充反而更贵。
   - 「攒批」要等到队列这一波到齐：一个 chunk 的识别请求几乎同时到达，判据是「队列连着 30 ms 没再增长」或够两批。只看是否凑满一批的话，第一批永远是从最先到的 16 条里硬凑，DP 没有选择余地。
+
+### 17. `mdviewer.html` 里本地相对图的三个坑
+
+`mdviewer.html` 直接在浏览器里跑，本地图片受文件系统访问权限限制，这几个点都实际踩过：
+
+- **图片 destination 带空格时不发 `<img>`**。SoMarkDown（markdown-it）按 CommonMark 解析，`![](./名字 带空格_media/a.png)` 会被当普通文字输出，图片整个不显示。`encodeImageDestinations()` 在渲染前把空格统一编码成 `%20`（跳过代码块、已是 `<...>` 的 destination 以及可选的 `"title"`），`render()` 传它的返回值。pdf2md/docx2md 输出目录名几乎都带空格（中文 + 空格），别把这个预处理拿掉。
+- **浏览器拿不到被打开本地文件的绝对路径**，相对图无法解析到 md 旁边的目录，只能在渲染后把 `<img src>` 换成 object URL：先建「相对路径 → File」索引，再读取并 `createObjectURL`。`img` 原始 src 存在 `dataset.origSrc` 里，重复解析时用它而不是 `img.currentSrc`（否则上次换的 blob: 会被当原始地址）。按 md 目录拼完还找不到时退化按文件名匹配。
+- **file:// 页面 fetch(file://) 被 Chromium 禁止**。`?file=` 指定本地 md 会加载失败，只能在失败后弹提示条，等用户手势点「授权并打开…」选一次 md 所在文件夹再读取——不弹出来就永远打不开，别改回纯直载。另外：drop 删除了文件夹遍历，只收 `.md`/`.smd`/`.txt` 文件本身，文件夹拖放会给出明确提示；之前遍历目录树的实现有边界情况（md 不在文件夹根层或 `webkitGetAsEntry` 返回 null 时会静默打不开），别把它加回去。
 
 ## 改完自检
 

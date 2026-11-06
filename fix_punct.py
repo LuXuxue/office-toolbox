@@ -14,6 +14,10 @@
   方向用错(如 ““ 或 ””)也会纠正;英文段落中的引号不动;
 - 公式($...$、$$...$$)、代码(``` … ``` 与 `...`)、
   URL 与链接地址、代码块中的标点一律不替换。
+- 自动替换计量单位等写法（如 m3/h → m³/h），
+  同样只作用于未受保护的区域;
+- 自动替换用到 UTF-8 字符(如 ³ ₂),
+  非 UTF-8 编码的 md 文件会先自动转换为 UTF-8 再处理(原来就是则跳过)。
 """
 
 import re
@@ -29,6 +33,19 @@ ZP_MAP = {
     '(': '（',
     ')': '）',
 }
+
+# 自动替换表：(原文, 替换文)，按顺序应用
+_REPLACEMENTS = [
+    ('m3/', 'm³/'),
+    ('m2/', 'm²/'),
+    ('/m3', '/m³'),
+    ('/m2', '/m²'),
+    ('km2', 'km²'),
+    ('BOD5', 'BOD₅'),
+    ('NH3', 'NH₃'),
+    ('H2S', 'H₂S'),
+    ('CO2', 'CO₂'),
+]
 
 # 这些收尾字符后面允许接中文句号
 ZH_BOUNDARY = '")]】》”’"”'
@@ -86,6 +103,32 @@ def merge_spans(spans):
     return out
 
 
+def _apply_replacements_to_seg(seg):
+    """对一段文本按顺序应用自动替换表。"""
+    for old, new in _REPLACEMENTS:
+        if old in seg:
+            seg = seg.replace(old, new)
+    return seg
+
+
+def apply_replacements(line):
+    """对行中未受保护的部分做自动替换。
+
+    公式、代码、URL、链接地址里的原文保持不变(比如 LaTeX 里的 CO2 不能变成 CO₂)。
+    """
+    prot = merge_spans(protected_spans(line))
+    if not prot:
+        return _apply_replacements_to_seg(line)
+    parts = []
+    last = 0
+    for s, e in prot:
+        parts.append(_apply_replacements_to_seg(line[last:s]))
+        parts.append(line[s:e])
+        last = e
+    parts.append(_apply_replacements_to_seg(line[last:]))
+    return ''.join(parts)
+
+
 def fix_line(line, in_code_fence, quote_depth):
     """处理单行。quote_depth 为当前未闭合的引号数(跨行保持)。
 
@@ -93,6 +136,10 @@ def fix_line(line, in_code_fence, quote_depth):
     """
     if in_code_fence:
         return line, quote_depth
+
+    # 自动替换(计量单位等)，必须在受保护区间断开后只替换未受保护部分；
+    # 替换会改变长度，后面的 protected_spans 要在替换后的行上重新计算
+    line = apply_replacements(line)
 
     prot = merge_spans(protected_spans(line))
     mask = [False] * len(line)
@@ -173,21 +220,49 @@ def fix_text(text):
     return '\n'.join(out)
 
 
+def read_text_auto(path):
+    """读取文本并检测编码，返回 (文本, 是否原本就是 UTF-8)。
+
+    依次尝试 UTF-8、GB18030(GBK 的超集，覆盖中文 Windows 常见编码)。
+    """
+    with open(path, 'rb') as f:
+        raw = f.read()
+    try:
+        return raw.decode('utf-8'), True
+    except UnicodeDecodeError:
+        pass
+    try:
+        return raw.decode('gb18030'), False
+    except UnicodeDecodeError:
+        raise ValueError('无法识别的编码(既不是 UTF-8 也不是 GBK/GB18030)')
+
+
 def main():
     if len(sys.argv) < 2:
         print('用法: python fix_punct.py 文件1.md [文件2.md ...]')
         return 1
+    rc = 0
     for path in sys.argv[1:]:
-        with open(path, 'r', encoding='utf-8', newline='') as f:
-            text = f.read()
+        try:
+            text, is_utf8 = read_text_auto(path)
+        except (OSError, ValueError) as e:
+            print(f'读取失败: {path}: {e}')
+            rc = 1
+            continue
+        if not is_utf8:
+            # 自动替换用到 UTF-8 字符，先把文件转码为 UTF-8（保留原行尾），再进入处理流程
+            with open(path, 'wb') as f:
+                f.write(text.encode('utf-8'))
+            print(f'已转换为 UTF-8: {path}')
         new_text = fix_text(text)
         if new_text == text:
-            print(f'无变化: {path}')
+            if is_utf8:
+                print(f'无变化: {path}')
         else:
             with open(path, 'w', encoding='utf-8', newline='') as f:
                 f.write(new_text)
             print(f'已更新: {path}')
-    return 0
+    return rc
 
 
 if __name__ == '__main__':

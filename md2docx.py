@@ -24,8 +24,11 @@ import urllib.parse
 from docx import Document
 from docx.enum.style import WD_STYLE_TYPE
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
+from docx.opc.packuri import PackURI
 from docx.oxml.ns import qn
-from docx.shared import Inches, RGBColor
+from docx.oxml.shape import CT_Inline
+from docx.parts.image import ImagePart
+from docx.shared import Emu, Inches, RGBColor
 from docx.oxml import OxmlElement
 
 
@@ -187,6 +190,97 @@ def _add_hyperlink(para, url, write_text):
         run.style = _HYPERLINK_STYLE_NAME
 
 
+# WMF/EMF 是矢量图，python-docx 的 add_picture 依赖 PIL，识别不了会抛异常。
+# 这里手动建图片部件（image/x-wmf / image/x-emf），拼 w:drawing 插入。
+_METAFILE_CONTENT_TYPES = {
+    'wmf': 'image/x-wmf',
+    'emf': 'image/x-emf',
+}
+
+
+def _metafile_size_emu(blob):
+    """从 WMF/EMF 文件头解析原生尺寸，返回 (宽EMU, 高EMU)；解析失败返回 (None, None)。
+
+    依次尝试 EMF+（GDI+）、标准 EMF、可放置 WMF 三种头格式。
+    有些真实文件头损坏（如 EMF+ 包围盒全 0），此时只能靠调用方兜底。
+    """
+    import struct
+
+    def _ok(w_mm, h_mm):
+        # 只信 0.1mm ~ 2000mm 范围，超出视为头不可信
+        if 0.1 < w_mm < 2000 and 0.1 < h_mm < 2000:
+            return int(w_mm * 360000), int(h_mm * 360000)
+        return None, None
+
+    if len(blob) < 44:
+        return None, None
+    try:
+        # EMF+（GDI+）：首记录 iType=108，rglFrame 在偏移 24，单位 0.01mm
+        if struct.unpack_from('<I', blob, 4)[0] == 108:
+            fl, ft, fr, fb = struct.unpack_from('<4f', blob, 24)
+            return _ok((fr - fl) / 100.0, (fb - ft) / 100.0)
+        # 标准 EMF：Type=1, Size=88，rclFrame 在偏移 28，单位 1/8192 mm
+        if struct.unpack_from('<2I', blob, 0) == (1, 88):
+            fl, ft, fr, fb = struct.unpack_from('<4i', blob, 28)
+            return _ok((fr - fl) / 8192.0, (fb - ft) / 8192.0)
+        # 可放置 WMF：魔数 0x9AC6CDD7，bbox 在偏移 4..11（int16），单位 0.01mm
+        if struct.unpack_from('<I', blob, 0)[0] == 0x9AC6CDD7:
+            l, t, r, b = struct.unpack_from('<4h', blob, 4)
+            return _ok((r - l) / 100.0, (b - t) / 100.0)
+    except Exception:
+        pass
+    return None, None
+
+
+def _insert_metafile(para, path, src):
+    """插入 WMF/EMF 图片，绕过 python-docx 基于 PIL 的 add_picture。
+
+    成功返回 True，失败返回 False（由调用方回退为原文）。
+    """
+    ext = os.path.splitext(path)[1].lower().lstrip('.')
+    content_type = _METAFILE_CONTENT_TYPES.get(ext)
+    if content_type is None:
+        return False
+    with open(path, 'rb') as f:
+        blob = f.read()
+
+    cx, cy = _metafile_size_emu(blob)
+    if cx is None:
+        # 头不可信时按版心宽 4:3 兜底，Word 里仍可手动调整
+        cx = _CONTENT_WIDTH if _CONTENT_WIDTH else Emu(5400000)  # 15cm
+        cy = int(cx * 3 / 4)
+    cx, cy = int(cx), int(cy)
+
+    # 生成不占用的部件号（沿用 python-docx 的 imageN.ext 命名）
+    package = para.part.package
+    used = {p.partname.idx for p in package.image_parts}
+    n = 1
+    while n in used:
+        n += 1
+    partname = PackURI('/word/media/image%d.%s' % (n, ext))
+    # 注意：ImagePart 第 4 个参数是 image（Image 对象或 None），不是 package
+    image_part = ImagePart(partname, content_type, blob)
+    package.image_parts.append(image_part)
+    r_id = para.part.relate_to(image_part, RT.IMAGE)
+
+    shape_id = para.part.next_id
+    filename = os.path.basename(path)
+    inline = CT_Inline.new_pic_inline(shape_id, r_id, filename, cx, cy)
+    run = para.add_run()
+    run._r.add_drawing(inline)
+
+    # 过宽时缩到版心宽内（与位图同逻辑）
+    if _CONTENT_WIDTH and cx > _CONTENT_WIDTH:
+        ratio = _CONTENT_WIDTH / cx
+        cx2, cy2 = int(cx * ratio), int(cy * ratio)
+        inline.extent.cx = cx2
+        inline.extent.cy = cy2
+        pic_spPr = inline.graphic.graphicData.pic.spPr
+        pic_spPr.cx = cx2
+        pic_spPr.cy = cy2
+    return True
+
+
 def _add_image_run(para, src, alt=''):
     """插入图片；找不到文件时把原始 Markdown 写成文字，绝不静默吞掉
 
@@ -205,10 +299,15 @@ def _add_image_run(para, src, alt=''):
         para.add_run(raw)
         print(f'警告: 图片不存在，按原文保留: {src}', file=sys.stderr)
         return
+    # WMF/EMF 走自定义插入路径（add_picture 不支持）
+    if os.path.splitext(path)[1].lower() in ('.wmf', '.emf'):
+        if _insert_metafile(para, path, src):
+            return
+        # 失败则继续往下，add_picture 会抛异常并回退原文
     try:
         shape = para.add_run().add_picture(path)
     except Exception as e:
-        # EMF/WMF 等 python-docx 不支持的格式，退回原文，别丢内容
+        # 其它 python-docx 不支持的格式，退回原文，别丢内容
         para.add_run(raw)
         print(f'警告: 图片插入失败 {src}: {e}', file=sys.stderr)
         return

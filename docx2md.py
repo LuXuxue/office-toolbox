@@ -37,10 +37,11 @@ from docx.text.paragraph import Paragraph
 @dataclass
 class Block:
     """内容块，按文档顺序排列"""
-    type: str  # "paragraph" / "table"
+    type: str  # "paragraph" / "table" / "html_table"
     text: str = ""
     headers: list = field(default_factory=list)
     rows: list = field(default_factory=list)
+    html: str = ""  # html_table 的完整 <table>…</table> 文本
     numbered: bool = False  # 段落本身带编号（标题/列表），合并时不可与邻段粘连
     explicit_body: bool = False  # 显式声明为「正文」（outlineLvl >= 9），不可再按文字猜成标题
 
@@ -597,7 +598,13 @@ def render(blocks) -> str:
 
 
 def _render_table(block: Block):
-    """将 Table Block 渲染为 GFM 表格语法"""
+    """将 Table Block 渲染为 GFM 表格或 HTML 表格
+
+    有合并单元格的表格保留原始网格，用 <table>/<tr>/<td> 写出来（rowspan、
+    colspan 才不会在拍平后丢失）；普通表格仍用 GFM，读起来更省事。
+    """
+    if block.html:
+        return block.html.splitlines()
     if not block.headers and not block.rows:
         return []
 
@@ -1832,9 +1839,25 @@ def parse_docx(path: str) -> list:
             ))
         else:
             data = _extract_table_grid(elm, doc)
-            headers, rows = process_table_data(data, _table_header_flags(elm))
-            if headers and rows:
-                blocks.append(Block(type="table", headers=headers, rows=rows))
+            header_flags = _table_header_flags(elm)
+            if _table_has_merge(elm):
+                # 合并单元格无法用 GFM 表达，保留原始网格写成 HTML。
+                # 表头只认 Word 的「重复标题行」标记，不按内容猜：
+                # 合并表头被拍平后列覆盖不全，猜出来的结果不可靠。
+                header_rows = 0
+                for flag in header_flags:
+                    if not flag:
+                        break
+                    header_rows += 1
+                if header_rows >= len(header_flags):
+                    header_rows = 0
+                html = _render_html_table(elm, doc, header_rows)
+                if html:
+                    blocks.append(Block(type="html_table", html=html))
+            else:
+                headers, rows = process_table_data(data, header_flags)
+                if headers and rows:
+                    blocks.append(Block(type="table", headers=headers, rows=rows))
 
     blocks = merge_consecutive_tables(blocks)
     blocks = merge_broken_paragraphs(blocks)
@@ -2369,6 +2392,104 @@ def _table_grid_cols(tbl) -> int:
     return 0
 
 
+def _table_has_merge(tbl) -> bool:
+    """表格里是否有横向或纵向合并单元格"""
+    for tr in _table_rows(tbl):
+        for tc in tr.findall(qn('w:tc')):
+            tcpr = tc.find(qn('w:tcPr'))
+            if tcpr is None:
+                continue
+            if tcpr.find(qn('w:vMerge')) is not None:
+                return True
+            gs = tcpr.find(qn('w:gridSpan'))
+            if gs is not None:
+                try:
+                    if int(gs.get(qn('w:val'), '1')) > 1:
+                        return True
+                except ValueError:
+                    pass
+    return False
+
+
+def _html_escape_cell(text: str) -> str:
+    """单元格文本转成 HTML 片段：特殊字符转义，换行写成 <br>"""
+    text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    return text.replace('\n', '<br>')
+
+
+def _render_html_table(tbl, doc, header_rows: int = 0) -> str:
+    """把带合并单元格的表格写成 HTML
+
+    不复用 _extract_table_grid：那里会把 rowspan 的续行文字补进每一行、
+    把 colspan 拆成空格子，正好丢掉 HTML 需要的合并信息。这里按原始
+    w:tc 顺序摆放，保留 gridSpan / vMerge。
+    """
+    rows = []
+    for tr in _table_rows(tbl):
+        cells = []
+        col = 0
+        for tc in tr.findall(qn('w:tc')):
+            tcpr = tc.find(qn('w:tcPr'))
+            span = 1
+            vstate = 'none'
+            if tcpr is not None:
+                gs = tcpr.find(qn('w:gridSpan'))
+                if gs is not None:
+                    try:
+                        span = max(int(gs.get(qn('w:val'), '1')), 1)
+                    except ValueError:
+                        span = 1
+                vm = tcpr.find(qn('w:vMerge'))
+                if vm is not None:
+                    vstate = 'restart' if vm.get(qn('w:val')) == 'restart' else 'continue'
+            cells.append({
+                'col': col,
+                'span': span,
+                'v': vstate,
+                'text': _tc_text(tc, doc),
+                'rowspan': 1,
+            })
+            col += span
+        if cells:
+            rows.append(cells)
+
+    if not rows:
+        return ''
+
+    # vMerge 的续行单元格只记录在下方各行里，rowspan 要从 restart 往下数
+    for r, row in enumerate(rows):
+        for cell in row:
+            if cell['v'] != 'restart':
+                continue
+            for r2 in range(r + 1, len(rows)):
+                cont = next((c for c in rows[r2]
+                             if c['col'] == cell['col'] and c['v'] == 'continue'), None)
+                if cont is None:
+                    break
+                cell['rowspan'] += 1
+
+    header_rows = max(0, min(header_rows, len(rows)))
+    lines = ['<table>']
+    for r, row in enumerate(rows):
+        lines.append('<tr>')
+        tag = 'th' if r < header_rows else 'td'
+        for cell in row:
+            # 续行单元格由上面 restart 单元格的 rowspan 覆盖，不再单独输出
+            if cell['v'] == 'continue':
+                continue
+            attrs = ''
+            if cell['rowspan'] > 1:
+                attrs += f' rowspan="{cell["rowspan"]}"'
+            if cell['span'] > 1:
+                attrs += f' colspan="{cell["span"]}"'
+            text = _html_escape_cell(cell['text'])
+            lines.append(f'<{tag}{attrs}>{text}</{tag}>')
+        lines.append('</tr>')
+    lines.append('</table>')
+    return '\n'.join(lines)
+
+
 def _table_header_flags(tbl) -> list:
     """逐行读取 Word 的「重复标题行」标记
 
@@ -2383,10 +2504,14 @@ def _table_header_flags(tbl) -> list:
 
 
 def _tc_text(tc_element, doc=None) -> str:
-    """提取 tc 元素的文本（含公式的 LaTeX 形式与超链接）"""
+    """提取 tc 元素的文本（含公式的 LaTeX 形式与超链接）
+
+    段落与 w:br 保留为换行：HTML 表格输出要据此写 <br>，GFM 表格那条
+    路径会用 _cell_texts()/clean_cell() 把换行折成空格。
+    """
     parts = []
     _collect_cell_text(tc_element, doc, parts)
-    return "".join(parts)
+    return "".join(parts).strip("\n")
 
 
 def _collect_cell_text(parent, doc, parts):
@@ -2426,6 +2551,10 @@ def _collect_cell_text(parent, doc, parts):
             branch = _mc_branch(child)
             if branch is not None:
                 parts.append(_drawing_text(branch, doc))
+        elif tag == qn('w:p'):
+            # 单元格里的多个段落用换行分隔（HTML 表格会写成 <br>）
+            _collect_cell_text(child, doc, parts)
+            parts.append("\n")
         else:
             # 段落、行、单元格、嵌套表格等容器继续往下找
             _collect_cell_text(child, doc, parts)
@@ -2442,6 +2571,10 @@ def _collect_cell_run_text(r_element, doc, parts):
         tag = node.tag
         if tag == qn('w:t'):
             parts.append(node.text or "")
+        elif tag in (qn('w:br'), qn('w:cr')):
+            parts.append(_render_break(node))
+        elif tag == qn('w:tab'):
+            parts.append(" ")
         elif tag in (_m('oMath'), _m('oMathPara')):
             parts.append(_render_cell_math(node))
         elif tag in (qn('w:drawing'), qn('w:pict'), qn('w:object')):

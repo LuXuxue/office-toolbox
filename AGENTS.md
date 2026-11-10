@@ -22,7 +22,7 @@ OXR/
   models/OXR-1.0/             模型权重（gitignore，自行下载）
 ```
 
-`docx2md.py` 与 `md2docx.py` 是**单向转换器**，`md2docx.py` 的公式转换器专门服务于 `docx2md.py` 的 LaTeX 输出。改动一侧的输出格式，另一侧必须同步跟上，否则往返会静默损坏。`docx2pdf.py` 只负责调用本机 Microsoft Word 导出 PDF，不参与 Markdown 往返。`pptx2md.py` 只做 pptx → md，目前没有反向脚本，不改动上面这对往返。`fix_punct.py` 做 md 的标点修正（中文文本里夹杂的英文标点替换为中文标点，含英文括号 `()` → `（）`，公式、代码、URL、英文段落不动）并附带计量单位等自动替换（如 m3/h → m³/h，只作用于未受保护的区域；非 UTF-8 编码的 md 先自动转 UTF-8 再处理，原来就是则跳过），是单向后处理，不参与 Markdown 往返。`normalize_docx.py` 只做 docx 的格式标准化（字体：标题黑体/正文宋体、英文 Times New Roman；正文小四 1.5 倍行距、标题 1 小三、标题 2~9 小四；标题 1~9 加粗、无倾斜、段前段后为 0、标题 8/9 居中；多级列表，其中 8/9 级为图表编号；无间隔样式五号 1 倍行距；自动替换，如 m3/h → m³/h），是单向后处理，不参与 Markdown 往返。
+`docx2md.py` 与 `md2docx.py` 是**单向转换器**，`md2docx.py` 的公式转换器专门服务于 `docx2md.py` 的 LaTeX 输出。改动一侧的输出格式，另一侧必须同步跟上，否则往返会静默损坏。`md2docx.py` 除 GFM 表格外还会解析 `pdf2md.py` 输出的 HTML 表格（`table`/`tr`/`td`/`th`、`rowspan`/`colspan`、单元格里的 `br`/`sup`/`sub`），并支持独占两行的 `$$` 围栏公式。`docx2pdf.py` 只负责调用本机 Microsoft Word 导出 PDF，不参与 Markdown 往返。`pptx2md.py` 只做 pptx → md，目前没有反向脚本，不改动上面这对往返。`fix_punct.py` 做 md 的标点修正（中文文本里夹杂的英文标点替换为中文标点，含英文括号 `()` → `（）`，公式、代码、URL、英文段落不动）并附带计量单位等自动替换（如 m3/h → m³/h，只作用于未受保护的区域；非 UTF-8 编码的 md 先自动转 UTF-8 再处理，原来就是则跳过），是单向后处理，不参与 Markdown 往返。`normalize_docx.py` 只做 docx 的格式标准化（字体：标题黑体/正文宋体、英文 Times New Roman；正文小四 1.5 倍行距、标题 1 小三、标题 2~9 小四；标题 1~9 加粗、无倾斜、段前段后为 0、标题 8/9 居中；多级列表，其中 8/9 级为图表编号；无间隔样式五号 1 倍行距；自动替换，如 m3/h → m³/h），是单向后处理，不参与 Markdown 往返。
 
 `pdf2md.py` 是 pdf → md/json 的单向转换器（md 之后可以交给 `md2docx.py`）。它自己只负责 CLI、PDF 渲染、本地模型加载和文件输出，版面分析之后的流水线全部复用 `OXR/oxr/pipeline` 里的上游代码。`OXR/` 是从 [SoMarkAI/OXR](https://github.com/SoMarkAI/OXR) 复制的最小运行子集：`oxr/`（去掉 `cli/`、`server/`）加 `services/layout_analyze/dfine_la`，许可证见 `OXR/LICENSE`、`OXR/NOTICE`。模型权重 `OXR/models/OXR-1.0` 不在库里，用 modelscope 或 huggingface-cli 下载。
 
@@ -177,6 +177,11 @@ modelscope download SoMark/OXR-1.0 --local_dir ./OXR/models/OXR-1.0
 - **图片 destination 带空格时不发 `<img>`**。SoMarkDown（markdown-it）按 CommonMark 解析，`![](./名字 带空格_media/a.png)` 会被当普通文字输出，图片整个不显示。`encodeImageDestinations()` 在渲染前把空格统一编码成 `%20`（跳过代码块、已是 `<...>` 的 destination 以及可选的 `"title"`），`render()` 传它的返回值。pdf2md/docx2md 输出目录名几乎都带空格（中文 + 空格），别把这个预处理拿掉。
 - **浏览器拿不到被打开本地文件的绝对路径**，相对图无法解析到 md 旁边的目录，只能在渲染后把 `<img src>` 换成 object URL：先建「相对路径 → File」索引，再读取并 `createObjectURL`。`img` 原始 src 存在 `dataset.origSrc` 里，重复解析时用它而不是 `img.currentSrc`（否则上次换的 blob: 会被当原始地址）。按 md 目录拼完还找不到时退化按文件名匹配。
 - **file:// 页面 fetch(file://) 被 Chromium 禁止**。`?file=` 指定本地 md 会加载失败，只能在失败后弹提示条，等用户手势点「授权并打开…」选一次 md 所在文件夹再读取——不弹出来就永远打不开，别改回纯直载。另外：drop 删除了文件夹遍历，只收 `.md`/`.smd`/`.txt` 文件本身，文件夹拖放会给出明确提示；之前遍历目录树的实现有边界情况（md 不在文件夹根层或 `webkitGetAsEntry` 返回 null 时会静默打不开），别把它加回去。
+
+### 18. `md2docx.py` 的 HTML 表格有两个坑
+
+- **合并单元格要在写内容之前做完**。`python-docx` 的 `cell.merge()` 会把被合并格里的段落一起带进来；先写内容再合并容易留下重复段落。现在的顺序是：建空表 → 按 `rowspan`/`colspan` 合并 → 只往合并后的左上角单元格写内容。
+- **判断「哪些 run 是这次新增的」不能存 `id()`**。lxml 的元素代理对象被回收后 `id` 会复用，`{id(r) for r in para._p.iter(qn('w:r'))}` 会把旧 run 也当成新 run，导致 `<sup>` 的格式扩散到前文、随后又被 `<sub>` 覆盖成下标。必须 `set(para._p.iter(qn('w:r')))` 直接存元素本身。
 
 ## 改完自检
 

@@ -21,6 +21,7 @@ import os
 import argparse
 import glob
 import urllib.parse
+from html.parser import HTMLParser
 from docx import Document
 from docx.enum.style import WD_STYLE_TYPE
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
@@ -91,7 +92,63 @@ def _add_formatted_text(para, text):
             if _looks_like_math(body):
                 add_inline_math(para, body)
                 continue
-        _add_text_segment(para, segment)
+        _add_html_segment(para, segment)
+
+
+def _add_html_segment(para, text):
+    """写入公式以外的文本，识别 <br>、<sup>、<sub> 等行内 HTML 标签"""
+    pos = 0
+    for m in _HTML_INLINE_RE.finditer(text):
+        if m.start() > pos:
+            _add_text_segment(para, text[pos:m.start()])
+
+        if m.group('code') is not None:
+            # 代码段交给 _add_text_segment，里面的标签保持原样
+            _add_text_segment(para, m.group('code'))
+        elif m.group('br') is not None:
+            para.add_run().add_break()
+        elif m.group('sup') is not None:
+            _add_html_styled(para, m.group('sup_t'), 'superscript')
+        elif m.group('sub') is not None:
+            _add_html_styled(para, m.group('sub_t'), 'subscript')
+        elif m.group('b') is not None:
+            _add_html_styled(para, m.group('b_t'), 'bold')
+        elif m.group('i') is not None:
+            _add_html_styled(para, m.group('i_t'), 'italic')
+        elif m.group('u') is not None:
+            _add_html_styled(para, m.group('u_t'), 'underline')
+        # skip 分支不再输出任何内容
+
+        pos = m.end()
+
+    if pos < len(text):
+        _add_text_segment(para, text[pos:])
+
+
+def _add_html_styled(para, text, attr):
+    """把一段 HTML 标签内的文字写上，并给新增的 run 套上对应格式
+
+    标签里可能还有 **粗体**、$公式$ 或嵌套的 <sup>，所以先按正常流程写，
+    再只给这段里新增的 run 加格式；w:hyperlink 里的 run 也要算进来。
+    """
+    from docx.text.run import Run
+    # 用元素本身而不是 id()：lxml 的代理对象被回收后 id 会复用，比对会全部错位
+    before = set(para._p.iter(qn('w:r')))
+    _add_formatted_text(para, text)
+    for r in para._p.iter(qn('w:r')):
+        if r in before:
+            continue
+        run = Run(r, para)
+        if attr == 'bold':
+            run.bold = True
+        elif attr == 'italic':
+            run.italic = True
+        elif attr == 'underline':
+            run.font.underline = True
+        elif attr == 'superscript':
+            run.font.superscript = True
+        elif attr == 'subscript':
+            run.font.subscript = True
 
 
 def _add_mono_run(para, text):
@@ -116,6 +173,26 @@ _IMAGE_PATTERN = (r'!\[(?P<img_alt>[^\]]*)\]'
 # 代码段、图片与链接按出现顺序匹配：`代码` 里的记号保持原样，
 # 链接文字里的 `代码` 则在递归处理链接文字时识别
 _INLINE_TOKEN_RE = re.compile(r'`[^`]+`|' + _IMAGE_PATTERN + r'|' + _LINK_PATTERN)
+
+# pdf2md 的表格和正文里会夹带 HTML 行内标签。公式在 _add_formatted_text 里
+# 已经先被切走，这里只处理公式之外的文本；代码段整体放过，避免 `a<br>b`
+# 这种示例被当成真正的换行。
+_HTML_INLINE_RE = re.compile(
+    r'(?P<code>`[^`]*`)'
+    r'|(?P<br><br\s*/?>)'
+    r'|(?P<sup><sup\b[^>]*>(?P<sup_t>.*?)</sup\s*>)'
+    r'|(?P<sub><sub\b[^>]*>(?P<sub_t>.*?)</sub\s*>)'
+    r'|(?P<b><(?:b|strong)\b[^>]*>(?P<b_t>.*?)</(?:b|strong)\s*>)'
+    r'|(?P<i><(?:i|em)\b[^>]*>(?P<i_t>.*?)</(?:i|em)\s*>)'
+    r'|(?P<u><u\b[^>]*>(?P<u_t>.*?)</u\s*>)'
+    # 其余已知标签直接丢掉（span/div/td…），只保留里面的文字；
+    # 只认常见 HTML 标签名，避免把正文里的「a<b」误当成标签吞掉
+    r'|(?P<skip></?(?:span|div|p|a|font|center|small|big|code|pre|s|del|'
+    r'ins|mark|em|strong|b|i|u|td|th|tr|table|thead|tbody|tfoot|caption|'
+    r'colgroup|col|ul|ol|li|blockquote|h[1-6])\b[^<>]*>)',
+    re.IGNORECASE | re.DOTALL,
+)
+
 
 # 转换过程中的上下文：md 所在目录（解析相对图片路径）与版心宽度（大图缩放）
 _BASE_DIR = None
@@ -387,6 +464,204 @@ def _add_formatted_runs(para, text):
         para.add_run(text[pos:])
 
 
+# ══════════════════════════════════════════════════════════════════
+# HTML 表格（pdf2md 的输出）
+#
+# pdf2md 会把表格直接写成 <table><tr><td>…，并带 rowspan/colspan。
+# 这里把它还原成真正的 Word 表格，合并单元格，单元格里的 <br>/<sup>/<sub>
+# 继续交给行内解析处理。
+# ══════════════════════════════════════════════════════════════════
+
+class _HtmlCell:
+    """一个 HTML 单元格：内容、跨行/跨列数与是否为表头"""
+    __slots__ = ('text', 'rowspan', 'colspan', 'header')
+
+    def __init__(self, text, rowspan=1, colspan=1, header=False):
+        self.text = text
+        self.rowspan = rowspan
+        self.colspan = colspan
+        self.header = header
+
+
+class _HtmlTableParser(HTMLParser):
+    """从 <table>…</table> 里取出各行、各单元格
+
+    单元格内容保留行内标签的原文（<br>、<sup>、<sub>…），后面统一按
+    行内 HTML 处理；convert_charrefs=True 会把 &lt; &gt; &amp; 还原成字符。
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.rows = []
+        self._depth = 0
+        self._row = None
+        self._cell = None
+        self._parts = []
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag == 'table':
+            self._depth += 1
+            return
+        if self._depth == 0:
+            return
+        if tag == 'tr':
+            self._end_row()
+            self._row = []
+            return
+        if tag in ('td', 'th'):
+            self._end_cell()
+            if self._row is None:
+                self._row = []
+            attr_map = {k.lower(): v for k, v in attrs}
+            self._cell = (
+                _span(attr_map.get('rowspan')),
+                _span(attr_map.get('colspan')),
+                tag == 'th',
+            )
+            self._parts = []
+            return
+        if self._cell is not None:
+            # 保留行内标签原文，别把 <br> 的换行语义提前丢掉
+            self._parts.append(self.get_starttag_text() or '')
+
+    def handle_startendtag(self, tag, attrs):
+        if self._depth and self._cell is not None:
+            self._parts.append(self.get_starttag_text() or '<%s/>' % tag)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag == 'table':
+            if self._depth:
+                self._depth -= 1
+            return
+        if self._depth == 0:
+            return
+        if tag in ('td', 'th'):
+            self._end_cell()
+            return
+        if tag == 'tr':
+            self._end_row()
+            return
+        if self._cell is not None:
+            self._parts.append('</%s>' % tag)
+
+    def handle_data(self, data):
+        if self._depth and self._cell is not None:
+            self._parts.append(data)
+
+    def _end_cell(self):
+        if self._cell is None:
+            return
+        if self._row is None:
+            self._row = []
+        text = ''.join(self._parts)
+        # HTML 里源码换行只是空白；<br> 已经在 parts 里，不会被压掉
+        text = re.sub(r'[ \t\r\n\f\v]+', ' ', text).strip()
+        text = text.replace('\xa0', ' ')
+        rowspan, colspan, header = self._cell
+        self._row.append(_HtmlCell(text, rowspan, colspan, header))
+        self._cell = None
+        self._parts = []
+
+    def _end_row(self):
+        self._end_cell()
+        if self._row:
+            self.rows.append(self._row)
+        self._row = None
+
+
+def _span(value):
+    """rowspan/colspan 属性值，最小为 1"""
+    try:
+        return max(int(value or '1'), 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _html_table_layout(rows):
+    """按 rowspan/colspan 把单元格摆到网格里
+
+    返回 (行数, 列数, [(行, 列, 单元格, 跨行数, 跨列数, 是否完整占据)]）。
+    被上面行的 rowspan 占住的位置要跳过，后一行的单元格不能叠上去。
+    """
+    occupied = {}
+    placements = []
+    for r, row in enumerate(rows):
+        c = 0
+        for cell in row:
+            while (r, c) in occupied:
+                c += 1
+            rs = min(cell.rowspan, len(rows) - r)
+            cs = cell.colspan
+            owned = True
+            for dr in range(rs):
+                for dc in range(cs):
+                    key = (r + dr, c + dc)
+                    if key in occupied:
+                        # 表格本身不合法（跨行跨列互相压住）时不要吞掉别人的格子
+                        owned = False
+                        continue
+                    occupied[key] = (r, c)
+            placements.append((r, c, cell, rs, cs, owned))
+            c += cs
+    if not occupied:
+        return 0, 0, []
+    nrows = max(r for r, _ in occupied) + 1
+    ncols = max(c for _, c in occupied) + 1
+    return nrows, ncols, placements
+
+
+def _fill_table_cell(cell, text, header=False):
+    """把单元格内容写进已经合并好的 Word 单元格"""
+    # 合并单元格会把被合并格里的空段落一起带进来，只保留第一个
+    for para in list(cell.paragraphs)[1:]:
+        para._p.getparent().remove(para._p)
+    para = cell.paragraphs[0]
+    if text:
+        _add_formatted_text(para, text)
+    if header:
+        # 链接文字的 run 在 w:hyperlink 里，要走 _iter_runs
+        for run in _iter_runs(para):
+            run.bold = True
+
+
+def _add_html_table(doc, html):
+    """把一段 HTML 表格写成 Word 表格；没有可识别的行时返回 None"""
+    parser = _HtmlTableParser()
+    parser.feed(html)
+    parser.close()
+    rows = parser.rows
+    if not rows:
+        return None
+
+    nrows, ncols, placements = _html_table_layout(rows)
+    if not nrows or not ncols:
+        return None
+
+    table = doc.add_table(rows=nrows, cols=ncols)
+    table.style = 'Table Grid'
+
+    for r, c, cell, rs, cs, owned in placements:
+        target = table.cell(r, c)
+        if owned and (rs > 1 or cs > 1):
+            target = target.merge(table.cell(r + rs - 1, c + cs - 1))
+        _fill_table_cell(target, cell.text, cell.header)
+    return table
+
+
+def _collect_html_table(lines, start):
+    """从 start 行起收集到 </table> 为止；找不到闭合标签时返回 (None, start)"""
+    parts = []
+    i = start
+    while i < len(lines):
+        parts.append(lines[i].rstrip('\n'))
+        if re.search(r'</table\s*>', lines[i], re.IGNORECASE):
+            return '\n'.join(parts), i + 1
+        i += 1
+    return None, start
+
+
 def _link_default_fonts_to_theme(doc):
     """让默认字体跟随主题，参数与 Word 2016 新建文档保持一致"""
     styles_elem = doc.styles.element
@@ -524,6 +799,7 @@ def _mtag(name):
 _LATEX_SYMBOLS = {
     r'\times': '×', r'\cdot': '⋅', r'\div': '÷', r'\pm': '±', r'\mp': '∓',
     r'\leq': '≤', r'\le': '≤', r'\geq': '≥', r'\ge': '≥',
+    r'\leqslant': '≤', r'\geqslant': '≥',
     r'\neq': '≠', r'\approx': '≈', r'\sim': '∼', r'\propto': '∝',
     r'\alpha': 'α', r'\beta': 'β', r'\gamma': 'γ', r'\delta': 'δ',
     r'\varepsilon': 'ε', r'\mu': 'μ', r'\sigma': 'σ', r'\tau': 'τ',
@@ -768,6 +1044,16 @@ class _LatexParser:
 
     def parse_env(self):
         env = self._read_env_name()
+        # array 环境的列格式 {l} 是排版参数，不是单元格内容，跳过后再读行
+        if (env or '').lower() == 'array' and self.peek()[0] == 'open':
+            self.take()
+            depth = 1
+            while depth and self.peek()[0] is not None:
+                kind, _ = self.take()
+                if kind == 'open':
+                    depth += 1
+                elif kind == 'close':
+                    depth -= 1
         # rows: 行 → 单元格 → 节点。& 分列、\\ 换行，两者都必须真的切分：
         # 之前 & 只是被 take() 丢掉，整行节点挤在一个列表里，_m_env 又把这个
         # 列表当成「单元格列表」遍历，于是每个节点变成一个空 <m:e/>，
@@ -1349,6 +1635,21 @@ def convert(md_path, heading_numbering=False):
             i += 1
             continue
 
+        # pdf2md 有时会把表格包在 ```html 围栏里；先按表格处理，别写成代码块
+        if line.strip().lower() in ('```html', '```htm'):
+            j = i + 1
+            parts = []
+            while j < len(lines) and lines[j].strip() != '```':
+                parts.append(lines[j].rstrip('\n'))
+                j += 1
+            block = '\n'.join(parts)
+            if j < len(lines) and '<table' in block.lower():
+                if _add_html_table(doc, block) is not None:
+                    list_level = 0
+                    ol_group_active = False
+                    i = j + 1
+                    continue
+
         if not line.strip():
             list_level = 0
             ol_group_active = False
@@ -1361,6 +1662,15 @@ def convert(md_path, heading_numbering=False):
             ol_group_active = False
             i += 1
             continue
+
+        # HTML 表格：pdf2md 直接输出 <table><tr><td>…，可能跨多行
+        if re.match(r'^\s*<table\b', line, re.IGNORECASE):
+            block, next_i = _collect_html_table(lines, i)
+            if block is not None and _add_html_table(doc, block) is not None:
+                list_level = 0
+                ol_group_active = False
+                i = next_i
+                continue
 
         heading_match = re.match(r'^(#{1,6})\s+(.+)$', line)
         if heading_match:
@@ -1375,8 +1685,37 @@ def convert(md_path, heading_numbering=False):
             i += 1
             continue
 
-        # 块级公式 $$...$$：整行就是一条公式
-        display_match = re.match(r'^\$\$(.+)\$\$\s*$', line.strip())
+        # 块级公式 $$...$$：同一行写完，或者独占一行开头、后面再用 $$ 收尾
+        stripped = line.strip()
+        if stripped.startswith('$$') and not (len(stripped) > 2
+                                              and stripped.endswith('$$')):
+            first = stripped[2:].strip()
+            parts = [first] if first else []
+            j = i + 1
+            closed = False
+            while j < len(lines):
+                s = lines[j].strip()
+                if s == '$$':
+                    closed = True
+                    j += 1
+                    break
+                if s.endswith('$$') and not s.startswith('$$'):
+                    parts.append(s[:-2].strip())
+                    closed = True
+                    j += 1
+                    break
+                parts.append(s)
+                j += 1
+            if closed:
+                para = doc.add_paragraph()
+                add_display_math(para, ' '.join(p for p in parts if p))
+                list_level = 0
+                ol_group_active = False
+                i = j
+                continue
+
+        # 同一行写完的 $$...$$
+        display_match = re.match(r'^\$\$(.+)\$\$\s*$', stripped)
         if display_match:
             para = doc.add_paragraph()
             add_display_math(para, display_match.group(1))

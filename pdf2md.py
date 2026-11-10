@@ -51,7 +51,7 @@ PDF 里的图片导出到同目录的 <文件名>_media/。
                       1 行请求按 16 行做一遍预填充。
     --graph-cache-len 图解码预留的缓存上限（默认：2048）。实际每批按
                       「prompt + 预留」取 256 的整数倍，桶切换时重新捕获。
-                      超出的请求续跑一段或回退到普通生成。
+                      超出的行改由普通 generate 续跑，已结束的行不重跑。
 
 内部还有三处不对外暴露的并行：PDF 按 chunk 懒渲染（渲染与上一块推理重叠，
 不再整本前置渲染）、版面分析预取下一块、视觉塔跑在独立 CUDA 流上与下一批的
@@ -72,6 +72,7 @@ import importlib
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -273,7 +274,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--graph-cache-len", type=int, default=2048,
         help=(
             "图解码预留的 KV 缓存长度（默认：2048）。"
-            "prompt 与生成长度之和超过它时回退到普通生成，"
+            "prompt 与生成长度之和超过它时，没跑完的行改由普通生成续跑，"
             "显存占用约 112 KB/行/千 token"
         ),
     )
@@ -426,6 +427,11 @@ GRAPH_CACHE_RESERVE = 512
 # × 2 字节（bf16）。显存预算和 --graph-cache-len 的说明都用它换算。
 GRAPH_KV_BYTES_PER_TOKEN = 28 * 2 * 8 * 128 * 2
 
+# generate 兜底路径的 KV 显存预算。generate 用的是 DynamicCache，长度随
+# 实际生成量增长：批 16、prompt 1200、生成到 8192 时约 16.8 GB，会把整张卡
+# 吃光，看起来就像卡死。兜底前按这个预算把请求拆成小组，单组不超过它。
+GENERATE_KV_BUDGET_BYTES = 3 * 1024 ** 3
+
 # 攒批的最长等待（秒）。攒满的批能把视觉编码器与预填充的固定开销摊薄，所以
 # 愿意多等一小会儿；但本地生成本来就是瓶颈，密集到一定程度后继续等只会多
 # 添延迟。0.5s 只是上限——真正的停止判据是「队列连着 30 ms 没再增长」
@@ -517,6 +523,107 @@ def _probe_sdpa_gqa(torch, config, device, dtype) -> bool:
         return False
 
 
+# 退化检测：模型偶尔会陷入“数数”或复读。比如公告页末尾的“1、2、3…”，
+# 模型会一路数到上百，直到 8192 token 才停；普通 generate 于是要跑十几分钟，
+# DynamicCache 也跟着把显存吃满。每 128 步检查一次尾部文本，命中就提前结束
+# 这一行、标成 finish_reason=length，交给 recognition 既有的长度恢复
+# （带 repetition_penalty 重跑）——实测同一页从 7 分钟降到十几秒。
+DEGENERATE_CHECK_STEPS = 128
+
+# 复读判定要求重复片段连起来至少这么长（字符）。表格里连续几个空单元格、
+# 目录里的点线都不短，但不会连出两百多个字一模一样。
+DEGENERATE_REPEAT_SPAN = 256
+
+# “数数”退化允许出现的分隔符：除数字外只允许这些字符（以及空白）。
+_NUMBER_LOOP_CHARS = set("、,，.。;；:：/|()（）[]【】<>《》-—_·… \t\r\n")
+_NUMBER_RE = re.compile(r"\d+")
+
+
+def _is_degenerate_text(text: str) -> bool:
+    """判断模型是不是已经陷入复读/数数（只看尾部，避免误伤正常内容）。
+
+    调用方要传末尾 800 token 左右：复读的片段可能很长，窗口太小就凑不满
+    DEGENERATE_REPEAT_SPAN 那么长的重复区域，会漏判。
+    """
+    tail = text[-1200:]
+    # 1) 复读：末尾整段重复同一个片段。周期不能写死：模型复读的片段长短
+    #    不定（GB 50268 第 148 页的表格复读的是 29 字的句子，16/24/32… 这类
+    #    固定周期完全抓不到），所以 16~400 字逐段试。判据是「重复区域连起来
+    #    至少 256 字」：正常表格里连续的空单元格、目录的点线都到不了这个量；
+    #    纯标点的片段直接跳过，免得把点线当复读。
+    longest = min(400, len(tail) // 3)
+    for period in range(16, longest + 1):
+        unit = tail[-period:]
+        if not any(char.isalnum() for char in unit):
+            continue
+        copies = max(3, -(-DEGENERATE_REPEAT_SPAN // period))
+        if period * copies <= len(tail) and tail.endswith(unit * copies):
+            return True
+    # 2) 数数：末尾 50 个数字连续递增（或完全相同），且从这一串的开头到
+    #    结尾除了数字与分隔符没有别的内容。表格里的编号一般不会连续 50 个
+    #    只靠“、”连接，命中基本就是退化。
+    numbers = list(_NUMBER_RE.finditer(tail))
+    if len(numbers) >= 50:
+        run = numbers[-50:]
+        values = [int(match.group()) for match in run]
+        consecutive = all(b == a + 1 for a, b in zip(values, values[1:]))
+        constant = len(set(values)) == 1
+        if consecutive or constant:
+            residue = _NUMBER_RE.sub("", tail[run[0].start():])
+            # 分隔符里必须有标点：纯空格分隔的数字串是阅读序的正常输出
+            # （「0 1 2 3 …」），不能当成退化。
+            if residue.strip() and all(char in _NUMBER_LOOP_CHARS for char in residue):
+                return True
+    return False
+
+
+class _DegenerateLogitsProcessor:
+    """generate 路径的退化处理器：把退化的行就地“掐断”，判据与图解码一致。
+
+    不能用 StoppingCriteria：它只能停整批。批里只要还有一行正常，退化的那行
+    就会陪跑到 max_new_tokens —— 这正是“卡住、显存吃满”的来源。这里改用
+    logits 处理器：某一行出现复读/数数，就把该行下一步强制成 eos，让它单独
+    结束，同批其他行照常生成。
+
+    每 128 步才解码一次尾部（避免每步都分词）；已结束或已判退化的行不再检查。
+    """
+
+    def __init__(self, tokenizer, eos_lookup, eos_id: int) -> None:
+        self.tokenizer = tokenizer
+        self.eos_lookup = eos_lookup
+        self.eos_id = int(eos_id)
+        self.degenerate: List[bool] = []
+        self.steps = 0
+
+    def __call__(self, input_ids, scores):
+        import torch
+
+        rows = int(input_ids.shape[0])
+        if len(self.degenerate) != rows:
+            self.degenerate = [False] * rows
+        self.steps += 1
+        check = self.steps % DEGENERATE_CHECK_STEPS == 0
+        force: List[int] = []
+        for row in range(rows):
+            tokens = input_ids[row, -800:].tolist()
+            if tokens and tokens[-1] in self.eos_lookup:
+                continue
+            if self.degenerate[row]:
+                # 上一步刚判退化，这一步把 eos 塞进去（模型没照做时再压一次）。
+                force.append(row)
+                continue
+            if check and _is_degenerate_text(
+                self.tokenizer.decode(tokens, skip_special_tokens=True)
+            ):
+                self.degenerate[row] = True
+                force.append(row)
+        if force:
+            scores = scores.clone()
+            scores[force] = torch.finfo(scores.dtype).min
+            scores[force, self.eos_id] = 0
+        return scores
+
+
 class GreedyGraphDecoderPool:
     """按 (批大小, 缓存长度) 复用图解码器，避免为每种组合重复捕获。
 
@@ -540,6 +647,7 @@ class GreedyGraphDecoderPool:
     def __init__(
         self,
         llm,
+        tokenizer,
         max_batch: int,
         max_cache_len: int,
         device,
@@ -547,6 +655,7 @@ class GreedyGraphDecoderPool:
         max_entries: int = 4,
     ) -> None:
         self.llm = llm
+        self.tokenizer = tokenizer
         self.max_batch = max(1, int(max_batch))
         self.max_cache_len = max(256, int(max_cache_len))
         self.device = device
@@ -590,7 +699,8 @@ class GreedyGraphDecoderPool:
             return None
         try:
             decoder = GreedyGraphDecoder(
-                self.llm, batch=batch, cache_len=cache_len, device=self.device
+                self.llm, self.tokenizer, batch=batch, cache_len=cache_len,
+                device=self.device,
             )
         except Exception as error:  # noqa: BLE001 - 捕获失败就退回 generate
             LOGGER.warning(
@@ -637,6 +747,7 @@ class GreedyGraphDecoder:
     def __init__(
         self,
         llm,
+        tokenizer,
         batch: int,
         cache_len: int,
         device,
@@ -646,6 +757,7 @@ class GreedyGraphDecoder:
 
         self.torch = torch
         self.llm = llm
+        self.tokenizer = tokenizer
         self.batch = int(batch)
         self.cache_len = int(cache_len)
         self.device = device
@@ -742,10 +854,11 @@ class GreedyGraphDecoder:
         max_new_tokens: int,
         eos_lookup: set,
     ):
-        """返回 (每行的 token 列表, 是否全部正常结束)。
+        """返回 (每行的 token 列表, 是否全部正常结束, 退化的行)。
 
         第二个返回值为 False 表示这批 token 超出了预留的生成长度，调用方应当
-        回退到 transformers.generate 重跑，避免把结果截断。
+        回退到 transformers.generate 续跑，避免把结果截断。退化的行（复读/
+        数数）在检测到的那一步就被截断，避免把后面的重复内容带进结果。
         """
         torch = self.torch
         rows = int(inputs_embeds.shape[0])
@@ -774,7 +887,12 @@ class GreedyGraphDecoder:
 
         produced = 1
         finished = [token in eos_lookup for token in self.first[:rows, 0].tolist()]
+        degenerate = [False] * rows
+        # 图解码里被掐断的行在之后的重放中还会继续写入 history，这里记下
+        # 检测点，返回前把尾巴截掉。
+        stop_at = [0] * rows
         stream = torch.cuda.current_stream(self.device)
+        next_check = DEGENERATE_CHECK_STEPS
         while produced < budget and not all(finished):
             steps = min(GRAPH_CHUNK_STEPS, budget - produced)
             with torch.inference_mode():
@@ -788,10 +906,34 @@ class GreedyGraphDecoder:
             for row in range(rows):
                 if not finished[row]:
                     finished[row] = any(token in eos_lookup for token in fresh[row])
+            if produced >= next_check:
+                # 每 128 步看一次尾部文本：复读/数数就停掉这一行，别让它
+                # 一路顶到 max_new_tokens（那才是显存与耗时的大头）。
+                next_check += DEGENERATE_CHECK_STEPS
+                for row in range(rows):
+                    if finished[row]:
+                        continue
+                    tail = self.history[
+                        row, max(0, produced - 800) : produced
+                    ].tolist()
+                    if _is_degenerate_text(
+                        self.tokenizer.decode(tail, skip_special_tokens=True)
+                    ):
+                        degenerate[row] = True
+                        finished[row] = True
+                        stop_at[row] = produced
+                        if LOGGER.isEnabledFor(logging.DEBUG):
+                            LOGGER.debug(
+                                "图解码第 %d 行在第 %d 步检测到退化，已截断",
+                                row, produced,
+                            )
 
         tokens = self.history[:rows, :produced].tolist()
+        for row in range(rows):
+            if degenerate[row]:
+                tokens[row] = tokens[row][: stop_at[row]]
         complete = all(finished) or produced >= int(max_new_tokens)
-        return tokens, complete
+        return tokens, complete, degenerate
 
     def _capture(self) -> None:
         torch = self.torch
@@ -905,6 +1047,7 @@ class OXRTextBackend:
             try:
                 self.graph_pool = GreedyGraphDecoderPool(
                     self.model.llm,
+                    self.tokenizer,
                     max_batch=max(1, int(graph_batch)),
                     max_cache_len=max(256, int(graph_cache_len)),
                     device=device,
@@ -999,7 +1142,7 @@ class OXRTextBackend:
         inputs_embeds,
         attention_mask,
         row_limits: Sequence[int],
-    ) -> Optional[List[List[int]]]:
+    ) -> Optional[Tuple[List[List[int]], Optional[Tuple[List[int], Any, Any]]]]:
         """用图解码跑完整批；缓存装不下时长出来的行续跑，而不是整批重来。
 
         一批里的行是同步推进的：只要还有一条长请求没结束，整批都得陪着跑，
@@ -1009,8 +1152,11 @@ class OXRTextBackend:
         真正划得来的是只在**缓存装不下**时才续跑：那本来要退回普通 generate
         把整批重跑一遍，代价大得多。
 
-        返回每行的 token 列表；图解码用不上（显存/长度不够）时返回 None，
-        由调用方回退到普通 generate。
+        返回 (每行的 token 列表, residual, 退化行)。residual 为 None 表示整批
+        都已用图解码跑完；否则是 (未完成的行号, 这些行的 embeds, 这些行的
+        mask)，它们已经生成了一部分，只是因为预留缓存装不下，需要调用方用
+        普通 generate 接着跑。退化行是复读/数数被提前停掉的行：它们的 token
+        不完整，调用方应按“达到上限”处理，交给长度恢复重跑。
         """
         torch = self.torch
         pool = self.graph_pool
@@ -1020,6 +1166,7 @@ class OXRTextBackend:
         eos_lookup = self._eos_lookup
         rows = int(inputs_embeds.shape[0])
         tokens: List[List[int]] = [[] for _ in range(rows)]
+        degenerate_rows: set[int] = set()
         active = list(range(rows))
         embeds = inputs_embeds
         mask = attention_mask
@@ -1036,28 +1183,35 @@ class OXRTextBackend:
                 cache_len = pool.cache_bucket(prompt_length, reserve)
                 decoder = pool.acquire(len(active), prompt_length, cache_len)
             if decoder is None or not decoder.supports(prompt_length):
-                LOGGER.debug(
-                    "图解码放弃：行数 %d，prompt %d，缓存 %d",
+                LOGGER.info(
+                    "图解码缓存装不下：%d 行、prompt %d token、缓存 %d，"
+                    "改由 generate 只续跑这些行",
                     len(active), prompt_length, cache_len,
                 )
-                return None
+                return tokens, (active, embeds, mask), degenerate_rows
             budget = max(row_limits[row] - len(tokens[row]) for row in active)
             budget = min(budget, GRAPH_STAGE_STEPS)
             if budget <= 0:
                 break
-            stage, _complete = decoder.decode(embeds, mask, budget, eos_lookup)
+            stage, _complete, degenerate = decoder.decode(
+                embeds, mask, budget, eos_lookup
+            )
 
             pending: List[Tuple[int, int]] = []
             for slot, row in enumerate(active):
                 produced = stage[slot]
                 tokens[row].extend(produced)
+                if degenerate[slot]:
+                    # 复读/数数已经停掉这一行，别再把它送去 generate 陪跑。
+                    degenerate_rows.add(row)
+                    continue
                 if len(tokens[row]) >= row_limits[row]:
                     continue
                 if any(token in eos_lookup for token in produced):
                     continue
                 pending.append((slot, row))
             if not pending:
-                return tokens
+                return tokens, None, degenerate_rows
 
             # 只把没结束的行拼回下一轮：原 prompt 的合法区间（mask 为真的部分）
             # 加上已经生成的前缀，右侧对齐后统一左填充。
@@ -1101,7 +1255,7 @@ class OXRTextBackend:
             embeds, mask = next_embeds, next_mask
             active = [row for _slot, row in pending]
 
-        return tokens
+        return tokens, None, degenerate_rows
 
     # -- 视觉前向与解码拆开，方便两者在两条流上重叠 ------------------------ #
 
@@ -1217,6 +1371,71 @@ class OXRTextBackend:
         # 各组都是原批里连续的一段，直接按顺序拼回整批。
         return torch.cat(parts, dim=0)
 
+    def _generate_rows(
+        self,
+        inputs_embeds,
+        attention_mask,
+        limits: Sequence[int],
+        generation_kwargs: Dict[str, Any],
+    ) -> Tuple[List[List[int]], set[int]]:
+        """普通 generate 兜底；按 KV 显存预算拆组，不让 DynamicCache 吃光显存。
+
+        generate 的缓存随**实际**生成长度增长：批 16、prompt 1200、生成到
+        8192 时约 16.8 GB，会顶满整张卡并触发驱动换页，表现就是“卡住、显存
+        几乎全满”。这里按「prompt + 本组最长行的生成长度」估最坏占用，超过
+        预算就拆成更小的组依次生成。行与行独立，拆组不影响结果。
+
+        返回 (每行的 token 列表, 退化的行号集合)。退化行同样按“达到上限”
+        处理，交给 recognition 的长度恢复重跑。
+        """
+        from transformers import LogitsProcessorList
+
+        torch = self.torch
+        rows = int(inputs_embeds.shape[0])
+        prompt_length = int(attention_mask.shape[1])
+        results: List[List[int]] = []
+        degenerate_rows: set[int] = set()
+        start = 0
+        while start < rows:
+            worst = prompt_length + max(1, int(max(limits[start:])))
+            per_group = GENERATE_KV_BUDGET_BYTES // (
+                worst * GRAPH_KV_BYTES_PER_TOKEN
+            )
+            stop = min(rows, start + max(1, int(per_group)))
+            group_started = time.perf_counter()
+            kwargs = dict(generation_kwargs)
+            kwargs["max_new_tokens"] = max(int(limit) for limit in limits[start:stop])
+            # 没有 eos 就没法在行内“掐断”，此时不做退化检测（只影响耗时）。
+            processor = None
+            if self.eos_token_ids:
+                processor = _DegenerateLogitsProcessor(
+                    self.tokenizer, self._eos_lookup, self.eos_token_ids[-1]
+                )
+                kwargs["logits_processor"] = LogitsProcessorList([processor])
+            with torch.inference_mode():
+                generated = self.model.llm.generate(
+                    inputs=None,
+                    inputs_embeds=inputs_embeds[start:stop],
+                    attention_mask=attention_mask[start:stop],
+                    **kwargs,
+                )
+            results.extend(row.tolist() for row in generated)
+            if processor is not None:
+                for offset, flag in enumerate(processor.degenerate):
+                    if flag:
+                        degenerate_rows.add(start + offset)
+            if LOGGER.isEnabledFor(logging.DEBUG):
+                LOGGER.debug(
+                    "generate 组：第 %d-%d 行，prompt %d，上限 %d，耗时 %.1fs，"
+                    "退化 %s",
+                    start, stop - 1, prompt_length, kwargs["max_new_tokens"],
+                    time.perf_counter() - group_started,
+                    [offset for offset, flag in enumerate(processor.degenerate) if flag]
+                    if processor is not None else "未检测",
+                )
+            start = stop
+        return results, degenerate_rows
+
     def run_batch(
         self,
         batch: Dict[str, Any],
@@ -1255,6 +1474,8 @@ class OXRTextBackend:
         )
         graph_used = False
         tokens_by_row = None
+        residual = None
+        degenerate_rows: set[int] = set()
 
         if self.graph_pool is not None and greedy:
             try:
@@ -1266,20 +1487,30 @@ class OXRTextBackend:
                 LOGGER.warning("CUDA Graph 解码失败，回退到 generate：%s", error)
                 decoded = None
             if decoded is not None:
-                tokens_by_row = decoded
+                tokens_by_row, residual, degenerate_rows = decoded
                 graph_used = True
             elif self.stats is not None:
                 self.stats.add_graph_fallback()
 
         if tokens_by_row is None:
-            with torch.inference_mode():
-                generated = self.model.llm.generate(
-                    inputs=None,
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                    **generation_kwargs,
-                )
-            tokens_by_row = [row.tolist() for row in generated]
+            tokens_by_row, generate_degenerate = self._generate_rows(
+                inputs_embeds, attention_mask, row_limits, generation_kwargs
+            )
+            degenerate_rows.update(generate_degenerate)
+        elif residual is not None:
+            # 只续跑图解码没装下的那几行：它们的 embeds 里已经带了已生成的
+            # 前缀，剩下的上限按各自还差多少算。已经结束的行不重跑。
+            pending_rows, pending_embeds, pending_mask = residual
+            remaining = [
+                max(1, row_limits[row] - len(tokens_by_row[row]))
+                for row in pending_rows
+            ]
+            generated, generate_degenerate = self._generate_rows(
+                pending_embeds, pending_mask, remaining, generation_kwargs
+            )
+            for slot, row in enumerate(pending_rows):
+                tokens_by_row[row].extend(generated[slot])
+            degenerate_rows.update(pending_rows[slot] for slot in generate_degenerate)
 
         results = []
         produced_tokens = 0
@@ -1293,12 +1524,22 @@ class OXRTextBackend:
                     cut = position
                     break
             text = self.tokenizer.decode(tokens[:cut], skip_special_tokens=True)
-            if cut >= row_limit:
+            if row in degenerate_rows:
+                # 复读/数数被提前停掉：token 不完整，按“达到上限”交给
+                # recognition 的长度恢复重跑（带 repetition_penalty）。
+                finish_reason = "length"
+            elif cut >= row_limit:
                 finish_reason = "length"
             else:
                 finish_reason = "stop"
             if finish_reason == "length" and self.stats is not None:
                 self.stats.add_length_hit()
+            if LOGGER.isEnabledFor(logging.DEBUG):
+                LOGGER.debug(
+                    "第 %d 行：%s，%d 字，%.1fs，长 %d，头 %r，尾 %r",
+                    row, finish_reason, len(text),
+                    time.perf_counter() - started, cut, text[:60], text[-120:],
+                )
             produced_tokens += cut
             results.append(ModelOutput(text, finish_reason=finish_reason))
 

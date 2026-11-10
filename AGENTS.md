@@ -165,6 +165,10 @@ modelscope download SoMark/OXR-1.0 --local_dir ./OXR/models/OXR-1.0
 - **合批要按「预估输出长度」挑，不能让短请求陪跑**（`_length_hint` / `_best_length_group`）。一批里的行同步推进，解码步数等于最长那条的输出长度，短请求全程陪跑。hint 用裁切像素面积估识别长度、用提示词长度估阅读序长度，按 hint 排序后用 DP 把序列切成若干**连续**的组（每组代价 = 组内最大 hint，组大小 ∈ [`batch_size`/2, `batch_size`]），每次只交出一组。两条约束：
   - hint 只能用于排序，不能进 `key`。进了 key 就会把同类拆成许多小批，预填充反而更贵。
   - 「攒批」要等到队列这一波到齐：一个 chunk 的识别请求几乎同时到达，判据是「队列连着 30 ms 没再增长」或够两批。只看是否凑满一批的话，第一批永远是从最先到的 16 条里硬凑，DP 没有选择余地。
+- **generate 兜底只续跑没完成的行，退化行要逐行掐断**。图解码装不下预留缓存时不能把整批退回 `generate` 重跑：`DynamicCache` 随**实际**生成长度增长，批 16、生成到 8192 时约 16.8 GB，16 GB 卡直接顶满并触发驱动换页，表现就是「卡住、显存几乎全满」（GB 50268 第 4 页单页实测 424s → 18s，同批 8 页 368s → 27s）。三条约束：
+  - `_graph_decode_rows` 返回 `(tokens, residual, degenerate_rows)`。`residual` 只含没跑完的行（它们的 `embeds` 已经拼好已生成前缀），由 `_generate_rows` 按 `GENERATE_KV_BUDGET_BYTES`（3 GiB）拆组，单组最坏占用不超过预算；已经结束的行不重跑。
+  - 退化检测（模型陷入「1、2、3…」数数或复读）用 `_DegenerateLogitsProcessor`，**不能用 `StoppingCriteria`**：停止条件只能停整批，同批还有正常行时退化行照样陪跑到 `max_new_tokens`。处理器把退化行的下一步强制成 eos，其余行不受影响；退化行标成 `finish_reason="length"`，交给 recognition 既有的 repetition_penalty 恢复重跑。
+  - 图解码里的同一套检测直接把该行的 token 在检测点截断（`stop_at`），避免后续重放再往 `history` 里写重复内容。判据（`_is_degenerate_text`）有两条，都不能放宽，否则会误伤正常表格与编号：①末尾重复同一个片段、周期 16~400 字不定（**不能写死周期**：GB 50268 第 148 页的表格复读的是 29 字句子，16/24/32… 完全抓不到），且重复区域连起来至少 `DEGENERATE_REPEAT_SPAN`=256 字，纯标点片段（目录点线）跳过；②尾部 50 个数字连续递增/相同，且数字之间只有标点分隔符（纯空格分隔的数字串是阅读序的正常输出 `0 1 2 3 …`）。
 
 ### 17. `mdviewer.html` 里本地相对图的三个坑
 

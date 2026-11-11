@@ -12,7 +12,7 @@ pptx2md.py                .pptx → .md
 pdf2md.py                 .pdf → .md / .json（本地 OXR 推理，依赖 OXR/）
 fix_punct.py              .md 标点修正（英文标点 → 中文标点；附带计量单位等自动替换）
 normalize_docx.py         .docx 格式标准化（主题字体、字号行距、标题多级列表）
-mdviewer.html             独立的 Markdown 查看器（浏览器打开即用，按钮选文件/拖入 .md，配色跟随系统，相对图需在提示条授权所在文件夹一次）
+mdviewer.html             独立的 Markdown 查看器（浏览器打开即用，按钮选文件/拖入 .md，配色跟随系统，源文件里没有空行分隔的连续行也逐行成段，相对图需在提示条授权所在文件夹一次）
 mdviewer_update_smd.bat   mdviewer.html 的后端渲染组件更新程序
 requirements.txt
 lib/                      mdviewer.html 的后端渲染组件资源库

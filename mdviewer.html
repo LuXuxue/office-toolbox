@@ -510,6 +510,43 @@
                 }).join("\n");
             }
 
+            // 每行单独成段：markdown-it 默认把没有空行分隔的连续行并进同一个 <p>。
+            // 渲染时打开 breaks，行间先变成 <br>；这里再把 <p> 在直属的 <br> 处拆成多个 <p>，
+            // 让每一行各自占一个段落。只拆 <p> 的直属子节点，避免破坏 <strong> 等行内元素里的换行。
+            function splitParagraphsByLineBreak() {
+                const paragraphs = Array.from(preview.querySelectorAll("p"));
+                paragraphs.forEach((para) => {
+                    // 图片说明框是一个整体，不能按换行拆开
+                    if (para.classList.contains("img-frame")) {
+                        return;
+                    }
+                    const parts = [[]];
+                    Array.from(para.childNodes).forEach((node) => {
+                        if (node.nodeType === Node.ELEMENT_NODE && node.tagName === "BR") {
+                            parts.push([]);
+                        } else {
+                            parts[parts.length - 1].push(node);
+                        }
+                    });
+                    if (parts.length < 2) {
+                        return;
+                    }
+                    // 去掉连续 <br> 或段尾 <br> 造成的空段落
+                    const hasContent = (nodes) => nodes.some((node) =>
+                        node.nodeType !== Node.TEXT_NODE || node.textContent.trim() !== ""
+                    );
+                    parts.forEach((nodes) => {
+                        if (!hasContent(nodes)) {
+                            return;
+                        }
+                        const line = para.cloneNode(false); // 保留 class 等属性，不复制子节点
+                        nodes.forEach((node) => line.appendChild(node));
+                        para.parentNode.insertBefore(line, para);
+                    });
+                    para.remove();
+                });
+            }
+
             function applyTheme() {
                 const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
                 const themeClass = dark ? "theme-dark" : "theme-light";
@@ -528,6 +565,8 @@
                 return new SoMarkDown({
                     html: true,
                     typographer: true,
+                    // 单换行也换行（渲染后再按 <br> 拆成独立段落，见 splitParagraphsByLineBreak）
+                    breaks: true,
                     imgDescEnabled: true,
                     lineNumbers: { enable: false, nested: false },
                     smiles: { disableColors: false },
@@ -558,6 +597,7 @@
                             return;
                         }
                         preview.innerHTML = renderer.render(encodeImageDestinations(readFileText));
+                        splitParagraphsByLineBreak();
                     } catch (error) {
                         preview.innerHTML = `<p>${String(error)}</p>`;
                     }

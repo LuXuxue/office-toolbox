@@ -771,6 +771,21 @@ def _format_num_value(value: int, fmt: str) -> str:
     return str(value)
 
 
+def _para_has_content(p_element) -> bool:
+    """段落里是否有可见内容（文字、公式、图片、对象）
+
+    只认真正的正文内容：书签、域代码、分页符、分节符都不算。
+    """
+    for t in p_element.iter(qn('w:t')):
+        if (t.text or '').strip():
+            return True
+    for child in p_element.iter():
+        if child.tag in (qn('w:drawing'), qn('w:pict'), qn('w:object'),
+                         _m('oMath'), _m('oMathPara')):
+            return True
+    return False
+
+
 class NumberingResolver:
     """按文档顺序重建 Word 自动编号（numPr + numbering.xml）"""
 
@@ -1041,7 +1056,8 @@ class NumberingResolver:
             return override
         lvl = self._lvl_def(num_id, levels, ilvl)
         if lvl:
-            return lvl.get('start', 1) or 1
+            start = lvl.get('start')
+            return 1 if start is None else start
         return 1
 
     def _restart_at(self, num_id, levels, ilvl):
@@ -1135,6 +1151,19 @@ class NumberingResolver:
             return False
         return (lvl.get('fmt') or 'decimal') not in _BULLET_FORMATS
 
+    def _is_empty_section_break(self, para) -> bool:
+        """空的分节符段落不占编号
+
+        Word 里用「分节符」结束上一节时，那个段落标记常带着标题样式（封面/
+        目录页最后一行的「标题 1」）。它没有文字，Word 不会把它算进编号序列：
+        实测同一段落加上一个字后，后面的「1 概述」就变成了「2 概述」。
+        不跳过的话，正文第一个一级标题会整体后移一位。
+        """
+        ppr = para._element.find(qn('w:pPr'))
+        if ppr is None or ppr.find(qn('w:sectPr')) is None:
+            return False
+        return not _para_has_content(para._element)
+
     def _resolve(self, para):
         """计算段落编号，返回 (编号文本, 分隔方式)"""
         num_id, ilvl = self._paragraph_numpr(para)
@@ -1148,6 +1177,8 @@ class NumberingResolver:
             return "", 'tab'
         if (lvl.get('fmt') or 'decimal') in _BULLET_FORMATS:
             # 项目符号类编号不还原为文本
+            return "", lvl.get('suff', 'tab')
+        if self._is_empty_section_break(para):
             return "", lvl.get('suff', 'tab')
         self._next_value(num_id, levels, ilvl)
         text = lvl.get('text') or ''
@@ -1223,8 +1254,10 @@ def _parse_lvl(lvl):
         val = e.get(qn('w:val'))
         return default if val is None else val
 
+    start = _to_int(attr('w:start', '1'))
     return {
-        'start': _to_int(attr('w:start', '1')) or 1,
+        # w:start 允许是 0（Word 里把起始值设成 0 就会出现），别用 or 1 吞掉
+        'start': 1 if start is None else start,
         'fmt': attr('w:numFmt', 'decimal') or 'decimal',
         'text': attr('w:lvlText', '') or '',
         'restart': _to_int(attr('w:lvlRestart')),

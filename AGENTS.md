@@ -198,6 +198,12 @@ modelscope download SoMark/OXR-1.0 --local_dir ./OXR/models/OXR-1.0
 
 两个配套点：超链接里的 run 不输出 `<u>`（Hyperlink 样式自带下划线，见 `_in_hyperlink()`）；单元格走独立的 `_collect_cell_run_text()`，行内格式的改动必须在这条路径上也做一遍，否则表格里的 `m²` 会退回普通文字。
 
+### 21. 空的分节符段落不占编号
+
+用「分节符」结束封面/目录那一节时，Word 把 `w:sectPr` 放进最后一个段落的 `w:pPr`，那个段落标记常带着「标题 1」样式（继承编号）。它没有文字，**Word 不把它算进编号序列**：正文第一个一级标题仍是「1」。`docx2md.py` 原来照常推进计数器，整篇标题就整体后移一位（`1 概述` 变成 `2 概述`）。判据见 `NumberingResolver._is_empty_section_break()`：带 `w:sectPr` 且没有可见内容（文字/公式/图片/对象）才跳过。
+
+这条规则是拿 Word 实测出来的，别按「空段落一律不占号」改：不带分节符的空标题段落 Word 照样占号（`w:start` 也从 0 开始计数，别用 `or 1` 把 0 吞掉）。
+
 ## 改完自检
 
 - [ ] 行尾仍是 CRLF

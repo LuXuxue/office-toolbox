@@ -22,7 +22,7 @@ OXR/
   models/OXR-1.0/             模型权重（gitignore，自行下载）
 ```
 
-`docx2md.py` 与 `md2docx.py` 是**单向转换器**，`md2docx.py` 的公式转换器专门服务于 `docx2md.py` 的 LaTeX 输出。改动一侧的输出格式，另一侧必须同步跟上，否则往返会静默损坏。`md2docx.py` 除 GFM 表格外还会解析 `pdf2md.py` 输出的 HTML 表格（`table`/`tr`/`td`/`th`、`rowspan`/`colspan`、单元格里的 `br`/`sup`/`sub`），并支持独占两行的 `$$` 围栏公式；`docx2md.py` 遇到含合并单元格的表格时也用 HTML 写出来，普通表格仍用 GFM，保证 `rowspan`/`colspan` 往返不丢。`docx2pdf.py` 只负责调用本机 Microsoft Word 导出 PDF，不参与 Markdown 往返。`pptx2md.py` 只做 pptx → md，目前没有反向脚本，不改动上面这对往返。`fix_punct.py` 做 md 的标点修正（中文文本里夹杂的英文标点替换为中文标点，含英文括号 `()` → `（）`，公式、代码、URL、英文段落不动）并附带计量单位等自动替换（如 m3/h → m³/h，只作用于未受保护的区域；非 UTF-8 编码的 md 先自动转 UTF-8 再处理，原来就是则跳过），是单向后处理，不参与 Markdown 往返。`normalize_docx.py` 只做 docx 的格式标准化（字体：标题黑体/正文宋体、英文 Times New Roman；正文小四 1.5 倍行距、标题 1 小三、标题 2~9 小四；标题 1~9 加粗、无倾斜、段前段后为 0、标题 8/9 居中；多级列表，其中 8/9 级为图表编号；无间隔样式五号 1 倍行距；自动替换，如 m3/h → m³/h），是单向后处理，不参与 Markdown 往返。
+`docx2md.py` 与 `md2docx.py` 是**单向转换器**，`md2docx.py` 的公式转换器专门服务于 `docx2md.py` 的 LaTeX 输出。改动一侧的输出格式，另一侧必须同步跟上，否则往返会静默损坏。行内格式的对应关系是加粗/斜体/删除线/下划线/上标/下标 ↔ `**`/`*`/`~~`/`<u>`/`<sup>`/`<sub>`，两侧都要认。`md2docx.py` 除 GFM 表格外还会解析 `pdf2md.py` 输出的 HTML 表格（`table`/`tr`/`td`/`th`、`rowspan`/`colspan`、单元格里的 `br`/`sup`/`sub`），并支持独占两行的 `$$` 围栏公式；`docx2md.py` 遇到含合并单元格的表格时也用 HTML 写出来，普通表格仍用 GFM，保证 `rowspan`/`colspan` 往返不丢。`docx2pdf.py` 只负责调用本机 Microsoft Word 导出 PDF，不参与 Markdown 往返。`pptx2md.py` 只做 pptx → md，目前没有反向脚本，不改动上面这对往返。`fix_punct.py` 做 md 的标点修正（中文文本里夹杂的英文标点替换为中文标点，含英文括号 `()` → `（）`，公式、代码、URL、英文段落不动）并附带计量单位等自动替换（如 m3/h → m³/h，只作用于未受保护的区域；非 UTF-8 编码的 md 先自动转 UTF-8 再处理，原来就是则跳过），是单向后处理，不参与 Markdown 往返。`normalize_docx.py` 只做 docx 的格式标准化（字体：标题黑体/正文宋体、英文 Times New Roman；正文小四 1.5 倍行距、标题 1 小三、标题 2~9 小四；标题 1~9 加粗、无倾斜、段前段后为 0、标题 8/9 居中；多级列表，其中 8/9 级为图表编号；无间隔样式五号 1 倍行距；自动替换，如 m3/h → m³/h），是单向后处理，不参与 Markdown 往返。
 
 `pdf2md.py` 是 pdf → md/json 的单向转换器（md 之后可以交给 `md2docx.py`）。它自己只负责 CLI、PDF 渲染、本地模型加载和文件输出，版面分析之后的流水线全部复用 `OXR/oxr/pipeline` 里的上游代码。`OXR/` 是从 [SoMarkAI/OXR](https://github.com/SoMarkAI/OXR) 复制的最小运行子集：`oxr/`（去掉 `cli/`、`server/`）加 `services/layout_analyze/dfine_la`，许可证见 `OXR/LICENSE`、`OXR/NOTICE`。模型权重 `OXR/models/OXR-1.0` 不在库里，用 modelscope 或 huggingface-cli 下载。
 
@@ -187,9 +187,20 @@ modelscope download SoMark/OXR-1.0 --local_dir ./OXR/models/OXR-1.0
 
 `_extract_table_grid()` 会把 `vMerge` 的续行重复首行文字、把 `gridSpan` 拆成空格子，用来生成 GFM 够用，但 `rowspan`/`colspan` 的原始信息已经丢了。写 HTML 表格时直接遍历 `w:tc`、按 `gridSpan`/`vMerge` 输出属性；表头只认 `w:tblHeader`，不要按拍平后的网格猜（合并表头覆盖的列不全，猜出来会错）。普通无合并表格仍走原来的 GFM 路径。
 
+### 20. 行内标记的嵌套顺序要跟 `md2docx.py` 的解析顺序对齐
+
+`md2docx.py` 的行内解析是**分层下降**的：`_add_formatted_text`（公式）→ `_add_html_segment`（HTML 标签）→ `_add_text_segment`（代码段/图片/链接）→ `_add_formatted_runs`（`~~`/`***`/`**`/`*`）。外层先被切走，里层才有机会解析，所以 `docx2md.py` 输出的标记顺序必须是：
+
+- **HTML 标签最外层**：`<sup>**2**</sup>`、`<u>~~作废~~</u>`。写成 `**<sup>2</sup>**` 时 `_add_html_segment` 会先把 `<sup>` 切走，剩下的 `**` 片段匹配不到成对星号，会被当正文写进 Word。
+- **`~~` 在 `**`/`*` 之外**：`~~***文字***~~`。写成 `***~~文字~~***` 时 `bi` 正则的 `***` 配对会落在错误的位置，内文变成 `文字~~`，同样写进正文。
+- `_segments_to_markdown()` 的叠加顺序（斜体 → 加粗 → 删除线 → `<u>` → `<sup>`/`<sub>`）就是据此定的，别「顺手」调换。
+- `_add_marked_runs()` 让 `**…**`、`*…*`、`~~…~~` 里的内文再走一遍 `_add_formatted_text()`，所以标签/公式嵌在粗体里面也能解析；不要退回 `para.add_run(内文)`。
+
+两个配套点：超链接里的 run 不输出 `<u>`（Hyperlink 样式自带下划线，见 `_in_hyperlink()`）；单元格走独立的 `_collect_cell_run_text()`，行内格式的改动必须在这条路径上也做一遍，否则表格里的 `m²` 会退回普通文字。
+
 ## 改完自检
 
 - [ ] 行尾仍是 CRLF
-- [ ] 一侧改了输出格式的话，另一侧同步跟上了
+- [ ] `docx2md.py` 与 `md2docx.py` 同步改：`docx2md.py` 新写出的标记，`md2docx.py` 要能解析回 Word；`md2docx.py` 新写进 docx 的格式（如 HTML 表格合并、`<sup>`/`<sub>`/`<u>`），`docx2md.py` 也要能还原成同样的标记
 - [ ] 注释是中文
 - [ ] `git status` 里没有模型权重、`OXR/models/`、`*_media/`、`outputs/`

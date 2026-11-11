@@ -408,11 +408,11 @@ def _add_text_segment(para, text):
         if m.group('img_src') is not None:
             _add_image_run(para, m.group('img_src'), m.group('img_alt'))
         elif m.group('link_t') is not None:
-            # 链接文字内部可能还有 **粗体** / *斜体* / `代码`
+            # 链接文字内部可能还有 **粗体** / *斜体* / `代码` / <sup>
             link_t = m.group('link_t')
             link_u = m.group('link_u')
             _add_hyperlink(para, link_u,
-                           lambda: _add_text_segment(para, link_t))
+                           lambda: _add_formatted_text(para, link_t))
         else:
             _add_mono_run(para, m.group(0)[1:-1])
 
@@ -420,6 +420,28 @@ def _add_text_segment(para, text):
 
     if pos < len(text):
         _add_formatted_runs(para, text[pos:])
+
+
+def _add_marked_runs(para, text, bold=False, italic=False, strike=False):
+    """写入加粗/斜体/删除线的文字，里面的嵌套标记继续解析
+
+    不能直接 add_run(内文)：`**带 <sup>2</sup> 的粗体**`、`**粗体里有 $x$**`
+    这类写法会把标签或公式当字面量写进 Word。先按正常流程写一遍，再只给
+    这段新增的 run 套格式（w:hyperlink 里的 run 也要算进来）。
+    """
+    from docx.text.run import Run
+    before = set(para._p.iter(qn('w:r')))
+    _add_formatted_text(para, text)
+    for r in para._p.iter(qn('w:r')):
+        if r in before:
+            continue
+        run = Run(r, para)
+        if bold:
+            run.bold = True
+        if italic:
+            run.italic = True
+        if strike:
+            run.font.strike = True
 
 
 def _add_formatted_runs(para, text):
@@ -438,25 +460,20 @@ def _add_formatted_runs(para, text):
             para.add_run(text[pos:m.start()])
 
         if m.group('bi'):
-            run = para.add_run(m.group('bi_t'))
-            run.bold = True
-            run.italic = True
+            _add_marked_runs(para, m.group('bi_t'), bold=True, italic=True)
         elif m.group('b'):
-            run = para.add_run(m.group('b_t'))
-            run.bold = True
+            _add_marked_runs(para, m.group('b_t'), bold=True)
         elif m.group('i'):
-            run = para.add_run(m.group('i_t'))
-            run.italic = True
+            _add_marked_runs(para, m.group('i_t'), italic=True)
         elif m.group('st'):
-            run = para.add_run(m.group('st_t'))
-            run.font.strike = True
+            _add_marked_runs(para, m.group('st_t'), strike=True)
         elif m.group('link'):
-            # 链接文字内部可能还有 **粗体** / *斜体*，先递归解析，
+            # 链接文字内部可能还有 **粗体** / *斜体* / <sup>，先递归解析，
             # 再把产生的 run 搬进 w:hyperlink
             link_t = m.group('link_t')
             link_u = m.group('link_u')
             _add_hyperlink(para, link_u,
-                           lambda: _add_text_segment(para, link_t))
+                           lambda: _add_formatted_text(para, link_t))
 
         pos = m.end()
 
@@ -626,6 +643,18 @@ def _fill_table_cell(cell, text, header=False):
             run.bold = True
 
 
+def _mark_header_row(table, index):
+    """把第 index 行标成「重复标题行」（w:tblHeader）
+
+    docx2md 回读时只认这个标记来判表头：GFM 表格的首行、HTML 表格里整行
+    都是 <th> 的行都要打上。没有标记时它只能按内容猜，遇到合并表头（拍平
+    后列覆盖不全）会猜错，往返一圈 <th> 就退化成 <td>。
+    """
+    trpr = table.rows[index]._tr.get_or_add_trPr()
+    if trpr.find(qn('w:tblHeader')) is None:
+        trpr.append(OxmlElement('w:tblHeader'))
+
+
 def _add_html_table(doc, html):
     """把一段 HTML 表格写成 Word 表格；没有可识别的行时返回 None"""
     parser = _HtmlTableParser()
@@ -647,6 +676,13 @@ def _add_html_table(doc, html):
         if owned and (rs > 1 or cs > 1):
             target = target.merge(table.cell(r + rs - 1, c + cs - 1))
         _fill_table_cell(target, cell.text, cell.header)
+
+    # 只有整行都是 <th> 的前导行才算表头，与 docx2md 输出 <th> 的规则一致
+    for r in range(nrows):
+        row_cells = [p[2] for p in placements if p[0] == r]
+        if not row_cells or not all(cell.header for cell in row_cells):
+            break
+        _mark_header_row(table, r)
     return table
 
 
@@ -904,9 +940,15 @@ class _LatexParser:
         return i < len(self.tokens) and self.tokens[i][0] in ('sub', 'sup')
 
     def parse_scripted(self):
-        base = self.parse_atom()
-        if base is None:
-            return None
+        kind0, _ = self.peek()
+        if kind0 in ('sub', 'sup'):
+            # 行首的 ^{5} / _{i}：没有基座的上下标也要保留。docx2md 对空基座
+            # 的上标就是这么输出的（图例编号「⁵—砾石层」），丢掉标记等于丢字
+            base = ('group', [])
+        else:
+            base = self.parse_atom()
+            if base is None:
+                return None
         sub = sup = None
         while True:
             kind, val = self.peek()
@@ -1859,6 +1901,9 @@ def convert(md_path, heading_numbering=False):
                         if c_idx < num_cols:
                             cell = table.rows[r_idx + 1].cells[c_idx]
                             _add_formatted_text(cell.paragraphs[0], cell_text)
+
+                # 首行是表头：打上「重复标题行」，docx2md 回读时才能认成表头
+                _mark_header_row(table, 0)
 
             list_level = 0
             ol_group_active = False

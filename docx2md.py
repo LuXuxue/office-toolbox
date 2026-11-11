@@ -9,7 +9,7 @@
 转换结果写在与 docx 同一目录、文件名相同的 .md 文件。
 
 支持: 多级标题、Word 自动编号、列表、表格（含合并单元格与多级表头）、
-      超链接、加粗/斜体/删除线、文档属性与域、修订、OMML 公式（转 LaTeX）
+      超链接、加粗/斜体/删除线/上下标/下划线、文档属性与域、修订、OMML 公式（转 LaTeX）
 
 依赖:
     pip install python-docx
@@ -21,7 +21,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from docx import Document
 from docx.oxml.ns import qn
@@ -44,6 +44,21 @@ class Block:
     html: str = ""  # html_table 的完整 <table>…</table> 文本
     numbered: bool = False  # 段落本身带编号（标题/列表），合并时不可与邻段粘连
     explicit_body: bool = False  # 显式声明为「正文」（outlineLvl >= 9），不可再按文字猜成标题
+
+
+class InlineSeg(NamedTuple):
+    """行内片段：文字 + 该片的格式
+
+    vert 取 "sup"/"sub"（Word 的上标/下标，对应 md 里的 <sup>/<sub>）；
+    underline 对应 <u>。这两项与加粗/斜体/删除线一样参与「相邻同格式合并」。
+    """
+    text: str
+    bold: bool = False
+    italic: bool = False
+    strike: bool = False
+    url: Optional[str] = None
+    vert: str = ""
+    underline: bool = False
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -144,7 +159,7 @@ def _image_segments(node, doc=None) -> list:
         seen.add(rid)
         ref = _media_ref(doc, rid)
         if ref:
-            segs.append((ref, False, False, False, None))
+            segs.append(InlineSeg(ref))
     return segs
 
 
@@ -157,7 +172,7 @@ def _drawing_segments(node, doc=None) -> list:
 
 def _drawing_text(node, doc=None) -> str:
     """表格单元格里用的扁平文本（图片会渲染成 Markdown 图片语法）"""
-    return "".join(text for text, _, _, _, _ in _drawing_segments(node, doc))
+    return "".join(seg.text for seg in _drawing_segments(node, doc))
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1161,6 +1176,43 @@ def _switch_on(elem) -> bool:
     return str(val).strip().lower() not in ('0', 'false', 'off')
 
 
+def _underline_on(elem) -> bool:
+    """w:u 是否启用
+
+    w:u 没有 val 时按单下划线算；val="none" 是显式取消（Word 里常见于
+    「取消样式自带的下划线」），不能当有下划线。
+    """
+    if elem is None:
+        return False
+    return (elem.get(qn('w:val')) or 'single').strip().lower() != 'none'
+
+
+def _vert_align(elem) -> str:
+    """w:vertAlign 的上下标："sup" / "sub"；baseline 等一律当正常文字"""
+    if elem is None:
+        return ""
+    val = (elem.get(qn('w:val')) or "").strip().lower()
+    if val == 'superscript':
+        return "sup"
+    if val == 'subscript':
+        return "sub"
+    return ""
+
+
+def _in_hyperlink(r_element) -> bool:
+    """run 是否在 w:hyperlink 里
+
+    链接文字本来就带下划线（Hyperlink 样式 + 直接格式兜底），照实写出来会得到
+    [<u>文字</u>](url) 这种噪音；Markdown 链接自己就有下划线，不必再套 <u>。
+    """
+    parent = r_element.getparent()
+    while parent is not None:
+        if parent.tag == qn('w:hyperlink'):
+            return True
+        parent = parent.getparent()
+    return False
+
+
 def _parse_lvl(lvl):
     """解析单个 w:lvl 定义"""
 
@@ -1249,12 +1301,31 @@ def _escape_tex_text(text: str) -> str:
     return ''.join(_MATH_ESCAPES.get(c, c) for c in text)
 
 
+# 正在渲染的上下标层数。° 在上标里本身就是一个上标 run，写成 ^{\circ} 会多套
+# 一层：Word 里 $90^{°}$ 输出 90^{\circ}（对），但 90^{^{\circ}} 再往返一次就
+# 涨成三层，再多跑几次还会继续涨。
+_SCRIPT_DEPTH = 0
+
+
+def _render_script(elem) -> str:
+    """渲染上下标里的内容（里面的 ° 不再自己套一层 ^{\\circ}）"""
+    global _SCRIPT_DEPTH
+    _SCRIPT_DEPTH += 1
+    try:
+        return _render_math(elem)
+    finally:
+        _SCRIPT_DEPTH -= 1
+
+
 def _escape_math(text: str) -> str:
     """数学模式下的转义（全角写法、希腊字母等转成 LaTeX 宏）"""
     text = text.translate(_FULLWIDTH_ASCII)
     out = []
     for c in text:
-        if c in _MATH_SYMBOLS:
+        if c == '°' and _SCRIPT_DEPTH:
+            # 已经在 ^{…} 里了，直接写 \circ，别再加一层 ^{}
+            out.append(r'\circ ')
+        elif c in _MATH_SYMBOLS:
             out.append(_MATH_SYMBOLS[c])
         else:
             out.append(_MATH_ESCAPES.get(c, c))
@@ -1387,9 +1458,9 @@ def _render_math_nary(elem) -> str:
     sub = sup = body = ''
     for child in elem:
         if child.tag == _m('sub'):
-            sub = _render_math(child)
+            sub = _render_script(child)
         elif child.tag == _m('sup'):
-            sup = _render_math(child)
+            sup = _render_script(child)
         elif child.tag == _m('e'):
             body = _render_math(child)
     if pr is not None:
@@ -1409,7 +1480,12 @@ def _render_math_nary(elem) -> str:
 
 
 def _render_math_matrix(elem) -> str:
-    """m:m（mr 里是 m:e 单元格）/ m:eqArr（每个 m:e 就是一行）"""
+    """m:m（mr 里是 m:e 单元格）/ m:eqArr（每个 m:e 就是一行）
+
+    eqArr 的一行是若干 run 顺序拼起来的「一行内容」，不是按 & 排开的单元格：
+    拿 & 去连 run 会凭空造出对齐点，往返一次 & 就翻一倍（`a & = & b` 变成
+    `a & & & = & & & b`，再往返还会涨）。这里直接拼接。
+    """
     rows = []
     aligned = False
     for child in elem:
@@ -1418,7 +1494,7 @@ def _render_math_matrix(elem) -> str:
                                    if c.tag == _m('e')))
         elif child.tag == _m('e'):
             aligned = True
-            rows.append(' & '.join(_render_math(c) for c in child))
+            rows.append(''.join(_render_math(c) for c in child))
     env = 'aligned' if aligned else 'matrix'
     body = ' \\\\ '.join(rows)
     return f'\\begin{{{env}}}{body}\\end{{{env}}}'
@@ -1452,11 +1528,11 @@ def _render_math(elem) -> str:
             if child.tag == _m('e'):
                 base = _render_math(child)
             elif child.tag == _m('sub'):
-                sub = _render_math(child)
+                sub = _render_script(child)
             elif child.tag == _m('sup'):
-                sup = _render_math(child)
+                sup = _render_script(child)
             elif child.tag == _m('lim'):
-                lim = _render_math(child)
+                lim = _render_script(child)
         low, high = _as_script(sub), _as_script(sup)
         if tag == _m('limLow'):
             low = _as_script(lim)
@@ -1965,7 +2041,7 @@ def _render_inline_children(parent, doc=None) -> str:
 
 
 def _collect_segments(parent, doc, segs):
-    """把元素下的行内内容拆成 (文本, 加粗, 斜体, 删除线, 链接地址) 片段"""
+    """把元素下的行内内容拆成 InlineSeg 片段（文字 + 格式 + 链接地址）"""
     _collect_segments_from(list(parent), doc, segs)
 
 
@@ -1985,7 +2061,7 @@ def _collect_segments_from(children, doc, segs):
             if field is not None:
                 url, text, nxt = field
                 if text:
-                    segs.append((text, False, False, False, url or None))
+                    segs.append(InlineSeg(text, url=url or None))
                 i = nxt
                 continue
             segs.extend(_run_segments(child, doc))
@@ -1998,7 +2074,7 @@ def _collect_segments_from(children, doc, segs):
             _collect_segments(child, doc, inner)
             text = _segments_to_markdown(inner)
             if text:
-                segs.append((text, False, False, False, url or None))
+                segs.append(InlineSeg(text, url=url or None))
         elif tag == qn('w:fldSimple'):
             # 简单域：HYPERLINK 域的地址写在 w:instr 域代码里，不在文字里
             url = _hyperlink_in_instr(child.get(qn('w:instr')) or '')
@@ -2007,7 +2083,7 @@ def _collect_segments_from(children, doc, segs):
             if url:
                 text = _segments_to_markdown(inner)
                 if text:
-                    segs.append((text, False, False, False, url))
+                    segs.append(InlineSeg(text, url=url))
             else:
                 # 不是链接域就按普通片段处理，免得加粗标记被拆成 **甲****乙**
                 segs.extend(inner)
@@ -2017,7 +2093,7 @@ def _collect_segments_from(children, doc, segs):
         elif tag in (_m('oMath'), _m('oMathPara')):
             text = render_math(child)
             if text:
-                segs.append((text, False, False, False, None))
+                segs.append(InlineSeg(text))
         elif tag == _mc('AlternateContent'):
             branch = _mc_branch(child)
             if branch is not None:
@@ -2026,24 +2102,29 @@ def _collect_segments_from(children, doc, segs):
 
 
 def _run_segments(r_element, doc=None) -> list:
-    """把 run 拆成若干 (文本, 加粗, 斜体, 删除线, None) 片段
+    """把 run 拆成若干 InlineSeg 片段（文字 + 加粗/斜体/删除线/上下标/下划线）
 
     文本框、图形里的内容单独渲染：里面的超链接才算得上链接，
     直接抽 w:t 只能拿到文字，地址会丢。
     """
     rpr = r_element.find(qn('w:rPr'))
-    bold = italic = strike = False
+    bold = italic = strike = underline = False
+    vert = ""
     if rpr is not None:
         bold = _switch_on(rpr.find(qn('w:b')))
         italic = _switch_on(rpr.find(qn('w:i')))
         strike = _switch_on(rpr.find(qn('w:strike')))
+        underline = (_underline_on(rpr.find(qn('w:u')))
+                     and not _in_hyperlink(r_element))
+        vert = _vert_align(rpr.find(qn('w:vertAlign')))
 
     segs = []
     texts = []
 
     def flush():
         if texts:
-            segs.append(("".join(texts), bold, italic, strike, None))
+            segs.append(InlineSeg("".join(texts), bold, italic, strike, None,
+                                  vert, underline))
             del texts[:]
 
     for node in r_element:
@@ -2097,42 +2178,60 @@ def _textbox_segments(node, doc=None) -> list:
             _collect_segments(para, doc, inner)
             text = _segments_to_markdown(inner)
             if text:
-                segs.append((text, False, False, False, None))
+                segs.append(InlineSeg(text))
     return segs
 
 
 def _textbox_text(node, doc=None) -> str:
     """文本框里的文字（扁平文本，图片不算 —— 含图片要用 _drawing_text）"""
-    return "".join(text for text, _, _, _, _ in _textbox_segments(node, doc))
+    return "".join(seg.text for seg in _textbox_segments(node, doc))
 
 
 def _segments_to_markdown(segs) -> str:
     """合并相邻同格式片段，再渲染成 Markdown 行内标记
 
     链接片段（url 非空）不参与合并，也不再套加粗等标记——它的文字里已经带好了。
+    上下标/下划线写成 <sup>/<sub>/<u>，并且包在 **…** 最外层：md2docx 先认
+    这些标签、再把标签里的 **粗体** 交给行内格式解析；反过来写成
+    `**<sup>2</sup>**` 会把两个星号当正文写进 Word。
     """
     merged = []
-    for text, bold, italic, strike, url in segs:
-        if not text:
+    for seg in segs:
+        if not seg.text:
             continue
-        if url is None and merged:
-            ptext, pbold, pitalic, pstrike, purl = merged[-1]
-            if purl is None and (pbold, pitalic, pstrike) == (bold, italic, strike):
-                merged[-1] = (ptext + text, bold, italic, strike, None)
+        if seg.url is None and merged:
+            prev = merged[-1]
+            if prev.url is None and (
+                    prev.bold, prev.italic, prev.strike, prev.vert,
+                    prev.underline) == (
+                    seg.bold, seg.italic, seg.strike, seg.vert,
+                    seg.underline):
+                merged[-1] = prev._replace(text=prev.text + seg.text)
                 continue
-        merged.append((text, bold, italic, strike, url))
+        merged.append(seg)
 
     parts = []
-    for text, bold, italic, strike, url in merged:
-        if url is not None:
-            parts.append(f"[{text}]({url})")
+    for seg in merged:
+        if seg.url is not None:
+            parts.append(f"[{seg.text}]({seg.url})")
             continue
-        if strike:
-            text = f"~~{text}~~"
-        if bold:
-            text = f"**{text}**"
-        if italic:
+        text = seg.text
+        # 标记的嵌套顺序要跟 md2docx 的解析顺序对上：它先认 <sup>/<sub>/<u>，
+        # 再认 ~~删除~~、**粗体**、*斜体*。所以标签包在最外层、删除线在
+        # Markdown 标记的最外层，写成 ~~***文字***~~ 而不是 ***~~文字~~***
+        # （后者会让 *** 的配对错位，反引号以外的标记被当正文写进 Word）。
+        if seg.italic:
             text = f"*{text}*"
+        if seg.bold:
+            text = f"**{text}**"
+        if seg.strike:
+            text = f"~~{text}~~"
+        if seg.underline:
+            text = f"<u>{text}</u>"
+        if seg.vert == "sup":
+            text = f"<sup>{text}</sup>"
+        elif seg.vert == "sub":
+            text = f"<sub>{text}</sub>"
         parts.append(text)
     return "".join(parts)
 
@@ -2411,9 +2510,15 @@ def _table_has_merge(tbl) -> bool:
     return False
 
 
+# 单元格里由 docx2md 自己生成的行内标签（<sup>/<sub>/<u>）：转义之后要还原回来，
+# 否则 < 被转成 &lt;，Word 里就变成字面量 <sup>2</sup>
+_CELL_TAG_RE = re.compile(r'&lt;(/?)(sup|sub|u|b|i|strong|em)&gt;')
+
+
 def _html_escape_cell(text: str) -> str:
     """单元格文本转成 HTML 片段：特殊字符转义，换行写成 <br>"""
     text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    text = _CELL_TAG_RE.sub(r'<\1\2>', text)
     text = text.replace('\r\n', '\n').replace('\r', '\n')
     return text.replace('\n', '<br>')
 
@@ -2566,27 +2671,47 @@ def _collect_cell_run_text(r_element, doc, parts):
     图片要用 _drawing_text：w:drawing/w:pict 的内容不会靠 _textbox_segments
     里 txbxContent 递归带出来，只抽文本框会把单元格里的图片整体丢掉
     （连 `<!-- image: … -->` 占位注释都没有）。
+
+    run 自己的上标/下标/下划线要写成 <sup>/<sub>/<u>：单元格走的是这条
+    独立的收集路径，不经过 _run_segments，忘了这里表格里的 m2、m3 就退回
+    普通文字。
     """
+    prefix = suffix = ""
+    rpr = r_element.find(qn('w:rPr'))
+    if rpr is not None:
+        if _underline_on(rpr.find(qn('w:u'))) and not _in_hyperlink(r_element):
+            prefix += "<u>"
+            suffix = "</u>" + suffix
+        vert = _vert_align(rpr.find(qn('w:vertAlign')))
+        if vert:
+            prefix += f"<{vert}>"
+            suffix = f"</{vert}>" + suffix
+
+    inner = []
     for node in r_element:
         tag = node.tag
         if tag == qn('w:t'):
-            parts.append(node.text or "")
+            inner.append(node.text or "")
         elif tag in (qn('w:br'), qn('w:cr')):
-            parts.append(_render_break(node))
+            inner.append(_render_break(node))
         elif tag == qn('w:tab'):
-            parts.append(" ")
+            inner.append(" ")
         elif tag in (_m('oMath'), _m('oMathPara')):
-            parts.append(_render_cell_math(node))
+            inner.append(_render_cell_math(node))
         elif tag in (qn('w:drawing'), qn('w:pict'), qn('w:object')):
-            parts.append(_drawing_text(node, doc))
+            inner.append(_drawing_text(node, doc))
         elif tag == _mc('AlternateContent'):
             branch = _mc_branch(node)
             if branch is not None:
-                parts.append(_drawing_text(branch, doc))
+                inner.append(_drawing_text(branch, doc))
         else:
             # 其他子元素（如 w:ruby 的注音）继续往里找文字
             for sub in node.iter(qn('w:t')):
-                parts.append(sub.text or "")
+                inner.append(sub.text or "")
+
+    text = "".join(inner)
+    if text:
+        parts.append(prefix + text + suffix)
 
 
 def _render_cell_math(node) -> str:

@@ -10,7 +10,7 @@ md2docx.py                .md → .docx
 docx2pdf.py               .doc / .docx → .pdf
 pptx2md.py                .pptx → .md
 pdf2md.py                 .pdf → .md / .json（本地 OXR 推理，依赖 OXR/）
-fix_punct.py              .md 标点修正（英文标点 → 中文标点；附带计量单位等自动替换）
+fix_punct.py              .md 标点修正（英文标点 → 中文标点；附带计量单位等自动替换、上下标标签转字符）
 normalize_docx.py         .docx 格式标准化（主题字体、字号行距、标题多级列表）
 mdviewer.html             独立的 Markdown 查看器（浏览器打开即用，按钮选文件/拖入 .md，配色跟随系统，源文件里没有空行分隔的连续行也逐行成段，相对图需在提示条授权所在文件夹一次）
 mdviewer_update_smd.bat   mdviewer.html 的后端渲染组件更新程序
@@ -22,7 +22,7 @@ OXR/
   models/OXR-1.0/             模型权重（gitignore，自行下载）
 ```
 
-`docx2md.py` 与 `md2docx.py` 是**单向转换器**，`md2docx.py` 的公式转换器专门服务于 `docx2md.py` 的 LaTeX 输出。改动一侧的输出格式，另一侧必须同步跟上，否则往返会静默损坏。行内格式的对应关系是加粗/斜体/删除线/下划线/上标/下标 ↔ `**`/`*`/`~~`/`<u>`/`<sup>`/`<sub>`，两侧都要认。`md2docx.py` 除 GFM 表格外还会解析 `pdf2md.py` 输出的 HTML 表格（`table`/`tr`/`td`/`th`、`rowspan`/`colspan`、单元格里的 `br`/`sup`/`sub`），并支持独占两行的 `$$` 围栏公式；`docx2md.py` 遇到含合并单元格的表格时也用 HTML 写出来，普通表格仍用 GFM，保证 `rowspan`/`colspan` 往返不丢。`docx2pdf.py` 只负责调用本机 Microsoft Word 导出 PDF，不参与 Markdown 往返。`pptx2md.py` 只做 pptx → md，目前没有反向脚本，不改动上面这对往返。`fix_punct.py` 做 md 的标点修正（中文文本里夹杂的英文标点替换为中文标点，含英文括号 `()` → `（）`，公式、代码、URL、英文段落不动）并附带计量单位等自动替换（如 m3/h → m³/h，只作用于未受保护的区域；非 UTF-8 编码的 md 先自动转 UTF-8 再处理，原来就是则跳过），是单向后处理，不参与 Markdown 往返。`normalize_docx.py` 只做 docx 的格式标准化（字体：标题黑体/正文宋体、英文 Times New Roman；正文小四 1.5 倍行距、标题 1 小三、标题 2~9 小四；标题 1~9 加粗、无倾斜、段前段后为 0、标题 8/9 居中；多级列表，其中 8/9 级为图表编号；无间隔样式五号 1 倍行距；自动替换，如 m3/h → m³/h），是单向后处理，不参与 Markdown 往返。
+`docx2md.py` 与 `md2docx.py` 是**单向转换器**，`md2docx.py` 的公式转换器专门服务于 `docx2md.py` 的 LaTeX 输出。改动一侧的输出格式，另一侧必须同步跟上，否则往返会静默损坏。行内格式的对应关系是加粗/斜体/删除线/下划线/上标/下标 ↔ `**`/`*`/`~~`/`<u>`/`<sup>`/`<sub>`，两侧都要认。`md2docx.py` 除 GFM 表格外还会解析 `pdf2md.py` 输出的 HTML 表格（`table`/`tr`/`td`/`th`、`rowspan`/`colspan`、单元格里的 `br`/`sup`/`sub`），并支持独占两行的 `$$` 围栏公式；`docx2md.py` 遇到含合并单元格的表格时也用 HTML 写出来，普通表格仍用 GFM，保证 `rowspan`/`colspan` 往返不丢。`docx2pdf.py` 只负责调用本机 Microsoft Word 导出 PDF，不参与 Markdown 往返。`pptx2md.py` 只做 pptx → md，目前没有反向脚本，不改动上面这对往返。`fix_punct.py` 做 md 的标点修正（中文文本里夹杂的英文标点替换为中文标点，含英文括号 `()` → `（）`，公式、代码、URL、英文段落不动）并附带计量单位等自动替换（如 m3/h → m³/h，只作用于未受保护的区域）和上下标标签转 UTF-8 字符（`<sub>3</sub>` → `₃`、`m<sup>3</sup>` → `m³`，内容是字母或 `**` 等标记时保持原样；非 UTF-8 编码的 md 先自动转 UTF-8 再处理，原来就是则跳过），是单向后处理，不参与 Markdown 往返。`normalize_docx.py` 只做 docx 的格式标准化（字体：标题黑体/正文宋体、英文 Times New Roman；正文小四 1.5 倍行距、标题 1 小三、标题 2~9 小四；标题 1~9 加粗、无倾斜、段前段后为 0、标题 8/9 居中；多级列表，其中 8/9 级为图表编号；无间隔样式五号 1 倍行距；自动替换，如 m3/h → m³/h），是单向后处理，不参与 Markdown 往返。
 
 `pdf2md.py` 是 pdf → md/json 的单向转换器（md 之后可以交给 `md2docx.py`）。它自己只负责 CLI、PDF 渲染、本地模型加载和文件输出，版面分析之后的流水线全部复用 `OXR/oxr/pipeline` 里的上游代码。`OXR/` 是从 [SoMarkAI/OXR](https://github.com/SoMarkAI/OXR) 复制的最小运行子集：`oxr/`（去掉 `cli/`、`server/`）加 `services/layout_analyze/dfine_la`，许可证见 `OXR/LICENSE`、`OXR/NOTICE`。模型权重 `OXR/models/OXR-1.0` 不在库里，用 modelscope 或 huggingface-cli 下载。
 

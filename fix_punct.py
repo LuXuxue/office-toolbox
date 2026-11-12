@@ -16,6 +16,9 @@
   URL 与链接地址、代码块中的标点一律不替换。
 - 自动替换计量单位等写法（如 m3/h → m³/h），
   同样只作用于未受保护的区域;
+- 自动把上/下标标签转成对应的 UTF-8 字符，
+  如 <sub>3</sub> → ₃、<sup>2</sup> → ²；
+  内容含无法映射的字符(字母、** 等标记、公式)时保持原样;
 - 自动替换用到 UTF-8 字符(如 ³ ₂),
   非 UTF-8 编码的 md 文件会先自动转换为 UTF-8 再处理(原来就是则跳过)。
 """
@@ -46,6 +49,23 @@ _REPLACEMENTS = [
     ('H2S', 'H₂S'),
     ('CO2', 'CO₂'),
 ]
+
+# 上标标签 <sup>…</sup> 到 UTF-8 字符的映射
+_SUP_MAP = {
+    '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴',
+    '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹',
+    '+': '⁺', '-': '⁻', '=': '⁼', '(': '⁽', ')': '⁾',
+}
+
+# 下标标签 <sub>…</sub> 到 UTF-8 字符的映射
+_SUB_MAP = {
+    '0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄',
+    '5': '₅', '6': '₆', '7': '₇', '8': '₈', '9': '₉',
+    '+': '₊', '-': '₋', '=': '₌', '(': '₍', ')': '₎',
+}
+
+# 上下标标签，内容不允许跨行
+_SUBSUP_RE = re.compile(r'<(sup|sub)>(.*?)</\1>', re.IGNORECASE)
 
 # 这些收尾字符后面允许接中文句号
 ZH_BOUNDARY = '")]】》”’"”'
@@ -103,12 +123,27 @@ def merge_spans(spans):
     return out
 
 
+def _replace_subsup(seg):
+    """把 <sup>…</sup> / <sub>…</sub> 换成对应的 UTF-8 上/下标字符。
+
+    内容里有无法映射的字符(字母、`**` 等 Markdown 标记、公式)时整段保持原样，
+    避免把 `<sup>**2**</sup>` 这类带格式的写法改坏。
+    """
+    def repl(m):
+        table = _SUP_MAP if m.group(1).lower() == 'sup' else _SUB_MAP
+        body = m.group(2)
+        if not body or any(ch not in table for ch in body):
+            return m.group(0)
+        return ''.join(table[ch] for ch in body)
+    return _SUBSUP_RE.sub(repl, seg)
+
+
 def _apply_replacements_to_seg(seg):
-    """对一段文本按顺序应用自动替换表。"""
+    """对一段文本按顺序应用自动替换表，再转换上/下标标签。"""
     for old, new in _REPLACEMENTS:
         if old in seg:
             seg = seg.replace(old, new)
-    return seg
+    return _replace_subsup(seg)
 
 
 def apply_replacements(line):

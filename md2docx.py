@@ -5,7 +5,7 @@
 用法:
     python md2docx.py path/to/file.md           转换单个文件
     python md2docx.py -d path/to/dir            转换目录下所有 .md
-    python md2docx.py -n path/to/file.md        1～5 级标题套用多级自动编号
+    python md2docx.py -n path/to/file.md        标题套用多级自动编号（含 8/9 级图表）
 
 结果写在与 md 同一目录、文件名相同的 .docx 文件。与 docx2md 配套使用：
 公式（$$…$$ / $…$）会写成可编辑的 Word 公式而非纯文本。
@@ -1424,9 +1424,20 @@ _HEADING_NUMBER_RE = re.compile(
     r')'
 )
 
-# docx2md 把 Word 的 6～9 级标题都压成 Markdown 的 ######，第 6 级标题
-# 到底对应 Word 的哪一级无法确定；自动编号只做到第 5 级，第 6 级保留原文序号
+# docx2md 把 Word 的 6～9 级标题都压成 Markdown 的 ######。普通 ###### 仍按
+# 第 6 级处理（自动编号只做到第 5 级，第 6 级保留原文序号）；图题、表题则
+# 靠文字前缀分别还原成 normalize_docx 使用的第 8、9 级标题。
+_FIGURE_TABLE_HEADING_LEVELS = (
+    ('图', 8),
+    ('表', 9),
+)
 _HEADING_NUMBER_MAX_LEVEL = 5
+
+# 图/表标题开头的自动编号：图 1.6-1 / 表 3.1-1（normalize_docx 的
+# lvlText 是「图 %1.%2-%8」「表 %1.%2-%9」）
+_FIGURE_TABLE_NUMBER_RE = re.compile(
+    r'^\s*[图表]\s*[0-9]+(?:[.．][0-9]+)*\s*[-－—]\s*[0-9]+\s*'
+)
 
 
 def _strip_heading_number(text):
@@ -1438,6 +1449,17 @@ def _strip_heading_number(text):
     这类标题原样保留。整个标题只有序号时保留原文，不产出空标题。
     """
     stripped = _HEADING_NUMBER_RE.sub('', text, count=1).strip()
+    return stripped or text.strip()
+
+
+def _strip_figure_table_number(text):
+    """去掉图/表标题开头的自动编号（图 1.6-1 / 表 3.1-1）
+
+    这类编号由图/表标题样式的多级列表生成；docx2md 回读时会把编号补进
+    文本，再次转换时文字里再留一份就会出现「图 1.6-1 图 1.6-1 …」。
+    整个标题只有编号时保留原文，不产出空标题。
+    """
+    stripped = _FIGURE_TABLE_NUMBER_RE.sub('', text, count=1).strip()
     return stripped or text.strip()
 
 
@@ -1459,14 +1481,17 @@ def _heading_style(doc, level):
 
 
 def _apply_heading_numbering(doc):
-    """给 Heading 1～5 样式套用同一个多级列表，标题序号交给 Word 自动生成
+    """给 Heading 1～5 与 8/9 样式套用同一个多级列表，序号交给 Word 自动生成
 
-    与参考模板一致：各级 lvlText 为 %1 / %1.%2 / … / %1.%2.%3.%4.%5，并用
-    w:pStyle 把每个编号级别绑到对应的标题样式。编号写在样式上而不是
+    与 normalize_docx 保持一致：1～5 级 lvlText 为 %1 / %1.%2 / … /
+    %1.%2.%3.%4.%5；8 级是图号「图 %1.%2-%8」，9 级是表号
+    「表 %1.%2-%9」，两者都随二级章节重置（w:lvlRestart=2）。用
+    w:pStyle 把每个编号级别绑到对应的标题样式，编号写在样式上而不是
     段落上，用户在 Word 里新加的同级标题也会自动接上序号。
 
-    第 6 级不参与：md 的 ###### 对应 Word 6～9 级，层级不确定，强行编号
-    会让本来没有序号的 7～9 级标题冒出「1.1.1.1.1.1」。
+    第 6/7 级不参与：md 的 ###### 对应 Word 6～9 级，普通 ###### 无法确定
+    是 6 还是 7 级，强行编号会让本来没有序号的标题冒出「1.1.1.1.1.1」。
+    图题、表题分别映射到 8/9 级，所以它们可以安全地参与图表编号。
     """
     try:
         numbering = doc.part.numbering_part.element
@@ -1500,9 +1525,16 @@ def _apply_heading_numbering(doc):
             break
         styles[level] = style
     if not styles:
-        print('警告: 文档里没有 1～5 级标题样式，无法套用多级列表',
+        print('警告: 文档里没有可编号的标题样式，无法套用多级列表',
               file=sys.stderr)
         return False
+
+    # 图/表号的 lvlText 引用 %1.%2，至少要有 1、2 级标题才挂得上
+    if 1 in styles and 2 in styles:
+        for level in (8, 9):
+            style = _heading_style(doc, level)
+            if style is not None:
+                styles[level] = style
 
     # w:lvl 必须排在 multiLevelType 之后，这里按 schema 顺序逐个 append
     multi_type = OxmlElement('w:multiLevelType')
@@ -1518,6 +1550,11 @@ def _apply_heading_numbering(doc):
         fmt = OxmlElement('w:numFmt')
         fmt.set(qn('w:val'), 'decimal')
         lvl.append(fmt)
+        if level in (8, 9):
+            # 图/表号随二级章节重置，与 normalize_docx 一致
+            restart = OxmlElement('w:lvlRestart')
+            restart.set(qn('w:val'), '2')
+            lvl.append(restart)
         pstyle = OxmlElement('w:pStyle')
         pstyle.set(qn('w:val'), style.style_id)
         lvl.append(pstyle)
@@ -1526,8 +1563,13 @@ def _apply_heading_numbering(doc):
         suff.set(qn('w:val'), 'space')
         lvl.append(suff)
         lvl_text = OxmlElement('w:lvlText')
-        lvl_text.set(qn('w:val'),
-                     '.'.join(f'%{n}' for n in range(1, level + 1)))
+        if level == 8:
+            text = '图 %1.%2-%8'
+        elif level == 9:
+            text = '表 %1.%2-%9'
+        else:
+            text = '.'.join(f'%{n}' for n in range(1, level + 1))
+        lvl_text.set(qn('w:val'), text)
         lvl.append(lvl_text)
         jc = OxmlElement('w:lvlJc')
         jc.set(qn('w:val'), 'left')
@@ -1718,9 +1760,20 @@ def convert(md_path, heading_numbering=False):
         if heading_match:
             level = len(heading_match.group(1))
             text = heading_match.group(2).strip()
-            if numbering_applied and level <= _HEADING_NUMBER_MAX_LEVEL:
-                text = _strip_heading_number(text)
-            para = doc.add_heading(level=level)
+            # docx2md 把 6～9 级标题都写成 ######，图示/表题按文字前缀还原
+            # 成 Word 的 8/9 级，普通 ###### 仍按 6 级处理
+            doc_level = level
+            if level == 6:
+                for prefix, mapped_level in _FIGURE_TABLE_HEADING_LEVELS:
+                    if text.startswith(prefix):
+                        doc_level = mapped_level
+                        break
+            if numbering_applied:
+                if level <= _HEADING_NUMBER_MAX_LEVEL:
+                    text = _strip_heading_number(text)
+                elif doc_level in (8, 9):
+                    text = _strip_figure_table_number(text)
+            para = doc.add_heading(level=doc_level)
             _add_formatted_text(para, text)
             list_level = 0
             ol_group_active = False
@@ -1938,9 +1991,9 @@ if __name__ == '__main__':
     parser.add_argument('-d', '--dir', action='store_true',
                         help='把 path 当作目录，转换其中所有 .md 文件')
     parser.add_argument('-n', '--heading-numbering', action='store_true',
-                        help='给 1～5 级标题样式套用多级自动编号（1 / 1.1 / '
-                             '1.1.1…），并去掉标题文字里已有的序号；'
-                             '6 级标题不编号、保留原文序号')
+                        help='给标题样式套用多级自动编号（1 / 1.1 / 1.1.1…，'
+                             '8/9 级为图号/表号），并去掉标题文字里已有的序号；'
+                             '普通 6 级标题不编号、保留原文序号')
     args = parser.parse_args()
 
     if not args.path:

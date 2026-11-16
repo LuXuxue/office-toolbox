@@ -59,6 +59,8 @@ python md2docx.py -n path/to/file.md     # 标题套用多级自动编号
 
 结果写在与 md 同一目录、文件名相同的 `.docx` 文件。
 
+样式与 `normalize_docx.py` 一致：中文标题黑体、正文宋体，英文 Times New Roman；正文小四、1.5 倍行距；标题 1 小三且段前分页，标题 2~9 小四、加粗、段前段后为 0，标题 8/9 居中。转换完不必再跑一遍 `normalize_docx.py`。
+
 `-n`（`--heading-numbering`）会给标题样式挂上 Word 多级自动编号，并去掉标题文字里已有的序号。`###### 图…` / `###### 表…` 分别写成 Heading 8 / Heading 9，图号、表号与 `normalize_docx.py` 一致；普通 `######` 仍是 Heading 6，不参与自动编号。
 
 支持 GFM 标题、列表、表格、引用、代码、图片、链接，行内 HTML 上下标/下划线，以及 `$…$` / `$$…$$` 公式；细节见 `AGENTS.md`。

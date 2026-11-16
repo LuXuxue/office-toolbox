@@ -10,6 +10,10 @@
 结果写在与 md 同一目录、文件名相同的 .docx 文件。与 docx2md 配套使用：
 公式（$$…$$ / $…$）会写成可编辑的 Word 公式而非纯文本。
 
+样式与 normalize_docx 一致：主题字体标题黑体/正文宋体、正文小四 1.5 倍
+行距、标题 1 小三且段前分页、8/9 级图表标题居中；加 -n 时再给标题套上
+多级自动编号。
+
 依赖:
     pip install python-docx
 
@@ -698,8 +702,166 @@ def _collect_html_table(lines, start):
     return None, start
 
 
+# ══════════════════════════════════════════════════════════════════
+# 样式格式（与 normalize_docx 一致）
+#
+# python-docx 的默认模板里 Heading 1 是蓝色大字、正文是五号单倍行距。
+# 这里把主题字体、字号行距、段前分页与图表标题居中统一成 normalize_docx
+# 的设置，md → docx 出来的文档不必再跑一遍 normalize_docx 也是同样的版式。
+# ══════════════════════════════════════════════════════════════════
+
+# 字号（w:sz 以半磅为单位）：小四 = 12pt = 24，小三 = 15pt = 30，五号 = 10.5pt = 21
+_SZ_XIAO4 = '24'
+_SZ_XIAO3 = '30'
+_SZ_WUHAO = '21'
+
+# 行距（w:line 以 1/20 磅为单位）：单倍 = 240，1.5 倍 = 360
+_LINE_1 = '240'
+_LINE_1_5 = '360'
+
+# 主题字体方案（中文环境：major 标题 / minor 正文，各分拉丁与中文）；
+# 与 normalize_docx 的 _MAJOR_* / _MINOR_* 保持一致
+_MAJOR_LATIN = 'Times New Roman'
+_MAJOR_EA = '黑体'
+_MINOR_LATIN = 'Times New Roman'
+_MINOR_EA = '宋体'
+
+
+def _find_style(doc, names, style_id):
+    """按名称（本地化兜底）或 styleId 找样式"""
+    for name in names:
+        try:
+            return doc.styles[name]
+        except KeyError:
+            continue
+    for style in doc.styles:
+        if style.style_id == style_id:
+            return style
+    return None
+
+
+def _set_theme_rfonts(rpr, major):
+    """让 rPr 的字体跟随主题（标题用 major，正文用 minor）"""
+    # get_or_add_rFonts 会按 schema 把 w:rFonts 放在 w:rStyle 之后
+    rfonts = rpr.get_or_add_rFonts()
+    prefix = 'major' if major else 'minor'
+    rfonts.set(qn('w:asciiTheme'), prefix + 'HAnsi')
+    rfonts.set(qn('w:eastAsiaTheme'), prefix + 'EastAsia')
+    rfonts.set(qn('w:hAnsiTheme'), prefix + 'HAnsi')
+    rfonts.set(qn('w:cstheme'), prefix + 'Bidi')
+    # 清掉可能硬编码的字体名，避免盖住主题引用
+    for attr in ('w:ascii', 'w:eastAsia', 'w:hAnsi', 'w:cs'):
+        if rfonts.get(qn(attr)) is not None:
+            del rfonts.attrib[qn(attr)]
+
+
+def _get_style_rpr(style):
+    """取样式的 w:rPr，没有就建一个"""
+    rpr = style.element.find(qn('w:rPr'))
+    if rpr is None:
+        rpr = OxmlElement('w:rPr')
+        # rPr 是 w:style 的最后一个子元素
+        style.element.append(rpr)
+    return rpr
+
+
+def _set_style_format(style, sz, line, page_break=False, major=False,
+                      bold=False, zero_spacing=False, no_italic=False,
+                      center=False):
+    """设置样式的字号、行距、段前分页、加粗、斜体、居中、段前段后间距与主题字体
+
+    规则与 normalize_docx._set_style_format 完全一致。
+    """
+    rpr = _get_style_rpr(style)
+    _set_theme_rfonts(rpr, major)
+
+    # 加粗（w:b 无 val 属性即为 true）
+    if bold:
+        rpr.get_or_add_b()
+
+    # 取消倾斜（w:i val=0）
+    if no_italic:
+        rpr.get_or_add_i().set(qn('w:val'), '0')
+
+    # 字号：w:szCs 紧跟 w:sz，别用 append 打乱 rPr 的子元素顺序
+    sz_el = rpr.get_or_add_sz()
+    sz_el.set(qn('w:val'), sz)
+    sz_cs = rpr.find(qn('w:szCs'))
+    if sz_cs is None:
+        sz_cs = OxmlElement('w:szCs')
+        sz_el.addnext(sz_cs)
+    sz_cs.set(qn('w:val'), sz)
+
+    ppr = style.element.get_or_add_pPr()
+    # 行距与段前段后间距
+    spacing = ppr.get_or_add_spacing()
+    spacing.set(qn('w:line'), line)
+    spacing.set(qn('w:lineRule'), 'auto')
+    if zero_spacing:
+        spacing.set(qn('w:before'), '0')
+        spacing.set(qn('w:after'), '0')
+
+    # 居中对齐（center=True 设 center，center=False 移除 jc）
+    if center:
+        ppr.get_or_add_jc().set(qn('w:val'), 'center')
+    else:
+        jc = ppr.find(qn('w:jc'))
+        if jc is not None:
+            ppr.remove(jc)
+
+    # 段前分页（get_or_add 会按 schema 插到 w:spacing 之前）
+    if page_break:
+        ppr.get_or_add_pageBreakBefore()
+    else:
+        pbb = ppr.find(qn('w:pageBreakBefore'))
+        if pbb is not None:
+            ppr.remove(pbb)
+
+
+def _apply_style_formatting(doc):
+    """按 normalize_docx 的规则设置正文与 1~9 级标题的样式
+
+    - 正文：小四、1.5 倍行距
+    - 标题 1：小三、1.5 倍行距、段前分页、加粗、段前段后为 0
+    - 标题 2~7：小四、1.5 倍行距、加粗、段前段后为 0
+    - 标题 8~9：小四、1.5 倍行距、加粗、居中、段前段后为 0
+    - 无间隔：五号、单倍行距
+    """
+    normal = _find_style(doc, ['Normal', '正文'], 'Normal')
+    if normal is not None:
+        _set_style_format(normal, _SZ_XIAO4, _LINE_1_5, page_break=False,
+                          major=False)
+
+    h1 = _find_style(doc, ['Heading 1', '标题 1', '1级标题'], 'Heading1')
+    if h1 is not None:
+        _set_style_format(h1, _SZ_XIAO3, _LINE_1_5, page_break=True,
+                          major=True, bold=True, zero_spacing=True,
+                          no_italic=True)
+
+    for level in range(2, 8):
+        style = _find_style(doc, [f'Heading {level}', f'标题 {level}',
+                                  f'{level}级标题'], f'Heading{level}')
+        if style is not None:
+            _set_style_format(style, _SZ_XIAO4, _LINE_1_5, page_break=False,
+                              major=True, bold=True, zero_spacing=True,
+                              no_italic=True)
+
+    for level in (8, 9):
+        style = _find_style(doc, [f'Heading {level}', f'标题 {level}',
+                                  f'{level}级标题'], f'Heading{level}')
+        if style is not None:
+            _set_style_format(style, _SZ_XIAO4, _LINE_1_5, page_break=False,
+                              major=True, bold=True, zero_spacing=True,
+                              no_italic=True, center=True)
+
+    no_spacing = _find_style(doc, ['No Spacing'], 'NoSpacing')
+    if no_spacing is not None:
+        _set_style_format(no_spacing, _SZ_WUHAO, _LINE_1, page_break=False,
+                          major=False, no_italic=True)
+
+
 def _link_default_fonts_to_theme(doc):
-    """让默认字体跟随主题，参数与 Word 2016 新建文档保持一致"""
+    """让默认字体跟随主题，字号行距与 normalize_docx 一致（小四、1.5 倍行距）"""
     styles_elem = doc.styles.element
     doc_defaults = styles_elem.find(qn('w:docDefaults'))
     if doc_defaults is None:
@@ -717,31 +879,29 @@ def _link_default_fonts_to_theme(doc):
         rpr_default.append(rpr)
 
     ppr_default = doc_defaults.find(qn('w:pPrDefault'))
-    if ppr_default is not None:
-        ppr = ppr_default.find(qn('w:pPr'))
-        if ppr is not None:
-            for child in list(ppr):
-                ppr.remove(child)
+    if ppr_default is None:
+        ppr_default = OxmlElement('w:pPrDefault')
+        doc_defaults.append(ppr_default)
+    ppr = ppr_default.find(qn('w:pPr'))
+    if ppr is None:
+        ppr = OxmlElement('w:pPr')
+        ppr_default.append(ppr)
+    spacing = ppr.get_or_add_spacing()
+    spacing.set(qn('w:line'), _LINE_1_5)
+    spacing.set(qn('w:lineRule'), 'auto')
 
-    rfonts = rpr.find(qn('w:rFonts'))
-    if rfonts is None:
-        rfonts = OxmlElement('w:rFonts')
-        rpr.insert(0, rfonts)
-    rfonts.set(qn('w:asciiTheme'), 'minorHAnsi')
-    rfonts.set(qn('w:eastAsiaTheme'), 'minorEastAsia')
-    rfonts.set(qn('w:hAnsiTheme'), 'minorHAnsi')
-    rfonts.set(qn('w:cstheme'), 'minorBidi')
+    _set_theme_rfonts(rpr, major=False)
 
     sz = rpr.find(qn('w:sz'))
     if sz is None:
         sz = OxmlElement('w:sz')
         rpr.append(sz)
-    sz.set(qn('w:val'), '21')
+    sz.set(qn('w:val'), _SZ_XIAO4)
     sz_cs = rpr.find(qn('w:szCs'))
     if sz_cs is None:
         sz_cs = OxmlElement('w:szCs')
         rpr.append(sz_cs)
-    sz_cs.set(qn('w:val'), '22')
+    sz_cs.set(qn('w:val'), _SZ_XIAO4)
 
     lang = rpr.find(qn('w:lang'))
     if lang is None:
@@ -751,11 +911,15 @@ def _link_default_fonts_to_theme(doc):
     lang.set(qn('w:eastAsia'), 'zh-CN')
     lang.set(qn('w:bidi'), 'ar-SA')
 
-    _config_theme_cn(doc)
+    _config_theme(doc)
 
 
-def _config_theme_cn(doc):
-    """把内置主题改成简体中文主题（等线）"""
+def _config_theme(doc):
+    """把主题字体方案设为：标题=黑体/Times New Roman，正文=宋体/Times New Roman
+
+    与 normalize_docx._config_theme 一致，同时保留 settings.xml 里的
+    东亚语言设置（themeFontLang）。
+    """
     _set_theme_font_lang(doc)
 
     theme_part = None
@@ -776,30 +940,30 @@ def _config_theme_cn(doc):
     minor = font_scheme.find('.//' + qn('a:minorFont'))
 
     if major is not None:
-        _set_theme_fonts(major, '等线 Light')
+        _set_theme_fonts(major, _MAJOR_LATIN, _MAJOR_EA)
     if minor is not None:
-        _set_theme_fonts(minor, '等线')
+        _set_theme_fonts(minor, _MINOR_LATIN, _MINOR_EA)
 
     new_blob = etree.tostring(root, xml_declaration=True, encoding='UTF-8',
                               standalone=True)
     theme_part._blob = new_blob
 
 
-def _set_theme_fonts(node, face):
+def _set_theme_fonts(node, latin_face, ea_face):
     """设置 fontScheme 中拉丁字体与中文（Hans）字体的字体名"""
     from lxml import etree
     latin = node.find(qn('a:latin'))
     if latin is None:
         latin = etree.SubElement(node, qn('a:latin'))
-    latin.set('typeface', face)
+    latin.set('typeface', latin_face)
 
     for f in node.findall(qn('a:font')):
         if f.get('script') == 'Hans':
-            f.set('typeface', face)
+            f.set('typeface', ea_face)
             return
     hans = etree.SubElement(node, qn('a:font'))
     hans.set('script', 'Hans')
-    hans.set('typeface', face)
+    hans.set('typeface', ea_face)
 
 
 def _set_theme_font_lang(doc):
@@ -1678,6 +1842,9 @@ def convert(md_path, heading_numbering=False):
 
     doc = Document()
     _link_default_fonts_to_theme(doc)
+    # 正文小四 1.5 倍行距、标题黑体加粗、1 级段前分页、图表标题居中：
+    # 与 normalize_docx 的样式设置保持一致
+    _apply_style_formatting(doc)
     _cancel_style_color_overrides(doc)
     # 编号没真正挂上时不要删标题里的序号，否则两边都没有序号
     numbering_applied = (_apply_heading_numbering(doc)

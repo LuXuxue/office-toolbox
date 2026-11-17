@@ -12,6 +12,10 @@
 - 圆括号成对处理:一对括号只要有一侧挨着中文就整对替换,
   避免出现 “（…)” 这种一半中文一半英文的混搭;
   段落内的软换行可跨行配对;
+  紧跟在拉丁字母/数字后的单位/标准写法视为记号(如 dB(A)、De63(mm)、2L/(m²·d)),
+  一律写成半角括号(源文件用了全角也改回来);
+  单位相乘的中点 `·`(U+00B7) 与 `⋅`(U+22C5) 按英文处理,不算中文;
+  括号里有中文或前面是中文时照常换全角;
   数量本来就不匹配的括号(缺一边或多一边)保持原样,不自动增删字符;
 - . 在前一字符或后一字符为中文、或前一字符为收尾字符且处于行尾时替换;
 - 双引号按全文配对转换为 “ ”(嵌套时用 ‘ ’),
@@ -92,12 +96,20 @@ _BARE_SUBSUP_RE = re.compile(r'</?(?:sup|sub)>', re.IGNORECASE)
 OPEN_PARENS = '(（'
 CLOSE_PARENS = ')）'
 
+# 单位写法里允许和左括号紧贴的运算符/上标字符(字母数字另算)。
+# 不包含 * ^ + - 等 Markdown 标记或通用运算符，避免把 **（`代码`） 这类误判成单位记号。
+_UNIT_PREV_CHARS = set('/·⋅%‰°²³¹⁰⁴⁵⁶⁷⁸⁹')
+
 # 这些收尾字符后面允许接中文句号
 ZH_BOUNDARY = '")]】》”’"”'
 
 
 def is_zh(ch):
-    """判断是否为中文(含 CJK 统一表意文字与中文标点)。"""
+    """判断是否为中文(含 CJK 统一表意文字与中文标点)。
+
+    单位相乘用的中点 `·`(U+00B7) 不算中文：它在 m²·d 这类单位写法里是乘号，
+    和中文的间隔号同形但语义不同，按英文处理，免得把整对括号带成全角。
+    """
     if not ch:
         return False
     cp = ord(ch)
@@ -107,7 +119,7 @@ def is_zh(ch):
         or 0x20000 <= cp <= 0x2A6DF  # CJK 扩展 B
         or 0x3000 <= cp <= 0x303F   # CJK 标点
         or 0xFF00 <= cp <= 0xFFEF   # 全角形
-        or ch in '“”‘’《》〈〉…—～·'
+        or ch in '“”‘’《》〈〉…—～'
     )
 
 
@@ -222,6 +234,25 @@ def _near_zh(line, i):
     return is_zh(prev) or is_zh(nxt)
 
 
+def _notation_pair(line, o, c):
+    """判断一对括号是不是紧贴英文/数字的单位或标准记号。
+
+    例：dB(A)、De63(mm)、2L/(m²·d)、ISO 9001(2015)。
+    判据：左括号紧贴前一个英文/数字，或紧跟在 / · % ° 这类单位运算符后面，
+    且括号里没有中文(上标、下标、°、℃、中点等都不算中文)。
+    记号一律写成半角括号，源文件用了全角也改回来；
+    括号里含中文(如 GB12348(A类))或前面是中文(如 压力(MPa))时不算记号。
+    前面是反引号、引号、空格时也不算记号，避免把 `代码` 外面的全角括号改掉。
+    """
+    if o == 0:
+        return False
+    prev = line[o - 1]
+    if not (prev.isascii() and prev.isalnum()) and prev not in _UNIT_PREV_CHARS:
+        return False
+    body = line[o + 1:c]
+    return bool(body.strip()) and not any(is_zh(ch) for ch in body)
+
+
 def prepare_line(line):
     """自动替换后计算保护区与“是否以中文为主”。
 
@@ -266,6 +297,11 @@ def paren_plans(prepared):
                 lo, o = stack.pop()
                 oline, _, o_dom = prepared[lo]
                 c_dom = prepared[li][2]
+                # 单位/标准记号(dB(A)、De63(mm))一律写成半角；跨行的括号不按记号处理
+                if lo == li and _notation_pair(line, o, i):
+                    plans[lo][o] = '('
+                    plans[li][i] = ')'
+                    continue
                 # 挨着中文要同时满足“该行以中文为主”，避免把英文行里的小括号改坏
                 zh_side = ((_near_zh(oline, o) and o_dom)
                            or (_near_zh(line, i) and c_dom))

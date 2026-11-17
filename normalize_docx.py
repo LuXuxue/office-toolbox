@@ -73,6 +73,34 @@ def _find_style(doc, names, style_id):
     return None
 
 
+def _show_style_in_gallery(style):
+    """去掉「使用前隐藏」标记，让样式一直显示在 Word 的样式库里
+
+    w:semiHidden 表示样式面板里要等用过一次才出现，w:unhideWhenUsed 是配套的
+    「用后取消隐藏」。Word 内置的 Heading 8/9 默认带这两个标记，而图表标题
+    要用到它们，所以直接删掉。
+    """
+    el = style.element
+    for tag in ('w:semiHidden', 'w:unhideWhenUsed'):
+        node = el.find(qn(tag))
+        if node is not None:
+            el.remove(node)
+
+
+def _disable_keep_with_next(style):
+    """去掉样式的「与下段同页」（w:keepNext）
+
+    Word 内置标题样式默认带 w:keepNext。Heading 8 用来放图题，图题在图片
+    下方，再跟正文同页会把图片挤到下一页，所以这里单独取消。
+    """
+    ppr = style.element.find(qn('w:pPr'))
+    if ppr is None:
+        return
+    keep_next = ppr.find(qn('w:keepNext'))
+    if keep_next is not None:
+        ppr.remove(keep_next)
+
+
 def _set_theme_rfonts(rpr, major):
     """让 rPr 的字体跟随主题（标题用 major，正文用 minor）"""
     rfonts = rpr.find(qn('w:rFonts'))
@@ -257,6 +285,9 @@ def _link_default_fonts_to_theme(doc):
         ppr.append(spacing)
     spacing.set(qn('w:line'), _LINE_1_5)
     spacing.set(qn('w:lineRule'), 'auto')
+    # docDefaults 自带 10 磅段后间距（w:after=200），这里清掉，避免正文继承
+    spacing.set(qn('w:before'), '0')
+    spacing.set(qn('w:after'), '0')
 
 
 def _apply_numbering(doc):
@@ -407,11 +438,12 @@ def normalize(docx_path):
     _link_default_fonts_to_theme(doc)
     _config_theme(doc)
 
-    # 正文（Normal）：小四、1.5 倍行距
+    # 正文（Normal）：小四、1.5 倍行距、段前段后为 0
     normal = _find_style(doc, ['Normal', '正文'], 'Normal')
     if normal is not None:
+        # docDefaults 默认带 10 磅段后间距，正文统一改成段前段后 0
         _set_style_format(normal, _SZ_XIAO4, _LINE_1_5, page_break=False,
-                          major=False)
+                          major=False, zero_spacing=True)
 
     # 标题 1：小三、1.5 倍行距、段前分页、加粗、取消倾斜、段前段后间距为 0
     h1 = _find_style(doc, ['Heading 1', '标题 1', '1级标题'], 'Heading1')
@@ -437,6 +469,11 @@ def normalize(docx_path):
             _set_style_format(style, _SZ_XIAO4, _LINE_1_5, page_break=False,
                              major=True, bold=True, zero_spacing=True,
                              no_italic=True, center=True)
+            # 图表标题用的 8/9 级样式不能再「使用前隐藏」，否则样式库里找不到
+            _show_style_in_gallery(style)
+            if level == 8:
+                # 图题在图片下方，取消「与下段同页」避免把图挤到下一页
+                _disable_keep_with_next(style)
 
     # 无间隔样式：五号、1 倍行距
     _set_style_format(_find_style(doc, [_STYLE_NO_SPACING], 'NoSpacing'),

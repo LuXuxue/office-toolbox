@@ -33,7 +33,7 @@ from docx.opc.packuri import PackURI
 from docx.oxml.ns import qn
 from docx.oxml.shape import CT_Inline
 from docx.parts.image import ImagePart
-from docx.shared import Emu, Inches, RGBColor
+from docx.shared import Emu, Inches, Pt, RGBColor
 from docx.oxml import OxmlElement
 
 
@@ -633,12 +633,28 @@ def _html_table_layout(rows):
     return nrows, ncols, placements
 
 
+def _set_table_cell_no_spacing(para):
+    """表格内文字统一套「无间隔」样式（段前段后 0、单倍行距）
+
+    docDefaults 默认带 10 磅段后间距，表格里一格一段会把每一行都撑高；
+    模板里缺少 No Spacing 样式时退回直接格式，保证不留段间距。
+    """
+    try:
+        para.style = 'No Spacing'
+    except KeyError:
+        fmt = para.paragraph_format
+        fmt.space_before = Pt(0)
+        fmt.space_after = Pt(0)
+        fmt.line_spacing = 1.0
+
+
 def _fill_table_cell(cell, text, header=False):
     """把单元格内容写进已经合并好的 Word 单元格"""
     # 合并单元格会把被合并格里的空段落一起带进来，只保留第一个
     for para in list(cell.paragraphs)[1:]:
         para._p.getparent().remove(para._p)
     para = cell.paragraphs[0]
+    _set_table_cell_no_spacing(para)
     if text:
         _add_formatted_text(para, text)
     if header:
@@ -765,6 +781,34 @@ def _get_style_rpr(style):
     return rpr
 
 
+def _show_style_in_gallery(style):
+    """去掉「使用前隐藏」标记，让样式一直显示在 Word 的样式库里
+
+    w:semiHidden 表示样式面板里要等用过一次才出现，w:unhideWhenUsed 是配套的
+    「用后取消隐藏」。Word 内置的 Heading 8/9 默认带这两个标记，而图表标题
+    要用到它们，所以在 md→docx 时直接删掉。
+    """
+    el = style.element
+    for tag in ('w:semiHidden', 'w:unhideWhenUsed'):
+        node = el.find(qn(tag))
+        if node is not None:
+            el.remove(node)
+
+
+def _disable_keep_with_next(style):
+    """去掉样式的「与下段同页」（w:keepNext）
+
+    Word 内置标题样式默认带 w:keepNext。Heading 8 用来放图题，图题在图片
+    下方，再跟正文同页会把图片挤到下一页，所以这里单独取消。
+    """
+    ppr = style.element.find(qn('w:pPr'))
+    if ppr is None:
+        return
+    keep_next = ppr.find(qn('w:keepNext'))
+    if keep_next is not None:
+        ppr.remove(keep_next)
+
+
 def _set_style_format(style, sz, line, page_break=False, major=False,
                       bold=False, zero_spacing=False, no_italic=False,
                       center=False):
@@ -829,8 +873,9 @@ def _apply_style_formatting(doc):
     """
     normal = _find_style(doc, ['Normal', '正文'], 'Normal')
     if normal is not None:
+        # docDefaults 默认带 10 磅段后间距，正文统一改成段前段后 0
         _set_style_format(normal, _SZ_XIAO4, _LINE_1_5, page_break=False,
-                          major=False)
+                          major=False, zero_spacing=True)
 
     h1 = _find_style(doc, ['Heading 1', '标题 1', '1级标题'], 'Heading1')
     if h1 is not None:
@@ -853,6 +898,11 @@ def _apply_style_formatting(doc):
             _set_style_format(style, _SZ_XIAO4, _LINE_1_5, page_break=False,
                               major=True, bold=True, zero_spacing=True,
                               no_italic=True, center=True)
+            # 图表标题用的 8/9 级样式不能再「使用前隐藏」，否则样式库里找不到
+            _show_style_in_gallery(style)
+            if level == 8:
+                # 图题在图片下方，取消「与下段同页」避免把图挤到下一页
+                _disable_keep_with_next(style)
 
     no_spacing = _find_style(doc, ['No Spacing'], 'NoSpacing')
     if no_spacing is not None:
@@ -889,6 +939,9 @@ def _link_default_fonts_to_theme(doc):
     spacing = ppr.get_or_add_spacing()
     spacing.set(qn('w:line'), _LINE_1_5)
     spacing.set(qn('w:lineRule'), 'auto')
+    # docDefaults 自带 10 磅段后间距（w:after=200），这里清掉，避免正文继承
+    spacing.set(qn('w:before'), '0')
+    spacing.set(qn('w:after'), '0')
 
     _set_theme_rfonts(rpr, major=False)
 
@@ -2111,16 +2164,20 @@ def convert(md_path, heading_numbering=False):
 
                 for j, h in enumerate(headers):
                     cell = table.rows[0].cells[j]
-                    _add_formatted_text(cell.paragraphs[0], h)
+                    cell_para = cell.paragraphs[0]
+                    _set_table_cell_no_spacing(cell_para)
+                    _add_formatted_text(cell_para, h)
                     # 链接文字的 run 在 w:hyperlink 里，只遍历 para.runs 会漏掉
-                    for run in _iter_runs(cell.paragraphs[0]):
+                    for run in _iter_runs(cell_para):
                         run.bold = True
 
                 for r_idx, row in enumerate(rows):
                     for c_idx, cell_text in enumerate(row):
                         if c_idx < num_cols:
                             cell = table.rows[r_idx + 1].cells[c_idx]
-                            _add_formatted_text(cell.paragraphs[0], cell_text)
+                            cell_para = cell.paragraphs[0]
+                            _set_table_cell_no_spacing(cell_para)
+                            _add_formatted_text(cell_para, cell_text)
 
                 # 首行是表头：打上「重复标题行」，docx2md 回读时才能认成表头
                 _mark_header_row(table, 0)

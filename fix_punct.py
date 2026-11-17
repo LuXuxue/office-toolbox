@@ -9,9 +9,14 @@
   因此整段英文不受影响;
 - , ; : ? ! ( ) 在前一字符或后一字符为中文时替换,
   数字(如 10,000)、时间(如 14:30)、版本号(如 1.0)里的标点保留;
+- 圆括号成对处理:一对括号只要有一侧挨着中文就整对替换,
+  避免出现 “（…)” 这种一半中文一半英文的混搭;
+  段落内的软换行可跨行配对;
+  数量本来就不匹配的括号(缺一边或多一边)保持原样,不自动增删字符;
 - . 在前一字符或后一字符为中文、或前一字符为收尾字符且处于行尾时替换;
 - 双引号按全文配对转换为 “ ”(嵌套时用 ‘ ’),
   方向用错(如 ““ 或 ””)也会纠正;英文段落中的引号不动;
+- HTML 标签(如 <td rowspan="2">)整段保护,标签里的属性引号不动;
 - 公式($...$、$$...$$)、代码(``` … ``` 与 `...`)、
   URL 与链接地址、代码块中的标点一律不替换。
 - 自动替换计量单位等写法（如 m3/h → m³/h），
@@ -67,6 +72,26 @@ _SUB_MAP = {
 # 上下标标签，内容不允许跨行
 _SUBSUP_RE = re.compile(r'<(sup|sub)>(.*?)</\1>', re.IGNORECASE)
 
+# HTML 标签(含属性)，整段不参与标点替换。
+# 只认常见标签名，避免把正文里的 “a<b>c” 之类误当标签吞掉。
+_HTML_TAG_NAMES = (
+    'a|abbr|b|big|blockquote|br|caption|center|cite|code|col|colgroup'
+    '|dd|del|div|dl|dt|em|font|h[1-6]|hr|i|img|ins|kbd|li|mark|ol|p|pre'
+    '|q|s|samp|small|span|strike|strong|table|tbody|td|tfoot|th|thead'
+    '|tr|tt|u|ul|var'
+)
+_HTML_TAG_RE = re.compile(
+    r'<!--.*?-->|</?(?:' + _HTML_TAG_NAMES + r')(?:\s[^<>]*)?/?>',
+    re.IGNORECASE,
+)
+
+# 不带属性的 <sup>/<sub> 要留给 _replace_subsup 处理，不做保护区
+_BARE_SUBSUP_RE = re.compile(r'</?(?:sup|sub)>', re.IGNORECASE)
+
+# 圆括号(半角与全角)
+OPEN_PARENS = '(（'
+CLOSE_PARENS = ')）'
+
 # 这些收尾字符后面允许接中文句号
 ZH_BOUNDARY = '")]】》”’"”'
 
@@ -86,6 +111,27 @@ def is_zh(ch):
     )
 
 
+def _link_dest_spans(line):
+    """链接地址 `](…)` 的区间，地址里的小括号按层数配对。
+
+    只用 `\\]\\([^)]*\\)` 的话，`[图](http://a.com/x(1))` 会在第一个 `)` 处截断，
+    剩下的 `)` 被当成正文参与括号配对，从而把这一行里别的括号带跑偏。
+    """
+    spans = []
+    for m in re.finditer(r'\]\(', line):
+        i = m.end()
+        depth = 1
+        while i < len(line) and depth:
+            if line[i] == '(':
+                depth += 1
+            elif line[i] == ')':
+                depth -= 1
+            i += 1
+        if depth == 0:
+            spans.append((m.start(), i))
+    return spans
+
+
 def protected_spans(line):
     """返回行内不可改动区间(公式、代码、URL、链接地址、有序列表点)。"""
     # 代码围栏整行
@@ -103,7 +149,12 @@ def protected_spans(line):
     # URL 与链接地址
     spans += [m.span() for m in re.finditer(r'<https?://[^\s>]*>', line)]
     spans += [m.span() for m in re.finditer(r'https?://[^\s<>()]*', line)]
-    spans += [m.span() for m in re.finditer(r'\]\([^)]*\)', line)]
+    spans += _link_dest_spans(line)
+    # HTML 标签整体保护，标签里的属性引号/逗号不能被当成正文标点
+    for m in _HTML_TAG_RE.finditer(line):
+        if _BARE_SUBSUP_RE.fullmatch(m.group(0)):
+            continue
+        spans.append(m.span())
     # 有序列表标记的点(如 "1. " 或 "1.本" 或 "a. " 或 "b.本")
     m = re.match(r'\s*(?:\d+|[a-zA-Z])\.(?=\D|$)', line)
     if m:
@@ -164,28 +215,72 @@ def apply_replacements(line):
     return ''.join(parts)
 
 
-def fix_line(line, in_code_fence, quote_depth):
-    """处理单行。quote_depth 为当前未闭合的引号数(跨行保持)。
+def _near_zh(line, i):
+    """判断位置 i 的前后字符是否有一个是中文。"""
+    prev = line[i - 1] if i else ''
+    nxt = line[i + 1] if i + 1 < len(line) else ''
+    return is_zh(prev) or is_zh(nxt)
 
-    返回 (处理后的行, 更新后的 quote_depth)。
+
+def prepare_line(line):
+    """自动替换后计算保护区与“是否以中文为主”。
+
+    自动替换会改变长度(m3/ → m³/、<sup>2</sup> → ²)，所以保护区必须在替换后的行上重算。
+    返回 (处理后的行, 保护区掩码, 是否以中文为主)。
     """
-    if in_code_fence:
-        return line, quote_depth
-
-    # 自动替换(计量单位等)，必须在受保护区间断开后只替换未受保护部分；
-    # 替换会改变长度，后面的 protected_spans 要在替换后的行上重新计算
     line = apply_replacements(line)
-
     prot = merge_spans(protected_spans(line))
     mask = [False] * len(line)
     for s, e in prot:
         mask[s:e] = [True] * (e - s)
+    # 只在“可见文字”里统计，HTML 标签名、URL、代码里的英文不算，否则表格行会被判成英文行
+    visible = ''.join(ch for i, ch in enumerate(line) if not mask[i])
+    zh_count = sum(1 for ch in visible if is_zh(ch))
+    en_words = len(re.findall(r'[A-Za-z]+', visible))
+    return line, mask, zh_count >= en_words
 
-    # 本行是否以中文为主:中文字数 >= 英文单词数
-    zh_count = sum(1 for ch in line if is_zh(ch))
-    en_words = len(re.findall(r'[A-Za-z]+', line))
-    zh_dominant = zh_count >= en_words
 
+def paren_plans(prepared):
+    """对段落里成对的圆括号统一风格，返回每行的 {位置: 目标字符}。
+
+    以前逐个字符判断，会出现 “（最小管径De63,最大不超过De200)” 这种
+    左括号换了、右括号没换的情况：右括号前是英文、后是 HTML 标签，两侧都不挨中文。
+    现在先配对，再决定这一对怎么换：任一侧挨着中文(或本身已是全角)就整对换成全角。
+
+    数量本来就不匹配的括号一律不动，不增删字符：
+    多余的 `)` 不会被改成 `）`，没有右括号的 `(` 也不会被改成 `（`，
+    否则会凭空造出一个不闭合的全角括号。
+    段落内的软换行允许跨行配对；空行是段落边界，调用方分段处理。
+    """
+    plans = [{} for _ in prepared]
+    stack = []  # [(行号, 位置)]，记录还没闭合的左括号
+    for li, (line, mask, _) in enumerate(prepared):
+        for i, ch in enumerate(line):
+            if mask[i]:
+                continue
+            if ch in OPEN_PARENS:
+                stack.append((li, i))
+            elif ch in CLOSE_PARENS:
+                if not stack:
+                    continue  # 落单的右括号：保持原样
+                lo, o = stack.pop()
+                oline, _, o_dom = prepared[lo]
+                c_dom = prepared[li][2]
+                # 挨着中文要同时满足“该行以中文为主”，避免把英文行里的小括号改坏
+                zh_side = ((_near_zh(oline, o) and o_dom)
+                           or (_near_zh(line, i) and c_dom))
+                if zh_side or oline[o] == '（' or ch == '）':
+                    plans[lo][o] = '（'
+                    plans[li][i] = '）'
+    return plans
+
+
+def fix_line(line, mask, zh_dominant, pplan, quote_depth):
+    """把预处理好的单行渲染成中文标点版本。
+
+    quote_depth 为当前未闭合的引号数(跨行保持)，返回 (处理后的行, 更新后的 quote_depth)。
+    pplan 是该行成对括号的替换方案(见 paren_plans)。
+    """
     out = []
     for i, ch in enumerate(line):
         if mask[i]:
@@ -193,7 +288,9 @@ def fix_line(line, in_code_fence, quote_depth):
             continue
         prev = line[i - 1] if i else ''
         nxt = line[i + 1] if i + 1 < len(line) else ''
-        if ch in ZP_MAP:
+        if ch in OPEN_PARENS or ch in CLOSE_PARENS:
+            out.append(pplan.get(i, ch))
+        elif ch in ZP_MAP:
             # 前一字符或后一字符为中文时替换
             if zh_dominant and (is_zh(prev) or is_zh(nxt)):
                 out.append(ZP_MAP[ch])
@@ -241,17 +338,40 @@ def fix_line(line, in_code_fence, quote_depth):
 
 
 def fix_text(text):
-    """处理整个文本,保留原有行尾符。"""
+    """处理整个文本，保留原有行尾符。
+
+    按段落(空行分隔)成批处理：圆括号的配对要在段落范围内看，
+    这样软换行拆开的一对括号也能统一风格；围栏代码块整块跳过。
+    """
     lines = text.split('\n')
     out = []
     quote_depth = 0
     in_code_fence = False
     fence_re = re.compile(r'\s*(```|~~~)')
-    for line in lines:
+    i = 0
+    while i < len(lines):
+        line = lines[i]
         if fence_re.match(line):
             in_code_fence = not in_code_fence
-        line, quote_depth = fix_line(line, in_code_fence, quote_depth)
-        out.append(line)
+            out.append(line)
+            i += 1
+            continue
+        if in_code_fence or not line.strip():
+            out.append(line)
+            i += 1
+            continue
+        # 收集一个段落：连续的、非空且非围栏的行
+        block = []
+        while (i < len(lines) and lines[i].strip()
+               and not fence_re.match(lines[i])):
+            block.append(lines[i])
+            i += 1
+        prepared = [prepare_line(l) for l in block]
+        plans = paren_plans(prepared)
+        for (pl_line, mask, zh_dominant), plan in zip(prepared, plans):
+            pl_line, quote_depth = fix_line(
+                pl_line, mask, zh_dominant, plan, quote_depth)
+            out.append(pl_line)
     return '\n'.join(out)
 
 

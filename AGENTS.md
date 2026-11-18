@@ -172,6 +172,21 @@ Word 里的链接地址不一定在 `w:t` 旁边。抽文字只能拿到链接�
 - **IMAGE 张量是 `[B,H,W,C]` 浮点 0~1**，存 PNG 前要 `detach().float().cpu()` 再转 uint8，PIL 只吃 3 维。
 - **`VAEDecode.decode(vae, samples)` 的参数顺序与 `KSampler.sample()` 不同**，别凭节点输入顺序猜。
 
+### 22. 4 GB 卡（GTX 1650）的 dtype 与 `--gtx1650` 预设
+
+- **用 bf16，不要 fp16，也不要 fp32**。sm75 没有 bf16 硬件指令，torch 会走按 fp32 的通道（实测瘦 GEMM 1.6 TFLOPS，与 fp32 的 2.0 相当），而权重只占一半（2.6 GB vs 5.2 GB）；fp16 的瘦 GEMM 掉到 0.3 TFLOPS（慢 6 倍），模型级单请求慢 2 倍；fp32 权重 5.2 GB 装不进 4 GB，靠驱动换页后慢 8 倍。三种精度的识别结果逐字相同。
+- **bf16 的注意力在 sm75 上没有 memory-efficient 内核**（只有 efficient 的 fp16 分支），只能走 math，会把 `(头 × 序列²)` 实体化：整页 3456 patch 单层就要 1.8 GiB。所以阅读序的整页图单独走 `READING_ORDER_MAX_PIXELS`（`--gtx1650` 给 320000），识别请求仍用 `MAX_PIXELS`；实测输出与全分辨率版逐字一致。
+- **Windows 上显存超卖不报 OOM**：驱动把显存换页到内存，表现是“能跑，但 3 s/token”。判断依据是 `nvidia-smi` 的 used 贴着物理上限（4096 MiB）且 `reserved` 超过 `allocated` 一倍以上。`expandable_segments:True` 在这套 Windows + torch 2.15 上**能生效但必须禁用**：VMM 打映射时会 `Failed to create GPU mapping` / `cuMemSetAccess` 返回 OOM，随后分配器内部断言 `!handles_.at(i)` 直接崩掉整个文件（短跑 2~4 页看不出来，整本跑到第 6 批必踩）。真正的杠杆是把 chunk / 批 / 图缓存压小，再加 `RELEASE_CACHE_EACH_CHUNK`。
+- **换出图解码器要真的还显存**：从池里 `pop` 掉只是丢引用，KV 缓存由 CUDA Graph 持有，要 `del` + `gc.collect()` + `torch.cuda.empty_cache()` 才还给驱动（`_release_cuda_memory()`）。捕获新图前必须先做完这一步，否则新旧两张图短暂共存，正好够把 4 GB 卡顶到换页甚至 OOM。
+- **`--gtx1650` 只是预设，显式参数优先**（判据是仍等于 argparse 默认值）；`GRAPH_POOL_BUDGET_BYTES`、`GENERATE_KV_BUDGET_BYTES`、`VISION_CHUNK_PATCHES`、`VISION_OVERLAP`、`READING_ORDER_MAX_PIXELS`、`RELEASE_CACHE_EACH_CHUNK` 这些内部旋钮由 `_apply_gtx1650_preset` 改模块级全局。
+- **捕获新图前先按预算淘汰旧图**：StaticCache 创建时一次性分配，新旧两张图共存会多占 400~900 MiB，正好够把 4 GB 卡顶到换页。
+
+### 23. 版面模型（D-FINE）单张前向会输出全 NaN
+
+- **判据**：只送 1 张页面时，`pred_boxes` / `pred_scores` 300 个候选全是 NaN，`layout_postprocess` 抛 `Invalid layout response: page 0 candidate 0 score must be finite`，整份文件作废；同一页跟着别的页一起送就完全正常。与页内容、显存、dtype 都无关，纯 batch 维度的坑。
+- **踩法**：总页数是奇数时最后一批只有 1 页；`--pages 37-37` 这种单页调试也一样。
+- **修法**：`LocalLayoutRuntime.infer()` 里单张时复制一张凑成 2 张，取第 1 行。实测该行与“和别的页同批”时**逐元素相同**（最大差 0.0），批内位置也不影响结果，代价只有一次多余的页面前向（约 0.5 s）。这是 pdf2md 的接线层，不用改 `OXR/services/`。
+
 ## 改完自检
 
 - [ ] 行尾仍是 CRLF

@@ -53,6 +53,17 @@ PDF 里的图片导出到同目录的 <文件名>_media/。
                       「prompt + 预留」取 256 的整数倍，桶切换时重新捕获。
                       超出的行改由普通 generate 续跑，已结束的行不重跑。
 
+小显存显卡（如 4 GB 的 GTX 1650）直接用默认参数会顶满显存：Windows 驱动
+不报 OOM，而是把显存换页到内存，单步解码从几十毫秒变成几秒（实测 2 页
+716 s）。这类卡加 --gtx1650 会自动把 chunk、批大小、图解码缓存、视觉切块
+压到 4 GB 以内，命令行里显式给出的参数仍然优先：
+
+    python pdf2md.py D:\\docs\\a.pdf --gtx1650
+
+精度用 --dtype 选（auto/bf16/fp16/fp32）。GTX 1650 实测：bf16 与 fp32
+吞吐相当但权重只占一半（2.6 GB vs 5.2 GB），fp16 会落到慢路径，fp32 装
+不进 4 GB 显存，所以 auto 仍用 bf16。
+
 内部还有三处不对外暴露的并行：PDF 按 chunk 懒渲染（渲染与上一块推理重叠，
 不再整本前置渲染）、版面分析预取下一块、视觉塔跑在独立 CUDA 流上与下一批的
 解码重叠（视觉受限算力、解码受限带宽，互相当填空；按 patch 切块以免两条流
@@ -68,6 +79,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import gc
 import importlib
 import json
 import logging
@@ -89,6 +101,14 @@ DEFAULT_MODEL_DIR = OXR_ROOT / "models" / "OXR-1.0"
 # 与官方 vLLM processor 保持一致（见 models/OXR-1.0/plugins/vllm/oxr_vllm/oxr_processor.py）。
 MIN_PIXELS = 200704   # 448 * 448
 MAX_PIXELS = 921600   # 1280 * 720
+
+# 阅读序请求送的是整页图，像素数直接决定视觉塔的序列长度。视觉塔的注意力
+# 在 bf16 + sm75 上没有 memory-efficient 内核，只能走 math，会把
+# （头 × 序列²）的注意力矩阵实体化：3456 patch 的整页图单层就要 1.8 GiB。
+# 阅读序只需要判断“块与块谁先谁后”（bbox 由提示词给出），不必看清正文，
+# 所以小显存显卡可以单独把这张图降到 READING_ORDER_MAX_PIXELS。识别请求
+# 仍用 MAX_PIXELS，不受影响（实测同一份 PDF 的输出与全分辨率版逐字一致）。
+READING_ORDER_MAX_PIXELS = MAX_PIXELS
 
 LOGGER = logging.getLogger("pdf2md")
 
@@ -247,6 +267,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--device", default="auto", help="推理设备：auto / cuda / cpu（默认：auto）"
     )
     parser.add_argument(
+        "--dtype", choices=("auto", "bf16", "fp16", "fp32"), default="auto",
+        help=(
+            "模型精度（默认：auto，CUDA 上用 bf16）。本机（GTX 1650，sm75）实测："
+            "bf16 与 fp32 吞吐相当但权重只占一半；fp16 会落到一条很慢的路径"
+            "（慢约 2 倍）；fp32 权重 5.2 GB 装不进 4 GB 显存，靠驱动换页，慢约 8 倍"
+        ),
+    )
+    parser.add_argument(
+        "--gtx1650", action="store_true",
+        help=(
+            "按 4 GB 显存的小卡（GTX 1650）预设参数：缩小 chunk、批大小、图解码"
+            "缓存与阅读序图片分辨率，压住显存峰值，避免驱动换页导致的成倍变慢。"
+            "命令行里显式给出的参数优先"
+        ),
+    )
+    parser.add_argument(
         "--dpi", type=int, default=150, help="PDF 渲染 DPI（默认：150，与官方服务一致）"
     )
     parser.add_argument(
@@ -288,6 +324,71 @@ def build_parser() -> argparse.ArgumentParser:
         "--verbose", action="store_true", help="输出调试日志"
     )
     return parser
+
+
+# --------------------------------------------------------------------------- #
+# 小显存预设
+# --------------------------------------------------------------------------- #
+
+# --gtx1650 的预设。GTX 1650 只有 4 GB 显存（实测可用约 3.3 GB，桌面已占
+# 0.8 GB），bf16 权重就占 2.6 GB，留给 KV 与激活值的只有 0.6 GB 左右。默认
+# 参数是按 12 GB 卡调的（chunk 8、批 16、图缓存 2048、图池 3 GiB），照搬会
+# 顶满显存：Windows 驱动不像 Linux 那样直接 OOM，而是把显存换页到内存，
+# 表现成“能跑，但每个 token 要 3 秒”（实测 2 页 716 s、峰值 3900/4096 MiB）。
+GTX1650_ARGS = {
+    # 显存峰值基本随 chunk 线性上涨，4 GB 卡上 2 页一批才安全
+    "chunk_pages": 2,
+    # 一批的 KV = 批 × 缓存长度 × 112 KiB；4 行 × 1024 token ≈ 448 MiB。
+    # 实测批 4 比批 2 快约 10%（预填充与视觉塔的固定开销摊得更薄）
+    "batch_size": 4,
+    # 版面模型的批大小同样按显存算，2 页一批足够摊薄开销
+    "layout_batch_size": 2,
+    # 版面分析与识别串行，少一条在途批就少一份激活值
+    "layout_concurrency": 1,
+    # 图解码的缓存上限：缓存长度按「prompt + 预留 512」取 256 的倍数，所以
+    # 1024 覆盖 prompt ≤512 的请求（绝大多数文字块）；大表格块的 prompt 能到
+    # 1000+，装不下时会退回普通 generate 只续跑那几行（实测比把上限提到 1280
+    # 更划算——1280 会让所有中等长度请求都换成更大的图，常规页反而慢 20%）
+    "graph_cache_len": 1024,
+}
+
+GTX1650_GLOBALS = {
+    # generate 兜底的 DynamicCache 预算：批 4、prompt 1200 时约 250 MiB
+    "GENERATE_KV_BUDGET_BYTES": 256 * 1024 ** 2,
+    # 图解码池只留一张 4 行 × 1024 token 的图（448 MiB），换桶就重新捕获
+    "GRAPH_POOL_BUDGET_BYTES": 512 * 1024 ** 2,
+    # 视觉塔一次前向的 patch 上限。视觉注意力在 bf16 + sm75 上只能走 math，
+    # 峰值按“行数 × 序列²”算，切小一点才压得住
+    "VISION_CHUNK_PATCHES": 1024,
+    # 视觉与解码重叠要靠第二条流，两条流的显存池不共享；4 GB 卡上省下的时间
+    # 抵不过多出来的那份池子，先关掉，让两条路径共用同一份显存
+    "VISION_OVERLAP": False,
+    # 阅读序的整页图降到约 1250 patch：3456 patch 时单层注意力就要 1.8 GiB，
+    # 会把 4 GB 卡直接顶到换页（实测同一份 PDF 的输出与全分辨率版逐字一致）
+    "READING_ORDER_MAX_PIXELS": 320000,
+    # 每个 chunk 结束时回收一次显存，别让上一块的临时块把下一块挤到换页
+    "RELEASE_CACHE_EACH_CHUNK": True,
+}
+
+
+def _apply_gtx1650_preset(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> List[str]:
+    """套用小显存预设，返回实际生效的参数名。
+
+    只在用户**没有显式给出**该参数时覆盖：判断依据是当前值仍等于 argparse
+    的默认值。这样 `--gtx1650 --batch-size 8` 仍按 8 跑，方便逐项试。
+    """
+    defaults = {action.dest: action.default for action in parser._actions}
+    applied: List[str] = []
+    for dest, value in GTX1650_ARGS.items():
+        if getattr(args, dest, None) == defaults.get(dest):
+            setattr(args, dest, value)
+            applied.append(f"{dest}={value}")
+    for name, value in GTX1650_GLOBALS.items():
+        globals()[name] = value
+        applied.append(f"{name}={value}")
+    return applied
 
 
 # --------------------------------------------------------------------------- #
@@ -431,6 +532,17 @@ GRAPH_KV_BYTES_PER_TOKEN = 28 * 2 * 8 * 128 * 2
 # 实际生成量增长：批 16、prompt 1200、生成到 8192 时约 16.8 GB，会把整张卡
 # 吃光，看起来就像卡死。兜底前按这个预算把请求拆成小组，单组不超过它。
 GENERATE_KV_BUDGET_BYTES = 3 * 1024 ** 3
+
+# 图解码池的 KV 总预算（见 GreedyGraphDecoderPool）。默认值按 12 GB 卡调过；
+# 4 GB 卡上必须压到几百 MiB，否则池里几张图加起来就顶满显存，驱动换页会让
+# 单步解码从几十毫秒退化到几秒。
+GRAPH_POOL_BUDGET_BYTES = 3 * 1024 ** 3
+
+# 每个 chunk 之间主动回收一次显存（--gtx1650 打开）。
+# 12 GB 卡上没必要：分配器的缓存池留着还能复用，empty_cache() 只会让下一次
+# 分配重新 cudaMalloc。4 GB 卡上不一样——上一块的视觉激活值、已换出的图解码
+# 器都还挂在分配器的缓存池里，等到捕获新图时才因为"没有连续显存"而失败。
+RELEASE_CACHE_EACH_CHUNK = False
 
 # 攒批的最长等待（秒）。攒满的批能把视觉编码器与预填充的固定开销摊薄，所以
 # 愿意多等一小会儿；但本地生成本来就是瓶颈，密集到一定程度后继续等只会多
@@ -624,6 +736,24 @@ class _DegenerateLogitsProcessor:
         return scores
 
 
+def _release_cuda_memory() -> None:
+    """把 Python 侧的垃圾清掉，再把分配器缓存池还给驱动。
+
+    CUDA Graph 的 KV 缓存和视觉激活值都由 Python 对象持有；只 drop 引用不够，
+    要等回收之后 empty_cache() 才看得见这些块。4 GB 卡上顺序很重要：先把旧
+    图解码器真正释放，再去捕获新图，否则新旧两张图会短暂共存。
+    """
+    gc.collect()
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001 - 回收失败不该影响推理
+        return
+
+
 class GreedyGraphDecoderPool:
     """按 (批大小, 缓存长度) 复用图解码器，避免为每种组合重复捕获。
 
@@ -638,7 +768,8 @@ class GreedyGraphDecoderPool:
 
     池子的字节预算不能按“显存还空着多少”给满：本机 12 GB 卡上留到 4 GiB
     就开始抖动（32 页实测：3 GiB→64 s，4 GiB→106 s，5 GiB→215 s），
-    所以默认只给 3 GiB，宁可每个 chunk 重新捕获一次（0.2~0.5 s）。
+    所以默认只给 3 GiB（GRAPH_POOL_BUDGET_BYTES；--gtx1650 会压到 512 MiB），
+    宁可每个 chunk 重新捕获一次（0.2~0.5 s）。
     """
 
     # 批大小阶梯：补齐到不小于实际行数的 2 的幂
@@ -651,7 +782,7 @@ class GreedyGraphDecoderPool:
         max_batch: int,
         max_cache_len: int,
         device,
-        max_bytes: int = 3 * 1024 ** 3,
+        max_bytes: Optional[int] = None,
         max_entries: int = 4,
     ) -> None:
         self.llm = llm
@@ -659,7 +790,9 @@ class GreedyGraphDecoderPool:
         self.max_batch = max(1, int(max_batch))
         self.max_cache_len = max(256, int(max_cache_len))
         self.device = device
-        self.max_bytes = max(0, int(max_bytes))
+        self.max_bytes = max(
+            0, int(GRAPH_POOL_BUDGET_BYTES if max_bytes is None else max_bytes)
+        )
         self.max_entries = max(1, int(max_entries))
         self._decoders: Dict[Tuple[int, int], GreedyGraphDecoder] = {}
         self._order: List[Tuple[int, int]] = []
@@ -697,6 +830,25 @@ class GreedyGraphDecoderPool:
         batch, cache_len = key
         if cache_len <= prompt_length + 2:
             return None
+        # 先按预算把要换出的图清掉，再捕获新的：捕获时新旧两张图会短暂共存
+        # （StaticCache 在创建时一次分配），4 GB 卡上这 400~900 MiB 的瞬时
+        # 叠加足够把显存顶过物理容量、触发驱动换页。
+        new_bytes = batch * cache_len * GRAPH_KV_BYTES_PER_TOKEN
+        evicted: List[GreedyGraphDecoder] = []
+        with self._lock:
+            while self._order and (
+                len(self._order) >= self.max_entries
+                or self._decoder_bytes() + new_bytes > self.max_bytes
+            ):
+                stale = self._order.pop(0)
+                decoder = self._decoders.pop(stale, None)
+                if decoder is not None:
+                    evicted.append(decoder)
+        if evicted:
+            # 光从字典里 pop 掉不够：图解码器可能还被调用方持有，而它的 KV
+            # 缓存要等对象真被回收才还给分配器。先清空列表再回收一次。
+            del evicted[:]
+            _release_cuda_memory()
         try:
             decoder = GreedyGraphDecoder(
                 self.llm, self.tokenizer, batch=batch, cache_len=cache_len,
@@ -713,12 +865,20 @@ class GreedyGraphDecoderPool:
             # KV 缓存是「批 × 缓存长度 × 112 KB」量级，留太多张会把显存吃光，
             # 但留太少又会因为桶来回切换而反复捕获（每次 0.2~0.5 s）。按总字节
             # 数淘汰，块大小不同的几张图才能长期共存。
+            dropped: List[GreedyGraphDecoder] = []
             while self._order and (
                 len(self._order) > self.max_entries
                 or self._decoder_bytes() > self.max_bytes and len(self._order) > 1
             ):
                 stale = self._order.pop(0)
-                self._decoders.pop(stale, None)
+                dropped_decoder = self._decoders.pop(stale, None)
+                if dropped_decoder is not None:
+                    dropped.append(dropped_decoder)
+        if dropped:
+            # 新图已经在用显存了，这里只把淘汰掉的 KV 真还回去，免得它跟着
+            # 分配器的缓存池一直涨到顶住物理上限。
+            del dropped[:]
+            _release_cuda_memory()
         LOGGER.info("图解码器就绪：批 %d，缓存 %d token", batch, cache_len)
         return decoder
 
@@ -963,6 +1123,40 @@ class GreedyGraphDecoder:
         )
 
 
+DTYPE_ALIASES = {
+    "auto": None,
+    "bf16": "bf16",
+    "bfloat16": "bf16",
+    "fp16": "fp16",
+    "float16": "fp16",
+    "half": "fp16",
+    "fp32": "fp32",
+    "float32": "fp32",
+}
+
+
+def _resolve_dtype(torch, device, name: Optional[str] = None):
+    """解析模型权重与计算的精度。
+
+    默认（auto）在 CUDA 上用 bf16：权重只占一半，且在本机这类没有 bf16
+    硬件指令的卡上，torch 会退回按 fp32 的通道计算，实测吞吐与 fp32 基本
+    一致（见 --dtype 的说明）。CPU 上仍用 fp32（半精度在 CPU 上更慢）。
+    """
+    key = DTYPE_ALIASES.get(str(name or "auto").strip().lower())
+    if key is None and str(name or "auto").strip().lower() != "auto":
+        raise SystemExit(f"不支持的精度 {name!r}，可选：auto、bf16、fp16、fp32")
+    if key is None:
+        return torch.bfloat16 if device.type == "cuda" else torch.float32
+    dtype = {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "fp32": torch.float32,
+    }[key]
+    if device.type != "cuda" and dtype is not torch.float32:
+        raise SystemExit("CPU 上只能用 fp32 精度。")
+    return dtype
+
+
 class OXRTextBackend:
     """用 transformers 本地加载 OXR-1.0，按批执行视觉问答。
 
@@ -979,13 +1173,14 @@ class OXRTextBackend:
         graph_decode: bool = False,
         graph_batch: int = 4,
         graph_cache_len: int = 2048,
+        dtype: Optional[str] = None,
     ) -> None:
         import torch
         from transformers import GenerationConfig
 
         self.torch = torch
         self.device = device
-        self.dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        self.dtype = _resolve_dtype(torch, device, dtype)
         self.stats = stats
 
         module = _load_model_module(model_dir)
@@ -1070,7 +1265,7 @@ class OXRTextBackend:
 
     # -- 预处理（纯 CPU） -------------------------------------------------- #
 
-    def prepare(self, prompt: str, image_bgr):
+    def prepare(self, prompt: str, image_bgr, max_pixels: Optional[int] = None):
         """把一张裁剪图和提示词变成模型输入，全程不碰 GPU。"""
         import cv2
         from PIL import Image
@@ -1087,18 +1282,25 @@ class OXRTextBackend:
             }
         ]
         input_ids, pixel_values, grid_thws = self.model.preprocess_inputs(
-            messages, min_pixels=MIN_PIXELS, max_pixels=MAX_PIXELS
+            messages,
+            min_pixels=MIN_PIXELS,
+            max_pixels=int(max_pixels or MAX_PIXELS),
         )
         return input_ids[0], pixel_values, grid_thws
 
     def prepare_batch(self, items: Sequence[Tuple[str, Any]]):
-        """逐张预处理；单张失败只影响它自己，不会毁掉整批。"""
+        """逐张预处理；单张失败只影响它自己，不会毁掉整批。
+
+        items 的元素是 (prompt, image) 或 (prompt, image, max_pixels)：阅读序
+        请求带的是整页图，按 READING_ORDER_MAX_PIXELS 单独限分辨率，其余请求
+        仍用 MAX_PIXELS（见 _prepare_loop）。
+        """
         started = time.perf_counter()
         prepared = []
         failures: List[Tuple[int, Exception]] = []
-        for position, (prompt, image) in enumerate(items):
+        for position, item in enumerate(items):
             try:
-                prepared.append(self.prepare(prompt, image))
+                prepared.append(self.prepare(*item))
             except Exception as error:  # noqa: BLE001 - 交给调用方重试
                 failures.append((position, error))
         if self.stats is not None:
@@ -1816,7 +2018,16 @@ class LocalOXRClient:
         while True:
             try:
                 group = await self._next_group()
-                items = [(request.prompt, request.image) for request in group]
+                items = [
+                    (
+                        request.prompt,
+                        request.image,
+                        READING_ORDER_MAX_PIXELS
+                        if request.key[0] == "reading_order"
+                        else MAX_PIXELS,
+                    )
+                    for request in group
+                ]
                 try:
                     prepared, failures = await loop.run_in_executor(
                         self._prepare_pool, self.backend.prepare_batch, items
@@ -2065,8 +2276,16 @@ class LocalLayoutRuntime:
 
         started = time.perf_counter()
         rgb = [cv2.cvtColor(image, cv2.COLOR_BGR2RGB) for image in images]
-        ready = preprocess_images(rgb, self._runtime.settings.image_size)
+        # 这套权重在只送 1 张时前向会输出全 NaN（300 个候选的分数与坐标都是
+        # NaN，随后被 layout_postprocess 判成 “score must be finite”，整份文件
+        # 作废）；送 2 张就完全正常。奇数页的最后一页、--pages 只指定一页时都
+        # 会踩到。复制一张凑成 2 张再取第 1 行即可：实测该行与“和别的页同批”
+        # 时逐元素相同（最大差 0.0），代价只有一次多余的页面前向（约 0.5 s）。
+        batch = rgb if len(rgb) > 1 else rgb * 2
+        ready = preprocess_images(batch, self._runtime.settings.image_size)
         outputs, _timings = self._runtime.infer(ready)
+        if len(rgb) == 1:
+            outputs = tuple(value[:1] for value in outputs)
         # 阈值过滤和 NMS 由 oxr.pipeline.postprocess.layout_postprocess 统一完成。
         if self.stats is not None:
             self.stats.add_layout(len(images), time.perf_counter() - started)
@@ -2337,6 +2556,7 @@ class LocalEngine:
             graph_decode=self.args.graph_decode != "off",
             graph_batch=max(1, int(self.args.batch_size)),
             graph_cache_len=max(256, int(self.args.graph_cache_len)),
+            dtype=self.args.dtype,
         )
         oxr_client = LocalOXRClient(
             text_backend, settings.oxr_model, self.args.batch_size
@@ -2710,6 +2930,10 @@ async def process_one(
 
         # 本块的页面位图只在这一轮用得到，及早释放（渲染下一块时会重新解码）。
         chunk_images.clear()
+        # 4 GB 卡上把本块用过的视觉激活值与临时块还给驱动：留着也复用不上
+        # （下一块要的是另一批形状），反而会在捕获新图时挡住连续显存。
+        if RELEASE_CACHE_EACH_CHUNK:
+            _release_cuda_memory()
 
         elapsed = time.perf_counter() - chunk_started
         detail = "".join(
@@ -2819,6 +3043,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s %(message)s",
     )
+    if args.gtx1650:
+        applied = _apply_gtx1650_preset(parser, args)
+        LOGGER.info("已启用 GTX 1650（4 GB 显存）预设：%s", "，".join(applied))
     logging.getLogger("transformers").setLevel(logging.ERROR)
     logging.getLogger("urllib3").setLevel(logging.ERROR)
     logging.getLogger("pikepdf").setLevel(logging.WARNING)

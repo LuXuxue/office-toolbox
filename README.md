@@ -9,6 +9,7 @@
 | `fix_punct.py` | `.md` 标点、计量单位与上下标后处理 |
 | `normalize_docx.py` | `.docx` 字体、字号、行距、标题与多级编号标准化 |
 | `pdf2md.py` | `.pdf` → `.md` / `.json`（本地 OXR-1.0 OCR） |
+| `image-moss.py` | 调用本地 ComfyUI 生成图像（MOSS 模型） |
 | `mdviewer.html` | 独立的 Markdown 查看器 |
 
 ## 安装
@@ -17,7 +18,7 @@
 pip install -r requirements.txt
 ```
 
-要求 Python 3.8 及以上（开发与验证环境为 3.13）。除 `pdf2md.py` 外的脚本都是单文件，可以单独拷走使用。
+要求 Python 3.8 及以上（开发与验证环境为 3.13）。除 `pdf2md.py` 外的脚本都是单文件，可以单独拷走使用；`image-moss.py` 另需本机 ComfyUI 环境。
 
 - `docx2pdf.py` 需要本机安装 Microsoft Word；`pywin32` 已按平台条件写入依赖。
 - `pptx2md.py` 需要 `python-pptx`；把 EMF/WMF 图片转成 PNG 需要 Pillow，缺了只会跳过这类图片。
@@ -33,6 +34,12 @@ huggingface-cli download SoMarkAI/OXR-1.0 --local-dir ./OXR/models/OXR-1.0
 ```
 
 推理默认使用 CUDA；没有 GPU 时可以加 `--device cpu`，但会慢一个数量级。
+
+`image-moss.py` 直接调用本机 ComfyUI 的源码与模型，不启动 ComfyUI 服务，也不依赖自定义节点。需要在 ComfyUI 所用的 Python 环境里运行，并保证 ComfyUI 目录（默认 `E:\ComfyUI`）下有三份默认模型：
+
+- `models/diffusion_models/MOSS/moss_image_sft_4step_v2.0_int8_convrot.safetensors`
+- `models/text_encoders/Qwen3.5-9B-heretic-v2_int8_convrot.safetensors`
+- `models/vae/flux2-vae_small.safetensors`
 
 ## 便携版
 
@@ -122,6 +129,31 @@ python pdf2md.py -d path/to/dir -o path/to/out --formats md
 | `--model <目录>` | 换一份模型权重 |
 | `--verbose` | 打印调试日志 |
 
+### 文生图（本地 ComfyUI）
+
+```bash
+python image-moss.py "a cozy reading nook by a window, morning light"
+python image-moss.py "..." -o out --name reading-nook          # 指定目录与文件名
+python image-moss.py "..." --width 1024 --height 1536 --seed 42 --steps 8
+```
+
+正向提示词必填，其余都是选填。默认参数：1536×1024、seed=1、steps=6、cfg=1、`er_sde` / `simple`，模型名见「安装」一节。宽高会取最近的 16 的倍数。图片默认存到执行命令时的当前目录，文件名是 `年月日-时分秒.png`；PNG 里带提示词与采样参数。
+
+常用参数：
+
+| 参数 | 作用 |
+|---|---|
+| `-o`, `--output-dir` | 输出目录，默认当前目录 |
+| `--name` | 输出文件名（可带 `.png`），默认时间戳 |
+| `--width`, `--height` | 图像宽高，按 16 取最近值 |
+| `--seed`, `--steps`, `--cfg` | 采样参数 |
+| `--sampler-name`, `--scheduler` | 采样器与调度器 |
+| `--unet-name`, `--clip-name`, `--vae-name` | 三个模型的文件名 |
+| `--comfyui` | ComfyUI 源码目录，默认 `E:\ComfyUI` |
+| `--no-ck-attention`, `--no-fast-disk` | 关闭默认开启的两项加速 |
+
+脚本直接使用 ComfyUI 自带的节点类，不启动服务、不依赖第三方节点；默认按 ComfyUI 的 `--use-ck-attention --fast-disk` 打开加速。
+
 ### md 标点修正
 
 ```bash
@@ -159,6 +191,7 @@ python normalize_docx.py path/to/file.docx
 - `md2docx.py` 的公式转换只覆盖 `docx2md.py` 输出的 LaTeX 子集，解析不了时退回 LaTeX 原文。
 - `pptx2md.py` 只读 `.pptx` / `.pptm`，不保留版式、动画与母版；OLE 对象只导出预览图。
 - `pdf2md.py` 把每页重新 OCR，不读取 PDF 文本层；插图是位图裁切，图表数据不会变成表格。
+- `image-moss.py` 需要本机有 ComfyUI 源码与上面三个模型文件，且必须用 ComfyUI 的 Python 环境运行；只适用于 MOSS 模型。
 - `pdf2md.py` 依赖上游 `OXR/` 子目录，`mdviewer.html` 依赖上游 `lib/` 子目录；许可证见各自的 `LICENSE`。
 
 ## 开发

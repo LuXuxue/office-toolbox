@@ -10,6 +10,7 @@ md2docx.py                .md → .docx
 docx2pdf.py               .doc / .docx → .pdf
 pptx2md.py                .pptx → .md
 pdf2md.py                 .pdf → .md / .json（本地 OXR 推理，依赖 OXR/）
+image-moss.py             调本地 ComfyUI 出图（PNG；依赖 ComfyUI 与模型权重）
 fix_punct.py              .md 标点修正（英文标点 → 中文标点；附带计量单位、上下标后处理）
 normalize_docx.py         .docx 格式标准化（主题字体、字号行距、标题多级列表）
 mdviewer.html             独立的 Markdown 查看器
@@ -39,6 +40,16 @@ OXR/
 - **公式** — OMML 元素在 `m` 命名空间，属性也是 `m`；`md2docx.py` 切分时 `$$…$$` 必须排在 `$…$` 前面。
 - **行内 HTML** — `<sup>`/`<sub>`/`<u>`/`<b>`/`<i>`/`<br>` 要能写回 Word；判断新增 run 不能存 `id()`，要存元素本身。
 - **其他转换器** — `fix_punct.py` 只做 md 后处理，公式/代码/URL/链接地址不替换，非 UTF-8 先转 UTF-8；`pptx2md.py` 只做 pptx → md；`normalize_docx.py` 只在样式层统一格式并套用 1~9 级编号；`pdf2md.py` 的本地推理接线都在自己文件里，`OXR/` 尽量不改。
+
+## 图像生成
+
+`image-moss.py` 不启动 ComfyUI 服务：把 ComfyUI 目录插进 `sys.path`，直接调用 ComfyUI 自带的节点类（`UNETLoader` / `CLIPLoader` / `VAELoader` / `CLIPTextEncode` / `SkipLayerGuidanceDiTSimple` / `EmptyFlux2LatentImage` / `KSampler` / `VAEDecode`）依次执行，存图用 Pillow。**不要引入第三方节点或 ComfyUI 私有接口**，否则 ComfyUI 升级就没法用了。
+
+- `--comfyui` 默认 `E:\ComfyUI`（可用环境变量 `COMFYUI_PATH` 覆盖），目录下必须有 `nodes.py`。
+- 默认参数：seed=1、steps=6、cfg=1、`er_sde`/`simple`、1536×1024；宽高按 16 四舍五入。
+- 默认模型：`MOSS\moss_image_sft_4step_v2.0_int8_convrot.safetensors` + `Qwen3.5-9B-heretic-v2_int8_convrot.safetensors` + `flux2-vae_small.safetensors`，三个名字都能用参数替换。
+- 输出默认写到执行命令时的当前目录，文件名是 `年月日-时分秒.png`；`-o/--output-dir`、`--name` 可改。
+- 加速按 ComfyUI 的 `--use-ck-attention --fast-disk` 默认打开，`--no-ck-attention` / `--no-fast-disk` 可关。
 
 ## 环境陷阱
 
@@ -154,10 +165,18 @@ Word 里的链接地址不一定在 `w:t` 旁边。抽文字只能拿到链接�
 
 用「分节符」结束封面/目录那一节时，Word 把 `w:sectPr` 放进最后一个段落的 `w:pPr`，那个段落标记常带着「标题 1」样式（继承编号）。它没有文字，**Word 不把它算进编号序列**：正文第一个一级标题仍是「1」。判据见 `NumberingResolver._is_empty_section_break()`：带 `w:sectPr` 且没有可见内容才跳过。不带分节符的空标题段落 Word 照样占号，别按「空段落一律不占号」改。
 
+### 21. `image-moss.py` 的 ComfyUI 接线
+
+- **`comfy.cli_args` 不会自动解析命令行**：脚本不经过 `main.py`，`args` 全是默认值。`--use-ck-attention` / `--fast-disk` 要在 **`import nodes`（进而 import `comfy.model_management`、`comfy.ldm.modules.attention`）之前**直接写 `comfy.cli_args.args.use_ck_attention` / `args.fast_disk`；attention 后端是 import 时绑定的，晚设无效。跑起来会打印实际绑定的 `optimized_attention.__name__`，正常应为 `attention_comfy_kitchen_int8`。
+- **模型要在退出前主动释放**：`del` 模型后调用 `comfy.model_management.unload_all_models()`，否则解释器退出时 `ModelPatcher.__del__` 会因模块已清空报 `'NoneType' object has no attribute 'ON_DETACH'`。
+- **IMAGE 张量是 `[B,H,W,C]` 浮点 0~1**，存 PNG 前要 `detach().float().cpu()` 再转 uint8，PIL 只吃 3 维。
+- **`VAEDecode.decode(vae, samples)` 的参数顺序与 `KSampler.sample()` 不同**，别凭节点输入顺序猜。
+
 ## 改完自检
 
 - [ ] 行尾仍是 CRLF
 - [ ] `docx2md.py` 与 `md2docx.py` 同步改：`docx2md.py` 新写出的标记，`md2docx.py` 要能解析回 Word；`md2docx.py` 新写进 docx 的格式，`docx2md.py` 也要能还原成同样的标记
 - [ ] 改到标题/编号时，`###### 图…`、`###### 表…` 仍分别还原成 Heading 8/9，`-n` 的图表编号仍与 `normalize_docx.py` 一致，往返不出现重复图号/表号
 - [ ] 注释是中文
+- [ ] 改到 `image-moss.py` 时能正常出图（快速冒烟：`--steps 1 --width 512 --height 512`）
 - [ ] `git status` 里没有模型权重、`OXR/models/`、`*_media/`、`outputs/`

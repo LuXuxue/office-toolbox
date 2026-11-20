@@ -78,6 +78,43 @@ def _looks_like_math(tex):
     return not re.search(r'\s', tex)
 
 
+# docx2md 会把正文里原样出现的 Markdown 记号转义成 \*、\_、\~ 等，
+# 免得回转时被当成格式（1*2*3=6 曾经被读成斜体，星号整个消失）。
+# 解析格式之前先把 \X 换成私用区占位符：占位符不是任何标记字符，不会被
+# 星号/反引号/方括号的正则匹配到；写进 Word 时再还原成原字符。
+# 反斜杠本身也要算，否则 C:\Users 往返后会变成 C:Users。
+_ESCAPE_CHARS = '\\`*_~[]'
+_ESCAPE_TO_PLACEHOLDER = {ch: chr(0xE000 + i)
+                          for i, ch in enumerate(_ESCAPE_CHARS)}
+_PLACEHOLDER_TO_ESCAPE = {v: k for k, v in _ESCAPE_TO_PLACEHOLDER.items()}
+_ESCAPE_RE = re.compile(r'\\([\\`*_~\[\]])')
+
+
+def _protect_escapes(text):
+    """把 \\X 换成占位符，让 X 不参与 Markdown 格式解析"""
+    if '\\' not in text:
+        return text
+    return _ESCAPE_RE.sub(lambda m: _ESCAPE_TO_PLACEHOLDER[m.group(1)], text)
+
+
+def _restore_escapes(text, keep_backslash=False):
+    r"""把占位符还原成字符
+
+    keep_backslash 给代码段用：代码里的反斜杠是字面量，
+    `a\*b` 应该原样写回 Word，而不是变成 `a*b`。
+    """
+    if not any(ch in text for ch in _PLACEHOLDER_TO_ESCAPE):
+        return text
+    out = []
+    for c in text:
+        ch = _PLACEHOLDER_TO_ESCAPE.get(c)
+        if ch is None:
+            out.append(c)
+        else:
+            out.append('\\' + ch if keep_backslash else ch)
+    return ''.join(out)
+
+
 def _add_formatted_text(para, text):
     """写入段落文本，识别行内公式与 markdown 行内格式"""
     if not text:
@@ -101,6 +138,8 @@ def _add_formatted_text(para, text):
 
 def _add_html_segment(para, text):
     """写入公式以外的文本，识别 <br>、<sup>、<sub> 等行内 HTML 标签"""
+    # 公式已经在上一步切走，这里的 \X 都是正文里的字面记号，先保护起来
+    text = _protect_escapes(text)
     pos = 0
     for m in _HTML_INLINE_RE.finditer(text):
         if m.start() > pos:
@@ -157,7 +196,7 @@ def _add_html_styled(para, text, attr):
 
 def _add_mono_run(para, text):
     """写入等宽字体 run（代码块与行内代码共用）"""
-    run = para.add_run(text)
+    run = para.add_run(_restore_escapes(text, keep_backslash=True))
     # font.name 只设 ascii/hAnsi，中文字符还要显式指定 eastAsia
     run.font.name = 'Consolas'
     run._element.rPr.rFonts.set(qn('w:eastAsia'), 'Consolas')
@@ -461,7 +500,7 @@ def _add_formatted_runs(para, text):
     pos = 0
     for m in pattern.finditer(text):
         if m.start() > pos:
-            para.add_run(text[pos:m.start()])
+            para.add_run(_restore_escapes(text[pos:m.start()]))
 
         if m.group('bi'):
             _add_marked_runs(para, m.group('bi_t'), bold=True, italic=True)
@@ -482,7 +521,7 @@ def _add_formatted_runs(para, text):
         pos = m.end()
 
     if pos < len(text):
-        para.add_run(text[pos:])
+        para.add_run(_restore_escapes(text[pos:]))
 
 
 # ══════════════════════════════════════════════════════════════════

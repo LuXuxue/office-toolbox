@@ -2163,7 +2163,7 @@ def _run_segments(r_element, doc=None) -> list:
     for node in r_element:
         tag = node.tag
         if tag == qn('w:t'):
-            texts.append(node.text or "")
+            texts.append(_escape_md_text(node.text or ""))
         elif tag in (qn('w:br'), qn('w:cr')):
             texts.append(_render_break(node))
         elif tag == qn('w:tab'):
@@ -2183,7 +2183,7 @@ def _run_segments(r_element, doc=None) -> list:
         else:
             # 其他子元素（如 w:ruby 的注音）继续往里找文字
             for sub in node.iter(qn('w:t')):
-                texts.append(sub.text or "")
+                texts.append(_escape_md_text(sub.text or ""))
     flush()
     return segs
 
@@ -2218,6 +2218,18 @@ def _textbox_segments(node, doc=None) -> list:
 def _textbox_text(node, doc=None) -> str:
     """文本框里的文字（扁平文本，图片不算 —— 含图片要用 _drawing_text）"""
     return "".join(seg.text for seg in _textbox_segments(node, doc))
+
+
+# 正文里原样出现的 Markdown 行内记号必须转义，否则 md2docx 会把它当成格式：
+# 1*2*3=6 会被读成「1<em>2</em>3=6」，星号消失；`代码`、[链接]、~~删除~~ 同理。
+# 竖线由表格渲染单独转义（GFM 单元格里的 \| 已有专门处理），
+# $ 与 < 分别走公式 / HTML 标签的解析路径，不在这里动。
+_MD_ESCAPE_RE = re.compile(r'([\\`*_~\[\]])')
+
+
+def _escape_md_text(text: str) -> str:
+    """把正文里原样出现的 Markdown 记号转义成 \\X"""
+    return _MD_ESCAPE_RE.sub(r'\\\1', text)
 
 
 def _segments_to_markdown(segs) -> str:
@@ -2661,7 +2673,7 @@ def _collect_cell_text(parent, doc, parts):
     for child in parent:
         tag = child.tag
         if tag == qn('w:t'):
-            parts.append(child.text or "")
+            parts.append(_escape_md_text(child.text or ""))
         elif tag == qn('w:r'):
             _collect_cell_run_text(child, doc, parts)
         elif tag == qn('w:hyperlink'):
@@ -2724,7 +2736,7 @@ def _collect_cell_run_text(r_element, doc, parts):
     for node in r_element:
         tag = node.tag
         if tag == qn('w:t'):
-            inner.append(node.text or "")
+            inner.append(_escape_md_text(node.text or ""))
         elif tag in (qn('w:br'), qn('w:cr')):
             inner.append(_render_break(node))
         elif tag == qn('w:tab'):
@@ -2740,7 +2752,7 @@ def _collect_cell_run_text(r_element, doc, parts):
         else:
             # 其他子元素（如 w:ruby 的注音）继续往里找文字
             for sub in node.iter(qn('w:t')):
-                inner.append(sub.text or "")
+                inner.append(_escape_md_text(sub.text or ""))
 
     text = "".join(inner)
     if text:

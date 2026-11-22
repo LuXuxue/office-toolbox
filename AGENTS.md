@@ -10,12 +10,14 @@ md2docx.py                .md → .docx
 docx2pdf.py               .doc / .docx → .pdf
 pptx2md.py                .pptx → .md
 pdf2md.py                 .pdf → .md / .json（本地 OXR 推理，依赖 OXR/）
+pdfcompress.py            .pdf → .pdf（按 DPI 重编码图像压缩；可选整页 PNG 化）
 image-moss.py             调本地 ComfyUI 出图（PNG；依赖 ComfyUI 与模型权重）
 fix_punct.py              .md 标点修正（英文标点 → 中文标点；附带计量单位、上下标后处理）
 normalize_docx.py         .docx 格式标准化（主题字体、字号行距、标题多级列表）
 mdviewer.html             独立的 Markdown 查看器
 mdviewer_update_smd.bat   mdviewer.html 的后端渲染组件更新程序
 requirements.txt
+pngquant/                 pdfcompress.py 用的 pngquant 可执行文件
 lib/                      mdviewer.html 的后端渲染组件资源库
 OXR/
   oxr/                        上游流水线最小子集（版面结果 → md/json）
@@ -188,6 +190,18 @@ Word 里的链接地址不一定在 `w:t` 旁边。抽文字只能拿到链接�
 - **踩法**：总页数是奇数时最后一批只有 1 页；`--pages 37-37` 这种单页调试也一样。
 - **修法**：`LocalLayoutRuntime.infer()` 里单张时复制一张凑成 2 张，取第 1 行。实测该行与“和别的页同批”时**逐元素相同**（最大差 0.0），批内位置也不影响结果，代价只有一次多余的页面前向（约 0.5 s）。这是 pdf2md 的接线层，不用改 `OXR/services/`。
 
+### 24. pdfcompress.py 的两阶段图像替换与整页判断
+
+- **MuPDF 保存时会把会话内动过的图像流重编码为 raw RGB + Flate**：`replace_image()` / `insert_image()` 不保留原 filter。图像在 PDF 内的真实体积 ≈ `zlib.compress(裸 RGB, 6)`，**不能用磁盘文件体积**（如 pngquant 产物）当参照，PNG 候选的入 PDF 估计必须用裸像素压缩。
+- **JPEG 替换必须走字节手术（stage 2）**：stage 1 保存后，把 JPEG 候选字节直接拼进已保存文件的图像对象（字典 `/Filter /DCTDecode` + 流），批量平移所有编号更高的对象偏移，最后重建 XRef 表（一遍扫 `N 0 obj`，startxref 在最后一行）。
+- **`replace_image` 会清掉 `/SMask`**：先记下原 SMask 引用，替换后用 `xref_set_key(x, "SMask", "N 0 R")` 写回（普通字符串即可）。
+- **读原 XRef 流要撤 PNG 预测**：MuPDF 存的 XRef 流带 `/DecodeParms << /Columns N /Predictor 12 >>` + FlateDecode。zlib 解压后必须逐行做 PNG 反预测（每行 N+1 字节：首字节是行内 filter 类型 0/2/3/4，其余是数据，Up 预测要用上一行值）。不撤预测，条目表整体错位，重建 XRef 会抄进垃圾条目。
+- **扫对象不能要求 `<<`**：存在标量对象（`N 0 obj\n12345\nendobj`，纯数字被间接引用），没有字典。扫描模式用 `N 0 obj` + 空白即可；若要求 `<<`，这类对象会被误标 free，引用它的地方变成悬挂引用（MuPDF `insert_pdf` 报 `cannot find object in xref`，逐页读取却正常，极难发现）。
+- **整页替换的参照用“该页在文档中的边际存储”**：内容流 +（图像大小 ÷ 引用该图像的页数），字体不计（全文档共享只存一份）。**不要用“该页单独提取成单页 PDF”的文件体积**：那会把共享字体、共享图像完整复制到每页，文本密集页的判断必然失真。
+- **全局守卫（剪枝式）**：逐页的“边际存储”判断不可单独依赖（共享对象会被每页重编码、对象头与 XRef 有固定开销）。先用全部胜出页构建整文件，不更小就只保留胜算最强的一半重建，再不更小就保留四分之一；仍不更小才保留图片压缩版。胜算 = 边际存储 − PNG 入 PDF 体积估计。
+- **页面资源里声明但从未绘制的图像**（`get_image_rects` 返回空）要跳过，否则 stage 1 崩。
+- pngquant 退出码 98 = “压缩后没变小”，属正常结束，按接受处理。
+
 ## 改完自检
 
 - [ ] 行尾仍是 CRLF
@@ -195,4 +209,5 @@ Word 里的链接地址不一定在 `w:t` 旁边。抽文字只能拿到链接�
 - [ ] 改到标题/编号时，`###### 图…`、`###### 表…` 仍分别还原成 Heading 8/9，`-n` 的图表编号仍与 `normalize_docx.py` 一致，往返不出现重复图号/表号
 - [ ] 注释是中文
 - [ ] 改到 `image-moss.py` 时能正常出图（快速冒烟：`--steps 1 --width 512 --height 512`）
+- [ ] 改到 `pdfcompress.py` 时跑一份真实 PDF 冒烟（几页即可），确认输出不大于输入、页面渲染正常
 - [ ] `git status` 里没有模型权重、`OXR/models/`、`*_media/`、`outputs/`

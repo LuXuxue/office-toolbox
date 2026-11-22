@@ -9,6 +9,7 @@
 | `fix_punct.py` | `.md` 标点、计量单位与上下标后处理 |
 | `normalize_docx.py` | `.docx` 字体、字号、行距、标题与多级编号标准化 |
 | `pdf2md.py` | `.pdf` → `.md` / `.json`（本地 OXR-1.0 OCR） |
+| `pdfcompress.py` | `.pdf` → `.pdf`（按 DPI 重编码图像压缩；可选整页 PNG 化） |
 | `image-moss.py` | 调用本地 ComfyUI 生成图像（MOSS 模型） |
 | `mdviewer.html` | 独立的 Markdown 查看器 |
 
@@ -129,6 +130,32 @@ python pdf2md.py -d path/to/dir -o path/to/out --formats md
 | `--model <目录>` | 换一份模型权重 |
 | `--verbose` | 打印调试日志 |
 
+### PDF 压缩
+
+```bash
+python pdfcompress.py 原文.pdf                 # 输出 原文-96DPI.pdf
+python pdfcompress.py 原文.pdf 输出.pdf --dpi 120
+python pdfcompress.py 原文.pdf --compress-pages  # 图片压缩后，再把划算的整页替换成 PNG
+```
+
+默认 96 DPI：只处理超过该 DPI 的图像，缩到 96 DPI 后生成 pngquant PNG 与 JPEG 两个候选，取比原图小的最小者替换，保证文件只小不大。JPEG 默认质量 65、4:2:0 色度下采样，可改。
+
+`--compress-pages` 在图片压缩之后再走一遍整页压缩：每页按 `--dpi` 渲染成 PNG 并用 pngquant（`--page-quality`，默认 0-20）压缩，只有当 PNG 小于该页在文档中的边际存储（内容流 + 分摊后的共享图像，字体不计）时才替换整页。替换后该页文字不可选中。
+
+常用参数：
+
+| 参数 | 作用 |
+|---|---|
+| `--dpi 96` | 目标 DPI |
+| `--jpeg-quality 65` | JPEG 质量 |
+| `--png-quality 0-10` | 图片压缩的 pngquant 质量区间 |
+| `--page-quality 0-20` | 整页压缩的 pngquant 质量区间 |
+| `--compress-pages` | 追加整页 PNG 化（默认关） |
+| `--workdir DIR` | 候选图临时目录（默认 `输入名.imgwork`） |
+| `--pngquant PATH` | pngquant 路径（默认 `pngquant/pngquant.exe`） |
+
+依赖 PyMuPDF、Pillow 与 `pngquant/` 目录下的 pngquant 可执行文件（已随仓库提供 Windows 版）。
+
 ### 文生图（本地 ComfyUI）
 
 ```bash
@@ -192,6 +219,7 @@ python normalize_docx.py path/to/file.docx
 - `pptx2md.py` 只读 `.pptx` / `.pptm`，不保留版式、动画与母版；OLE 对象只导出预览图。
 - `pdf2md.py` 把每页重新 OCR，不读取 PDF 文本层；插图是位图裁切，图表数据不会变成表格。
 - `image-moss.py` 需要本机有 ComfyUI 源码与上面三个模型文件，且必须用 ComfyUI 的 Python 环境运行；只适用于 MOSS 模型。
+- `pdfcompress.py` 的 `--compress-pages` 把整页替换成一张图片：该页文字不可选中、不可搜索；默认只在替换后整文件不增大时才替换。
 - `pdf2md.py` 依赖上游 `OXR/` 子目录，`mdviewer.html` 依赖上游 `lib/` 子目录；许可证见各自的 `LICENSE`。
 
 ## 开发

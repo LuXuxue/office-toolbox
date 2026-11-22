@@ -10,6 +10,7 @@
 | `normalize_docx.py` | `.docx` 字体、字号、行距、标题与多级编号标准化 |
 | `pdf2md.py` | `.pdf` → `.md` / `.json`（本地 OXR-1.0 OCR） |
 | `pdfcompress.py` | `.pdf` → `.pdf`（按 DPI 重编码图像压缩；可选整页 PNG 化） |
+| `pdfunembed.py` | `.pdf` → `.pdf`（清理不可见元素：嵌入字体、结构树、图层等） |
 | `image-moss.py` | 调用本地 ComfyUI 生成图像（MOSS 模型） |
 | `mdviewer.html` | 独立的 Markdown 查看器 |
 
@@ -155,6 +156,23 @@ python pdfcompress.py 原文.pdf --compress-pages  # 图片压缩后，再把划
 | `--pngquant PATH` | pngquant 路径（默认 `pngquant/pngquant.exe`） |
 
 依赖 PyMuPDF、Pillow 与 `pngquant/` 目录下的 pngquant 可执行文件（已随仓库提供 Windows 版）。
+
+### PDF 清理不可见元素
+
+```bash
+python pdfunembed.py 原文.pdf              # 输出 原文-unembed.pdf
+python pdfunembed.py 原文.pdf 输出.pdf
+```
+
+清理内容（全部默认执行）：
+
+- **嵌入字体文件**：字体描述符里的 FontFile/FontFile2/FontFile3 流，并去掉 /BaseFont 的 6 位子集前缀（如 `/VFTWUL+SimSun` → `/SimSun`），查看器按字体名匹配系统字体替代显示。字体对象保留编码、字宽与 ToUnicode，版式与文字映射不变。
+- **结构树**：tagged PDF 的 /StructTreeRoot。Word 直存的 PDF 里常有数万个 /StructElem 对象（测试件 10.3 万个、约 4 MB 压缩体积），页面上完全不可见。
+- **死 XObject**：页面资源里声明了、内容流里从未绘制的图像/表单对象。
+- **书签**（大纲）、**图层**（OCG）、**嵌入文件附件**、**XMP 元数据**：整类移除。
+- **隐藏文字**：内容流里不可见的文字绘制操作——文字渲染模式（`Tr`）为 3/4/6/7（不填充不描边）的文字。CAD 导出件里供 SHX 文字选择用的背景字属于此类（常配 `3 Tr`，渲染时不可见），一并删除。不按颜色判断，正常的白字/灰字不受影响。
+
+注意：字体移除后，输出文件依赖查看端系统装有同名（或可替代）字体；缺失时查看器会自行替换成外观相近的字体，渲染抗锯齿会有细微差异。只依赖 PyMuPDF。
 
 ### 文生图（本地 ComfyUI）
 

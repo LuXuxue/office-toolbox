@@ -202,6 +202,20 @@ Word 里的链接地址不一定在 `w:t` 旁边。抽文字只能拿到链接�
 - **页面资源里声明但从未绘制的图像**（`get_image_rects` 返回空）要跳过，否则 stage 1 崩。
 - pngquant 退出码 98 = “压缩后没变小”，属正常结束，按接受处理。
 
+### 25. pdfunembed.py 清理不可见元素
+
+- **字体体积在描述符的字体文件流**（`/FontFile`、`/FontFile2`、`/FontFile3`），不在字体对象本身。字体对象保留 `/BaseFont`、`/Encoding`、`/Widths`、`/ToUnicode`，版式与字形映射不变，查看器按字体名匹配系统字体替代。描述符要**全对象扫 `/Type /FontDescriptor`**，不能只从字体对象走（存在孤儿描述符）。
+- **`/BaseFont` 的 6 位子集前缀要剥掉**（`VFTWUL+SimSun` → `SimSun`），否则名称匹配不到真字体。描述符的 `/FontName` 同样处理。
+- **PyMuPDF 2.1 的 `xref_get_key` 对 xref 型键返回字符串**（`'102 0 R'`，完整引用文本）而不是 int，要用它做 xref 操作时先解析。
+- **`xref_set_key(x, key, "null")` 是设字面 null 值，不是删键**（PyMuPDF 2.1 没有删键 API）：顶层键（catalog/描述符）设 null 无副作用——被引用的对象照样被 `garbage=4` 回收；但**嵌套键**（如页面 `/Resources /Properties`）必须用文本重建删：取字典文本 → 正则定位顶层键 → 平衡括号扫描找内联字典终点（跳过 `(...)` 字符串）→ 拼回新文本 → `set_key` 整键替换。
+- **内容流里引用资源只有裸名**（`/Image24 ... Do`），没有 `N 0 R` 形式。判断 XObject 是否被使用时，扫内容流里出现的名字标记集合，不能找 `N 0 R`；且**必须扫解压后的流**（`xref_stream`），`xref_stream_raw` 是 Flate 压缩数据，扫出来是空的（曾导致全部 150 个在用的图像被误判为死对象）。
+- **内容流里有 BDC 标记内联字典**（`/P <</MCID 0>> BDC`），手写 tokenizer 必须处理孤立的 `>`（不能死循环）；op 分支必须保证每次循环 `i` 前进。
+- **内容流重建只能拼 token 自身字节 `raw[s:e]`**，绝不能 `raw[prev:e]` 跨间隙取——间隙里就是被删的死 token，跨取等于没删（曾整段重建与原流完全相同）。重建后两个“裸” token（num/name/op）相邻会合并成单个 token，相邻时补一个空格；字符串/数组前后不需要。
+- **OCG 的引用链比想象的多**：除 catalog 的 `/OCGs`、`/OCProperties` 和页面的 `/OC` 外，**页面 `/Resources /Properties` 字典也直接引用 OCG 对象**（CAD 导出件）。不删它，OCG 对象不会被垃圾回收。
+- **隐藏文字删除**：内容流里不可见的文字绘制操作，删字符串/数组 + 显示操作符（Tj/TJ/'/"）。**判据只有文字渲染模式 `N Tr` 为 3/4/6/7**（不填充不描边即不可见）——CAD 导出件 SHX 选择字的标准做法（常配超大字号 200~412pt、自定义 CMap）。**不要按颜色判断**（白字/零透明度/中性灰）：既漏掉黑色隐藏字，又有误删文档里合法白字/灰字的风险。实测某 CAD 件全部 10,301 个文字块都是 `3 Tr`（可见标签实为矢量图形），删净后渲染逐像素不变。`Tr` 属文字状态，须随 `q`/`Q` 存取。
+- **匿名 CID 字典够不着**：Type0 的 `/DescendantFonts` 数组里可能直接内嵌匿名 CIDFont 字典（字典没有 xref），`xref_set_key` 改不到它的 `/BaseFont`。无妨：查看器做字体替代时用的是 Type0 层的 `/BaseFont`。
+- 验证口径：输出里 `FontFile*` 键为 0、StructElem 为 0、`insert_pdf` 零 MuPDF 错误、页数不变、逐页 `get_text()`/`get_images()` 不抛错、隐藏文字件渲染逐页对比。
+
 ## 改完自检
 
 - [ ] 行尾仍是 CRLF
@@ -210,4 +224,5 @@ Word 里的链接地址不一定在 `w:t` 旁边。抽文字只能拿到链接�
 - [ ] 注释是中文
 - [ ] 改到 `image-moss.py` 时能正常出图（快速冒烟：`--steps 1 --width 512 --height 512`）
 - [ ] 改到 `pdfcompress.py` 时跑一份真实 PDF 冒烟（几页即可），确认输出不大于输入、页面渲染正常
+- [ ] 改到 `pdfunembed.py` 时跑真实 PDF 冒烟：Word 件（结构树/字体）与 CAD 件（图层/隐藏文字）各一份，确认 `FontFile*`/StructElem 键为 0、文字可提取、`insert_pdf` 零错误、渲染正常
 - [ ] `git status` 里没有模型权重、`OXR/models/`、`*_media/`、`outputs/`

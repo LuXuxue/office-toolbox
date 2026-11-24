@@ -13,6 +13,7 @@
 
 依赖:
     pip install python-docx
+    pip install Pillow   # 可选，WMF/EMF 矢量图栅格化成 PNG 用（Windows 上走 GDI）
 
 """
 
@@ -71,34 +72,256 @@ class InlineSeg(NamedTuple):
 # 在原位写 `![](…/image1.png)`；convert() 无论 CLI 还是当库调用都会
 # 配置输出目录，`<!-- image: image1.png -->` 注释只在绕过 convert()
 # 直接调用 parse_docx/render 的场景出现，至少保留「此处有图」这个事实。
+# WMF/EMF 是浏览器显示不了的矢量元文件（老式公式常存成这种），导出时栅格化
+# 成同名 PNG，md 里也就引用 .png。优先交给 Word 渲染：Pillow/GDI 播放 MathType
+# 公式时会因字体替换导致字形重叠错位，只有 Word 自己的排版和文档里一致。
 _MEDIA = None
+_CANVASES = None  # 画布 docPr id -> 整图 PNG 字节（由 _render_canvases 填）
 _VML_NS = 'urn:schemas-microsoft-com:vml'
+_CANVAS_NS = 'http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas'
+_CANVAS_RASTER_DPI = 300
+
+# 原图按物理尺寸存储，72 dpi 下往往只有几十像素宽，因此放大到可读
+# 分辨率再栅格化，保证文字清晰。
+_VECTOR_EXTS = {".wmf", ".emf"}
+_WMF_RASTER_DPI = 300
 
 
 class _MediaDir:
-    """图片落盘器：懒建目录，同一张图只写一次"""
+    """图片落盘器：懒建目录，同内容只写一次，重名时自动避让"""
 
     def __init__(self, directory: Path, rel_prefix: str):
         self.directory = directory
         self.rel_prefix = rel_prefix
-        self.written = set()
+        self.written = {}  # 文件名 -> 内容，用于去重与重名避让
 
     def save(self, name: str, blob: bytes) -> str:
-        if name not in self.written:
-            try:
-                self.directory.mkdir(parents=True, exist_ok=True)
-                (self.directory / name).write_bytes(blob)
-                self.written.add(name)
-            except OSError as e:
-                print(f"警告: 图片写入失败 {name}: {e}", file=sys.stderr)
-                return ""
+        # 同名同内容直接复用；同名不同内容另起一个名字，避免相互覆盖
+        if name in self.written:
+            if self.written[name] == blob:
+                return f"{self.rel_prefix}/{name}"
+            stem, suffix = Path(name).stem, Path(name).suffix
+            i = 2
+            while f"{stem}-{i}{suffix}" in self.written:
+                i += 1
+            name = f"{stem}-{i}{suffix}"
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True)
+            (self.directory / name).write_bytes(blob)
+            self.written[name] = blob
+        except OSError as e:
+            print(f"警告: 图片写入失败 {name}: {e}", file=sys.stderr)
+            return ""
         return f"{self.rel_prefix}/{name}"
 
 
-def _media_ref(doc, rid: str):
+def _word_metafile_to_png(blob: bytes, name: str, size_pt=None):
+    """用 Word 渲染 WMF/EMF 再栅格化成 PNG，返回 PNG 字节；不可用返回 None
+
+    Pillow/GDI 播放老式 MathType 公式元文件时，Symbol 等字体替换会让字形重叠
+    错位（公式内容与 Word 里看到的不一致）。Word 自己排版再导出 PDF，能逐字
+    还原文档里的显示效果。size_pt 是文档里声明的显示尺寸 (宽pt, 高pt)，照它
+    设置能保持和 Word 一样的视觉大小。需要 Windows + Word + pywin32 + PyMuPDF。
+    """
+    if sys.platform != "win32":
+        return None
+    tmpdir = None
+    word = None
+    try:
+        import os
+        import tempfile
+        import pythoncom
+        import win32com.client
+        try:
+            import pymupdf as fitz
+        except ImportError:
+            import fitz
+
+        tmpdir = tempfile.mkdtemp(prefix="docx2md_wmf_")
+        suffix = Path(name).suffix or ".wmf"
+        src = os.path.join(tmpdir, "image" + suffix)
+        pdf = os.path.join(tmpdir, "image.pdf")
+        with open(src, "wb") as f:
+            f.write(blob)
+
+        pythoncom.CoInitialize()
+        try:
+            # DispatchEx 另起一个 Word 进程，Quit() 不会关掉用户已开的 Word
+            word = win32com.client.DispatchEx("Word.Application")
+            word.Visible = False
+            word.DisplayAlerts = 0
+            doc = word.Documents.Add()
+            try:
+                shape = doc.InlineShapes.AddPicture(src, False, True, doc.Content)
+                if size_pt and size_pt[0] and size_pt[1]:
+                    shape.Width, shape.Height = size_pt
+                ps = doc.PageSetup
+                ps.TopMargin = ps.BottomMargin = ps.LeftMargin = ps.RightMargin = 20
+                doc.ExportAsFixedFormat(pdf, 17)  # wdExportFormatPDF
+            finally:
+                doc.Close(False)
+        finally:
+            if word is not None:
+                word.Quit()
+            pythoncom.CoUninitialize()
+
+        pdfdoc = fitz.open(pdf)
+        try:
+            page = pdfdoc[0]
+            # 取所有文字/图片/矢量块的并集做裁剪区，去掉页边空白
+            rects = []
+            for b in page.get_text("dict")["blocks"]:
+                if b.get("type") == 1 and b.get("bbox"):
+                    rects.append(fitz.Rect(b["bbox"]))
+                for line in b.get("lines", []):
+                    for span in line.get("spans", []):
+                        rects.append(fitz.Rect(span["bbox"]))
+            for d in page.get_drawings():  # 纯矢量元文件在 PDF 里没有文字块
+                if d.get("rect"):
+                    rects.append(fitz.Rect(d["rect"]))
+            clip = rects[0] if rects else page.rect
+            for r in rects[1:]:
+                clip |= r
+            clip = fitz.Rect(clip.x0 - 2, clip.y0 - 2, clip.x1 + 2, clip.y1 + 2)
+            zoom = _WMF_RASTER_DPI / 72
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
+            return pix.tobytes("png")
+        finally:
+            pdfdoc.close()
+    except Exception as e:
+        print(f"警告: Word 渲染矢量图失败 {name}: {e}", file=sys.stderr)
+        return None
+    finally:
+        if tmpdir is not None:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _render_canvases(docx_path: str) -> dict:
+    """把文档里的 Word 绘图画布整体渲染成 PNG，返回 {docPr id: PNG 字节}
+
+    画布里的图片和文字在 OOXML 里是并列的形状，逐个导出会把排版拆散。
+    交给 Word 导出 PDF，再按画布在页面上的矩形裁剪，得到的整图与 Word 一致。
+    没有画布、没有 Word 或渲染失败时返回空字典，调用方维持原来的逐个导出。
+    """
+    # 先扫 XML 快速判断有没有画布，没有就别启动 Word（动辄几秒）
+    try:
+        import zipfile
+        with zipfile.ZipFile(docx_path) as z:
+            has_canvas = False
+            for n in z.namelist():
+                if n.endswith('.xml') and n.startswith('word/'):
+                    text = z.read(n).decode('utf-8', 'ignore')
+                    if 'wordprocessingCanvas' in text or 'editas="canvas"' in text:
+                        has_canvas = True
+                        break
+    except Exception:
+        has_canvas = False
+    if not has_canvas or sys.platform != "win32":
+        return {}
+
+    import os
+    import re
+    import shutil
+    import tempfile
+    import pythoncom
+    import win32com.client
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        import fitz
+
+    tmpdir = None
+    word = None
+    result = {}
+    try:
+        pythoncom.CoInitialize()
+        try:
+            # DispatchEx 另起一个 Word 进程，Quit() 不会关掉用户已开的 Word
+            word = win32com.client.DispatchEx("Word.Application")
+            word.Visible = False
+            word.DisplayAlerts = 0
+            doc = word.Documents.Open(os.path.abspath(docx_path), ReadOnly=True)
+            try:
+                boxes = []
+                for i in range(1, doc.Shapes.Count + 1):
+                    shp = doc.Shapes.Item(i)
+                    if shp.Type != 20:  # msoCanvas：绘图画布
+                        continue
+                    m = re.search(r'(\d+)\s*$', shp.Name)
+                    cid = int(m.group(1)) if m else i
+                    # Left/Top 相对列/段落；Information(5)/(6) 给出锚点的页面坐标
+                    x = (shp.Left if shp.RelativeHorizontalPosition == 1
+                         else shp.Anchor.Information(5) + shp.Left)
+                    y = (shp.Top if shp.RelativeVerticalPosition == 1
+                         else shp.Anchor.Information(6) + shp.Top)
+                    boxes.append((cid, shp.Anchor.Information(3),
+                                  x, y, shp.Width, shp.Height))
+                if not boxes:
+                    return {}
+                tmpdir = tempfile.mkdtemp(prefix="docx2md_canvas_")
+                pdf = os.path.join(tmpdir, "doc.pdf")
+                doc.ExportAsFixedFormat(pdf, 17)  # wdExportFormatPDF
+            finally:
+                doc.Close(False)
+        finally:
+            if word is not None:
+                word.Quit()
+            pythoncom.CoUninitialize()
+
+        pdfdoc = fitz.open(pdf)
+        try:
+            zoom = _CANVAS_RASTER_DPI / 72
+            for cid, pageno, x, y, w, h in boxes:
+                page = pdfdoc[pageno - 1]
+                clip = fitz.Rect(x, y, x + w, y + h) & page.rect
+                if clip.is_empty:
+                    continue
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom),
+                                      clip=clip, alpha=False)
+                result[cid] = pix.tobytes("png")
+        finally:
+            pdfdoc.close()
+    except Exception as e:
+        print(f"警告: 绘图画布渲染失败: {e}", file=sys.stderr)
+        return {}
+    finally:
+        if tmpdir is not None:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    return result
+
+
+def _rasterize_vector(blob: bytes, name: str, size_pt=None):
+    """把 WMF/EMF 矢量元文件栅格化成 PNG，返回 (字节, 新文件名)；失败返回 None
+
+    优先用 Word 渲染（和文档里显示一致），没有 Word 时退回 Pillow/GDI。
+    两者都失败就返回 None，调用方退回写原始文件，不至于把转换流程弄崩。
+    """
+    png = _word_metafile_to_png(blob, name, size_pt)
+    if png is None:
+        try:
+            import io
+            from PIL import Image
+
+            im = Image.open(io.BytesIO(blob))
+            im.load(dpi=_WMF_RASTER_DPI)
+            if im.mode not in ("RGB", "RGBA"):
+                im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
+            buf = io.BytesIO()
+            im.save(buf, format="PNG")
+            png = buf.getvalue()
+        except Exception as e:
+            print(f"警告: 矢量图转 PNG 失败 {name}: {e}", file=sys.stderr)
+            return None
+    return png, str(Path(name).with_suffix(".png"))
+
+
+def _media_ref(doc, rid: str, size_pt=None):
     """把一个图片关系 id 落成磁盘文件，返回 Markdown 里用的相对路径
 
     写盘失败或关系缺失时返回占位注释，调用方据此仍能在原文位置留下标记。
+    WMF/EMF 会先栅格化成 PNG，否则 Markdown 查看器显示不了。
+    size_pt 是文档声明的显示尺寸 (宽pt, 高pt)，传给 Word 渲染器保持原比例。
     """
     part = None
     try:
@@ -115,12 +338,38 @@ def _media_ref(doc, rid: str):
         name = f"{rid}.png"
     if not blob:
         return f"<!-- image: {name} (missing) -->"
+    # 矢量元文件浏览器显示不了，栅格化成 PNG；失败就退回原样写盘
+    if Path(name).suffix.lower() in _VECTOR_EXTS:
+        raster = _rasterize_vector(blob, name, size_pt)
+        if raster is not None:
+            blob, name = raster
     if _MEDIA is None:
         return f"<!-- image: {name} -->"
     rel = _MEDIA.save(name, blob)
     if not rel:
         return f"<!-- image: {name} (write failed) -->"
     return f"![]({rel})"
+
+
+def _shape_size_pt(el):
+    """从图片元素往上找声明的显示尺寸 (宽pt, 高pt)，找不到返回 (None, None)
+
+    DrawingML 写在 wp:extent（EMU，1pt=12700EMU）；老式 VML 写在 v:shape 的
+    style 里，形如 `width:161.25pt;height:33.2pt`。
+    """
+    while el is not None:
+        if el.tag == qn('wp:extent'):
+            cx, cy = el.get('cx'), el.get('cy')
+            if cx and cy:
+                return int(cx) / 12700, int(cy) / 12700
+        style = el.get('style') or ''
+        w = re.search(r'\bwidth:\s*([\d.]+)pt', style, re.I)
+        h = re.search(r'\bheight:\s*([\d.]+)pt', style, re.I)
+        if w or h:
+            return (float(w.group(1)) if w else None,
+                    float(h.group(1)) if h else None)
+        el = el.getparent()
+    return None, None
 
 
 def _image_segments(node, doc=None) -> list:
@@ -138,18 +387,21 @@ def _image_segments(node, doc=None) -> list:
         txbx_pics.update(txbx.iter(f'{{{_VML_NS}}}imagedata'))
 
     rids = []
+    sizes = {}
     for el in node.iter(qn('a:blip')):
         if el in txbx_pics:
             continue
         rid = el.get(qn('r:embed')) or el.get(qn('r:link'))
         if rid:
             rids.append(rid)
+            sizes[rid] = _shape_size_pt(el)
     for imagedata in node.iter(f'{{{_VML_NS}}}imagedata'):
         if imagedata in txbx_pics:
             continue
         rid = imagedata.get(qn('r:id'))
         if rid:
             rids.append(rid)
+            sizes[rid] = _shape_size_pt(imagedata)
 
     segs = []
     seen = set()
@@ -157,10 +409,36 @@ def _image_segments(node, doc=None) -> list:
         if rid in seen:
             continue
         seen.add(rid)
-        ref = _media_ref(doc, rid)
+        ref = _media_ref(doc, rid, sizes.get(rid))
         if ref:
             segs.append(InlineSeg(ref))
     return segs
+
+
+def _canvas_image_segments(node, doc=None):
+    """若 node 子树是 Word 绘图画布，返回预先渲染好的整图片段，否则 None
+
+    画布在 mc:Choice 里是 wpc:wpc，里面的图片和文本框是并列的形状；
+    有整图时直接替换掉它们，避免 md 里图片和文字被拆成好几段。
+    """
+    if _CANVASES is None or _MEDIA is None:
+        return None
+    is_canvas = False
+    docpr_id = None
+    for el in node.iter():
+        if el.tag == f'{{{_CANVAS_NS}}}wpc':
+            is_canvas = True
+        if docpr_id is None and el.tag == qn('wp:docPr'):
+            v = el.get('id') or ''
+            if v.isdigit():
+                docpr_id = int(v)
+    if not is_canvas or docpr_id is None:
+        return None
+    png = _CANVASES.get(docpr_id)
+    if png is None:
+        return None
+    rel = _MEDIA.save(f"canvas{docpr_id}.png", png)
+    return [InlineSeg(f"![]({rel})")] if rel else None
 
 
 def _drawing_segments(node, doc=None) -> list:
@@ -2130,7 +2408,11 @@ def _collect_segments_from(children, doc, segs):
         elif tag == _mc('AlternateContent'):
             branch = _mc_branch(child)
             if branch is not None:
-                _collect_segments_from(list(branch), doc, segs)
+                canvas = _canvas_image_segments(branch, doc)
+                if canvas is not None:
+                    segs.extend(canvas)
+                else:
+                    _collect_segments_from(list(branch), doc, segs)
         i += 1
 
 
@@ -2169,14 +2451,16 @@ def _run_segments(r_element, doc=None) -> list:
         elif tag == qn('w:tab'):
             texts.append("\t")
         elif tag in (qn('w:drawing'), qn('w:pict'), qn('w:object')):
-            box = _drawing_segments(node, doc)
+            canvas = _canvas_image_segments(node, doc)
+            box = canvas if canvas is not None else _drawing_segments(node, doc)
             if box:
                 flush()
                 segs.extend(box)
         elif tag == _mc('AlternateContent'):
             branch = _mc_branch(node)
             if branch is not None:
-                box = _drawing_segments(branch, doc)
+                canvas = _canvas_image_segments(branch, doc)
+                box = canvas if canvas is not None else _drawing_segments(branch, doc)
                 if box:
                     flush()
                     segs.extend(box)
@@ -2696,11 +2980,15 @@ def _collect_cell_text(parent, doc, parts):
         elif tag in (_m('oMath'), _m('oMathPara')):
             parts.append(_render_cell_math(child))
         elif tag in (qn('w:drawing'), qn('w:pict'), qn('w:object')):
-            parts.append(_drawing_text(child, doc))
+            canvas = _canvas_image_segments(child, doc)
+            parts.append("".join(s.text for s in canvas) if canvas is not None
+                         else _drawing_text(child, doc))
         elif tag == _mc('AlternateContent'):
             branch = _mc_branch(child)
             if branch is not None:
-                parts.append(_drawing_text(branch, doc))
+                canvas = _canvas_image_segments(branch, doc)
+                parts.append("".join(s.text for s in canvas) if canvas is not None
+                             else _drawing_text(branch, doc))
         elif tag == qn('w:p'):
             # 单元格里的多个段落用换行分隔（HTML 表格会写成 <br>）
             _collect_cell_text(child, doc, parts)
@@ -2744,11 +3032,15 @@ def _collect_cell_run_text(r_element, doc, parts):
         elif tag in (_m('oMath'), _m('oMathPara')):
             inner.append(_render_cell_math(node))
         elif tag in (qn('w:drawing'), qn('w:pict'), qn('w:object')):
-            inner.append(_drawing_text(node, doc))
+            canvas = _canvas_image_segments(node, doc)
+            inner.append("".join(s.text for s in canvas) if canvas is not None
+                         else _drawing_text(node, doc))
         elif tag == _mc('AlternateContent'):
             branch = _mc_branch(node)
             if branch is not None:
-                inner.append(_drawing_text(branch, doc))
+                canvas = _canvas_image_segments(branch, doc)
+                inner.append("".join(s.text for s in canvas) if canvas is not None
+                             else _drawing_text(branch, doc))
         else:
             # 其他子元素（如 w:ruby 的注音）继续往里找文字
             for sub in node.iter(qn('w:t')):
@@ -2778,16 +3070,19 @@ def _render_cell_math(node) -> str:
 
 def convert(docx_path: str) -> str:
     """将 docx 转换为 markdown 文本"""
-    global _MEDIA
+    global _MEDIA, _CANVASES
     # 图片导出到 `<同名>_media/`：无论 CLI 还是当库调用都写盘，
     # md 里写的相对路径按「md 与 docx 同目录同名」约定计算
     src = Path(docx_path)
     media_dir = f"{src.stem}_media"
+    # 绘图画布先整图渲染（Word→PDF→裁剪），没有画布时是空字典、不启动 Word
+    _CANVASES = _render_canvases(docx_path)
     _MEDIA = _MediaDir(src.parent / media_dir, media_dir)
     try:
         return render(parse_docx(docx_path))
     finally:
         _MEDIA = None
+        _CANVASES = None
 
 
 def _convert_one(src: Path) -> bool:

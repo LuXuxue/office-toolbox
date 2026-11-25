@@ -2384,6 +2384,12 @@ def _collect_segments_from(children, doc, segs):
                     segs.append(InlineSeg(text, url=url or None))
                 i = nxt
                 continue
+            circled = _field_circled_char(children, i)
+            if circled is not None:
+                text, nxt = circled
+                segs.append(InlineSeg(text))
+                i = nxt
+                continue
             segs.extend(_run_segments(child, doc))
         elif tag == qn('w:hyperlink'):
             # 一个超链接整体算一个片段：链接文字自己的加粗等标记留在括号里面，
@@ -2396,17 +2402,23 @@ def _collect_segments_from(children, doc, segs):
             if text:
                 segs.append(InlineSeg(text, url=url or None))
         elif tag == qn('w:fldSimple'):
-            # 简单域：HYPERLINK 域的地址写在 w:instr 域代码里，不在文字里
-            url = _hyperlink_in_instr(child.get(qn('w:instr')) or '')
-            inner = []
-            _collect_segments(child, doc, inner)
-            if url:
-                text = _segments_to_markdown(inner)
-                if text:
-                    segs.append(InlineSeg(text, url=url))
+            instr = child.get(qn('w:instr')) or ''
+            circled = _eq_ac_text(instr)
+            if circled:
+                # 带圈字符域没有文字结果，直接还原成 ① 这样的字符
+                segs.append(InlineSeg(circled))
             else:
-                # 不是链接域就按普通片段处理，免得加粗标记被拆成 **甲****乙**
-                segs.extend(inner)
+                # 简单域：HYPERLINK 域的地址写在 w:instr 域代码里，不在文字里
+                url = _hyperlink_in_instr(instr)
+                inner = []
+                _collect_segments(child, doc, inner)
+                if url:
+                    text = _segments_to_markdown(inner)
+                    if text:
+                        segs.append(InlineSeg(text, url=url))
+                else:
+                    # 不是链接域就按普通片段处理，免得加粗标记被拆成 **甲****乙**
+                    segs.extend(inner)
         elif tag in _INLINE_CONTAINER_TAGS:
             content = child.find(qn('w:sdtContent'))
             _collect_segments(content if content is not None else child, doc, segs)
@@ -2690,6 +2702,82 @@ def _field_hyperlink(children, index, doc=None):
     return url, text, end + 1
 
 
+# Word 的「带圈字符」写成 EQ \o\ac(圈符,字符) 域，往往没有 w:t 缓存结果，
+# 只抽 w:t 会把整个圈号丢掉。\o 是叠加开关，\ac 的两个参数分别是圈符与圈内字符。
+_EQ_AC_RE = re.compile(r'\\ac\s*\(\s*([^,()\s])\s*,\s*([^()]*?)\s*\)', re.IGNORECASE)
+
+# 中文数字也有现成的带圈码位（U+3280~U+3289），比退化成「一」更好
+_CIRCLED_IDEOGRAPHS = {
+    '一': '\u3280', '二': '\u3281', '三': '\u3282', '四': '\u3283', '五': '\u3284',
+    '六': '\u3285', '七': '\u3286', '八': '\u3287', '九': '\u3288', '十': '\u3289',
+}
+
+
+def _unicode_circled(text: str):
+    """把圈内字符映射成 Unicode 带圈字符；覆盖不到时返回 None
+
+    数字 0→⓪、1~9→①~⑨、10→⑩、11~20→⓫~⓴；
+    大写字母→Ⓐ~Ⓩ、小写字母→ⓐ~ⓩ、中文数字→㊀~㊉。多字符映射不了。
+    """
+    ideograph = _CIRCLED_IDEOGRAPHS.get(text)
+    if ideograph:
+        return ideograph
+    if text.isascii() and text.isdigit():
+        n = int(text)
+        if n == 0:
+            return '\u24ea'
+        if 1 <= n <= 9:
+            return chr(0x2460 + n - 1)
+        if n == 10:
+            return '\u2469'
+        if 11 <= n <= 20:
+            return chr(0x246a + n - 11)
+        return None
+    if len(text) != 1:
+        return None
+    cp = ord(text)
+    if 'A' <= text <= 'Z':
+        return chr(0x24b6 + cp - ord('A'))
+    if 'a' <= text <= 'z':
+        return chr(0x24d0 + cp - ord('a'))
+    return None
+
+
+def _eq_ac_text(instr: str) -> str:
+    """解析 EQ \\o\\ac 域代码，返回还原后的文本；不是带圈域返回空串
+
+    优先还原成 Unicode 带圈字符（①②Ⓐ…）；圈符不是圆圈或码位覆盖不到时，
+    退化为圈内字符本身——去掉圈也仍能表达内容。
+    """
+    if not instr or not re.match(r'\s*eq\b', instr, re.IGNORECASE):
+        return ""
+    m = _EQ_AC_RE.search(instr)
+    if not m:
+        return ""
+    accent, inner = m.group(1), m.group(2).strip()
+    if not inner:
+        return ""
+    if accent in ('○', '〇', '◯', 'O', 'o'):
+        circled = _unicode_circled(inner)
+        if circled is not None:
+            return circled
+    return inner
+
+
+def _field_circled_char(children, index):
+    """识别复杂 EQ 带圈字符域，返回 (还原文本, 下一个待处理下标)；不是则返回 None"""
+    if not _is_field_begin(children[index]):
+        return None
+    instr, _, end = _scan_field(children, index)
+    if end is None:
+        return None
+    text = _eq_ac_text(instr)
+    if not text:
+        return None
+    # 域结果里的 run 一并跳过，避免和缓存文字重复
+    return text, end + 1
+
+
 def _is_bullet_list(para) -> bool:
     """判断是否为无序列表项"""
     style_name = _para_style(para)[1] or ""
@@ -2963,11 +3051,21 @@ def _collect_cell_text(parent, doc, parts):
     单元格里的超链接要跟正文里一样转成 Markdown 链接：
     只抽 w:t 能拿到文字，链接地址会丢（表格里的参考链接、文献列表很常见）。
     """
-    for child in parent:
+    children = list(parent)
+    i = 0
+    n = len(children)
+    while i < n:
+        child = children[i]
         tag = child.tag
         if tag == qn('w:t'):
             parts.append(_escape_md_text(child.text or ""))
         elif tag == qn('w:r'):
+            circled = _field_circled_char(children, i)
+            if circled is not None:
+                text, nxt = circled
+                parts.append(text)
+                i = nxt
+                continue
             _collect_cell_run_text(child, doc, parts)
         elif tag == qn('w:hyperlink'):
             url = _hyperlink_target(child, doc)
@@ -2977,12 +3075,17 @@ def _collect_cell_text(parent, doc, parts):
             if text:
                 parts.append(f"[{text}]({url})" if url else text)
         elif tag == qn('w:fldSimple'):
-            url = _hyperlink_in_instr(child.get(qn('w:instr')) or '')
-            inner = []
-            _collect_cell_text(child, doc, inner)
-            text = "".join(inner)
-            if text:
-                parts.append(f"[{text}]({url})" if url else text)
+            instr = child.get(qn('w:instr')) or ''
+            circled = _eq_ac_text(instr)
+            if circled:
+                parts.append(circled)
+            else:
+                url = _hyperlink_in_instr(instr)
+                inner = []
+                _collect_cell_text(child, doc, inner)
+                text = "".join(inner)
+                if text:
+                    parts.append(f"[{text}]({url})" if url else text)
         elif tag in _INLINE_CONTAINER_TAGS:
             content = child.find(qn('w:sdtContent'))
             _collect_cell_text(content if content is not None else child, doc, parts)
@@ -3005,6 +3108,7 @@ def _collect_cell_text(parent, doc, parts):
         else:
             # 段落、行、单元格、嵌套表格等容器继续往下找
             _collect_cell_text(child, doc, parts)
+        i += 1
 
 
 def _collect_cell_run_text(r_element, doc, parts):

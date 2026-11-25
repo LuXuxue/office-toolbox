@@ -1064,6 +1064,36 @@ def _para_has_content(p_element) -> bool:
     return False
 
 
+# 段落样式查询缓存：python-docx 的 para.style 每次都按 styleId 在 styles.xml 里
+# 做一次 xpath；若 w:pStyle 指向字符样式（如「-Char」）或没写 pStyle，还会退化成
+# default_for() 遍历全部样式。这份文档 3105 个样式、18740 个段落，每段落又要查
+# 五六次（标题/列表/引用/编号判断），累计十万次全表扫描，表现就是卡死。
+# 同一份文档里同一个 styleId 的解析结果恒定，按 styleId 缓存即可把扫描降到十几次。
+# parse_docx 开始时清空，避免跨文件串味。
+_STYLE_CACHE = {}
+
+
+def _para_style(para):
+    """返回段落的 (styleId, 样式名)，语义与 para.style 一致，但结果按 styleId 缓存"""
+    ppr = para._element.find(qn('w:pPr'))
+    ps = ppr.find(qn('w:pStyle')) if ppr is not None else None
+    sid = ps.get(qn('w:val')) if ps is not None else None
+    if sid not in _STYLE_CACHE:
+        try:
+            style = para.style
+            if style is None:
+                _STYLE_CACHE[sid] = (None, None)
+            else:
+                style_id = getattr(style, 'style_id', None)
+                if style_id is None:
+                    el = getattr(style, '_element', None)
+                    style_id = el.get(qn('w:styleId')) if el is not None else None
+                _STYLE_CACHE[sid] = (style_id, getattr(style, 'name', None))
+        except Exception:
+            _STYLE_CACHE[sid] = (None, None)
+    return _STYLE_CACHE[sid]
+
+
 class NumberingResolver:
     """按文档顺序重建 Word 自动编号（numPr + numbering.xml）"""
 
@@ -1255,18 +1285,7 @@ class NumberingResolver:
             if e is not None:
                 ilvl = e.get(qn('w:val'))
 
-        style_name = None
-        style_id = None
-        try:
-            style = para.style
-        except Exception:
-            style = None
-        if style is not None:
-            style_name = getattr(style, "name", None)
-            style_id = getattr(style, "style_id", None)
-            if style_id is None:
-                el = getattr(style, "_element", None)
-                style_id = el.get(qn('w:styleId')) if el is not None else None
+        style_id, style_name = _para_style(para)
 
         if num_id is None and style_id is not None:
             s_num, s_ilvl = self._style_numpr(style_id)
@@ -2109,20 +2128,14 @@ class HeadingResolver:
                         return min(value + 1, _HEADING_MAX_LEVEL)
                     return None
 
-        try:
-            style = para.style
-        except Exception:
-            style = None
-        if style is None:
-            return None
-
-        outline = self._style_outline(getattr(style, 'style_id', None))
+        style_id, style_name = _para_style(para)
+        outline = self._style_outline(style_id)
         if outline is not None:
             # 样式定下的大纲级别同样权威（9 = 正文，不再按样式名猜标题）
             if 0 <= outline < 9:
                 return min(outline + 1, _HEADING_MAX_LEVEL)
             return None
-        return heading_level_of(getattr(style, 'name', None))
+        return heading_level_of(style_name)
 
     def is_explicit_body(self, para) -> bool:
         """段落是否显式声明为「正文」（outlineLvl >= 9）
@@ -2138,13 +2151,8 @@ class HeadingResolver:
                 if value is not None:
                     return value >= 9
 
-        try:
-            style = para.style
-        except Exception:
-            return False
-        if style is None:
-            return False
-        outline = self._style_outline(getattr(style, 'style_id', None))
+        style_id, _ = _para_style(para)
+        outline = self._style_outline(style_id)
         return outline is not None and outline >= 9
 
 
@@ -2190,6 +2198,7 @@ def _iter_body_blocks(container, host):
 
 def parse_docx(path: str) -> list:
     """解析 .docx 文件，返回按文档顺序排列的 Block 列表"""
+    _STYLE_CACHE.clear()  # 样式查询缓存只在同一份文档内有效
     doc = Document(path)
     blocks = []
 
@@ -2272,7 +2281,7 @@ def _render_paragraph(para, list_counter: int, doc=None, numbering=None,
     if headings is not None:
         level = headings.level_of(para)
     else:
-        style_name = para.style.name if para.style else ""
+        style_name = _para_style(para)[1] or ""
         level = heading_level_of(style_name)
 
     inline = _render_inline(para, doc)
@@ -2683,7 +2692,7 @@ def _field_hyperlink(children, index, doc=None):
 
 def _is_bullet_list(para) -> bool:
     """判断是否为无序列表项"""
-    style_name = para.style.name if para.style else ""
+    style_name = _para_style(para)[1] or ""
     if "List Bullet" in style_name or "项目符号" in style_name:
         return True
     ppr = para._element.find(qn('w:pPr'))
@@ -2697,7 +2706,7 @@ def _is_bullet_list(para) -> bool:
 
 def _is_numbered_list(para) -> bool:
     """判断是否为有序列表项"""
-    style_name = para.style.name if para.style else ""
+    style_name = _para_style(para)[1] or ""
     if "List Number" in style_name or "编号" in style_name:
         return True
     ppr = para._element.find(qn('w:pPr'))
@@ -2723,7 +2732,7 @@ def _is_quote(para) -> bool:
     只认样式，不认「手工缩进 + 左边框」—— 那类排版与普通段落无法可靠区分，
     强行识别会把正文误判成引用。样式名按英文名与中文 Word 的本地化名一起匹配。
     """
-    style_name = (para.style.name if para.style else "") or ""
+    style_name = _para_style(para)[1] or ""
     name = style_name.strip()
     if not name:
         return False
